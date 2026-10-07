@@ -2,6 +2,16 @@
 
 一个 Windows 桌面应用（Electron），本身就是一台 **AI 浏览器**：你描述任务，AI 大模型直接驱动浏览器替你点、输、读、填、搬运数据，全过程实时可见，token 消耗可控；本地免费 OCR 与本地快速决策模型加持。
 
+## 界面一览
+
+| 主界面（多页签 + AI 任务面板） | AI 操作过程时间线 |
+|---|---|
+| ![主界面](docs/screenshots/app-main.png) | ![时间线](docs/screenshots/panel-timeline.png) |
+
+**⏰ 定时任务**（每天定时 / 固定间隔 / 单次，执行前 1 分钟顶部倒计时可取消）：
+
+![定时任务](docs/screenshots/schedule-modal.png)
+
 ```
 ┌────────────────────────────────────────────┬──────────────┐
 │ [页签1 淘宝][页签2 聚水潭]…(≤5)  +          │ 任务输入框    │
@@ -18,19 +28,20 @@
 ### 开发运行
 
 ```bash
-npm install          # 首次安装依赖（.npmrc 已配置国内镜像）
+npm install          # 首次安装依赖（.npmrc 已配置国内镜像；postinstall 自动打 WASM 推理补丁）
 npm run dev          # 开发模式（热更新）
-npm run selftest:prod # 自测：31 项检查（CDP/元素提取/iframe/视觉构造/文档粘贴/OCR/UI）
+npm run selftest:prod # 自测：36 项检查（CDP/元素提取/iframe/视觉构造/文档粘贴/遮罩硬解除/定时任务/OCR/UI）
+npm run fetch:model  # （可选）预拉取本地快速决策模型到 resources/fastmodel
 ```
 
 ### 打包 EXE
 
 ```bash
-npm run dist         # 产出安装包 + 便携版到 dist/
+npm run dist         # 自动拉取模型 + 构建 + 打包：安装包 + 便携版到 dist/
 ```
 
-- `dist/EasyBow-Setup-1.1.0.exe` — NSIS 安装包
-- `dist/EasyBow-Portable-1.1.0.exe` — 免安装便携版
+- `dist/EasyBow-Setup-1.1.1.exe` — NSIS 安装包（约 476MB，**已内置本地快速决策模型**，装完即用）
+- `dist/EasyBow-Portable-1.1.1.exe` — 免安装便携版（同内置）
 
 ### 使用步骤
 
@@ -48,7 +59,7 @@ npm run dist         # 产出安装包 + 便携版到 dist/
 | AI 操作遮罩 | AI 工作期间浏览器蒙上淡蓝色水波纹遮罩并拦截人工鼠标（避免误操作干扰，AI 经 CDP 不受影响）；顶部悬浮「AI 操作中」状态条实时显示当前步骤，可一键 **⏸ 暂停**；暂停后遮罩自动揭开，人工接管操作，随时点「继续」恢复任务 |
 | 省 token | 模型只看「编号元素列表」（browser-use 同款技术，每步约 1~4k tokens）；元素上限可调；历史自动压缩；实时 token 统计 |
 | 视觉模式（可选，默认关） | 每步把视口截图发给支持图片的模型（glm-4.5v / gpt-4o / qwen-vl / kimi-latest 等），看图+元素列表一起判断更准；元素带 `@x,y` 归一化坐标与截图对照，动作仍按编号执行；模型拒图自动降级为元素列表，任务不中断；「测试连接」顺带探测视觉支持 |
-| ⚡ 混合模式（默认开） | 本地快速决策模型（Qwen2.5-0.5B int8 ONNX，onnxruntime WASM 本机推理，仅本机）秒出"显而易见"的简单步骤，不确定/高风险（done、跳转、粘贴、人工指导、经验库场景）自动回退云端大模型；本地推理 >8s 或连续决策不可靠时自动冷却；另有 `repeat` 重放动作让翻页/批量操作一次决策执行多轮。设置可切「纯大模型」模式 |
+| ⚡ 混合模式（默认开） | 本地快速决策模型（Qwen2.5-0.5B int8 ONNX，onnxruntime WASM 本机推理，仅本机，**安装包内置免下载**）秒出"显而易见"的简单步骤，不确定/高风险（done、跳转、粘贴、人工指导、经验库场景）自动回退云端大模型；本地推理 >10s 或连续决策不可靠时自动冷却；另有 `repeat` 重放动作让翻页/批量操作一次决策执行多轮。设置可切「纯大模型」模式 |
 | 文档写作（富文本+真图） | `paste_rich`：把 Markdown 自动转成标题/列表/加粗等真实样式粘贴进文档（空白文档默认美化排版）；`paste_image`：下载图片→写剪贴板→真实粘贴嵌入，文档里显示的是图片本体而非链接文字；均粘贴在光标处、不清空已有内容 |
 | ⏰ 定时任务 | 任务描述一键设为定时（每天定时 / 固定间隔 / 单次），到点 AI 空闲时自动执行；执行前 1 分钟顶部倒计时提示 + 一键取消本次；支持编辑任务与策略、停用、删除；AI 忙碌时自动跳过本次 |
 | 人工介入（附截图） | 运行/暂停中随时发文字+剪贴板截图指路（Win+Shift+S 后点「📷 附截图」或输入框 Ctrl+V），下一步优先执行 |
@@ -91,14 +102,16 @@ resources/
 └── testpage.html         # 自测 fixture
 scripts/
 ├── download-ocr-models.mjs  # （可选）重新下载 OCR 模型
-└── sync-ocr-web.mjs         # 构建前同步 onnxruntime-web 运行时
+├── sync-ocr-web.mjs         # 构建前同步 onnxruntime-web 运行时
+├── fetch-fastmodel.mjs      # 构建前拉取内置快速决策模型（幂等、断点续传）
+└── patch-transformers.mjs   # postinstall：transformers WASM 注入分支补丁
 ```
 
 ## 技术要点
 
 - **元素提取**（browser-use 核心技术）：CDP 注入脚本遍历可交互元素 → 可见性/遮挡检查 → 视口优先打分排序 → 截取上限数量 → 生成 `[5] <button> "提交订单"` 精简列表；同源 iframe 递归穿透（聚水潭类老式布局），iframe 内元素坐标已换算为顶层视口绝对坐标（与截图/OCR 区域对齐）
 - **视觉模式**（设置里开启，默认关）：每步消息附带视口截图（jpeg q70）+ 带 `@x,y` 归一化坐标（0~1000，仅视口内元素）的元素列表，模型看图判断版式/图标/图片文字；动作仍按元素编号执行（坐标由本地 RESOLVE_FN 换算，不依赖模型输出坐标，精度有保障）；降级链 **视觉（截图+列表）→ 纯元素列表 →（DOM 提取稀疏时）OCR 整页识别**；模型拒图（HTTP 400/415/422 或明确文案）时会话内记住并不再重试图片
-- **混合模式（本地快速决策）**：`@huggingface/transformers`（onnxruntime WASM）加载 Qwen2.5-0.5B-Instruct int4（约 400MB，首次从 hf-mirror 下载到本机 `%APPDATA%/easybow/models`，仅本机推理不发上云）；**严格门控**——仅当上一步全部成功、同站点、无页签/跳转/粘贴类变化、无人工指导与经验库注入、非视觉模式时才尝试本地直出，且只放行 click/type/scroll/wait/read_content/save/recall（≤2 个动作，**done 等终止/跳转决策永远走云端**）；输出 JSON 契约校验不过即回退云端并冷却 10 步；本地推理超过 8s 自动放弃（不如云端快）；`repeat` 动作可重放上一批动作 1~10 轮（翻页/批量场景一步顶多轮）。时间线 ⚡ 标记本地直出步骤
+- **混合模式（本地快速决策）**：`@huggingface/transformers`（onnxruntime WASM 后端，经官方 `Symbol.for('onnxruntime')` 注入口接管，规避原生库在部分 Windows 机器上的段错误）加载 Qwen2.5-0.5B-Instruct int8（512MB，**随安装包内置**于 `resources/fastmodel`，开发环境 `npm run fetch:model` 从 hf-mirror 拉取；仅本机推理不发上云）；**严格门控**——仅当上一步全部成功、同站点、无页签/跳转/粘贴类变化、无人工指导与经验库注入、非视觉模式时才尝试本地直出，且只放行 click/type/scroll/wait/read_content/save/recall（≤2 个动作，**done 等终止/跳转决策永远走云端**）；输出 JSON 契约校验不过即回退云端并冷却 10 步；本地推理超过 10s 自动放弃（不如云端快）；`repeat` 动作可重放上一批动作 1~10 轮（翻页/批量场景一步顶多轮）。时间线 ⚡ 标记本地直出步骤
 - **文档写作**：`paste_rich` 把模型输出的 Markdown 在主进程转成 HTML（标题/列表/加粗/引用/表格），经 `clipboard.write` 写入 `text/html`+`text/plain` 后 `webContents.paste()` 真实粘贴，在线文档渲染出真实样式；`paste_image` 用页签会话（带登录态）下载图片 → `nativeImage` 解码统一转 PNG → 写剪贴板 → 粘贴，由文档平台自己的粘贴处理器上传嵌入真实图片——两条路径都是系统级粘贴（trusted），且都在光标处追加、不像 `type` 那样先清空目标；附截图按钮同走主进程 `clipboard.read()`（Electron 44 W3C 风格 API），修复旧版因渲染进程无 clipboard-read 权限导致必然失败的问题
 - **动作执行**：`Input.dispatchMouseEvent` / `Input.insertText` 合成浏览器级 trusted 事件；输入走原生 setter + input/change 事件（React 受控组件可感知）；元素失效自动重提取
 - **Agent 循环**：每步无状态重组上下文（任务 + 页签列表 + 元素列表 + 任务记忆 + 上步结果 + 压缩历史），模型输出纯 JSON（宽松解析，不依赖 tool-calling），每步最多 5 个动作
@@ -119,6 +132,14 @@ scripts/
 - 不自动破解验证码（人工完成后继续）
 - 截图默认只用于界面时间线展示；开启「视觉模式」后才会把视口截图发给模型（需模型支持图片输入，不支持时自动降级）
 
+## 联系作者
+
+- 昵称：clb
+- 邮箱：[lamthebest@foxmail.com](mailto:lamthebest@foxmail.com)
+- 问题反馈：[Issues](https://github.com/FortC/Easy-BOW/issues)
+
+软件内也内置了关于信息：**⚙ 设置 → 关于**（版本、作者、联系方式、许可协议）。
+
 ## 许可
 
-MIT
+MIT License © clb

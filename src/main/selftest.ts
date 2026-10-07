@@ -634,6 +634,25 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
         // 弹窗 UI：任务描述框样式已与全局设计语言统一（真实断言 + 截图供人工核对）
         if (!app.isPackaged) {
           try {
+            // 先截主界面 hero（窗口置顶防止截到其他应用；README 文档用）
+            {
+              const w = deps.getWin?.()
+              if (w && !w.isDestroyed()) {
+                w.show()
+                w.focus()
+                w.moveTop()
+                await sleep(500)
+                const { desktopCapturer } = await import('electron')
+                const sources = await desktopCapturer.getSources({
+                  types: ['screen'],
+                  thumbnailSize: { width: 1600, height: 1000 }
+                })
+                if (sources[0]) {
+                  const { writeFileSync } = await import('fs')
+                  writeFileSync(join(process.cwd(), 'hero-screen.png'), sources[0].thumbnail.toPNG())
+                }
+              }
+            }
             await ui.executeJavaScript(
               `(() => { const b = Array.from(document.querySelectorAll('button')).find(x => (x.textContent||'').includes('定时')); b && b.click(); })()`,
               true
