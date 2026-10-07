@@ -24,8 +24,8 @@ app.setAboutPanelOptions({
   applicationName: 'EasyBow',
   applicationVersion: app.getVersion(),
   authors: ['clb'],
-  contact: 'lamthebest@foxmail.com',
-  credits: 'MIT License · AI 浏览器'
+  website: 'mailto:lamthebest@foxmail.com',
+  copyright: 'MIT License · AI 浏览器 · 联系：lamthebest@foxmail.com'
 })
 
 let win: BrowserWindow | null = null
