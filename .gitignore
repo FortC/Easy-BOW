@@ -11,3 +11,6 @@ schedule-modal.png
 selftest-trace.log
 fastllm-test-trace.log
 *.part
+
+.easy-publish.json
+hero-screen.png
