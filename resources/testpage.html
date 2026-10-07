@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>EasyBow 自测页面</title>
+  <style>
+    body { font-family: sans-serif; margin: 24px; }
+    .box { border: 1px solid #ccc; padding: 12px; margin: 12px 0; border-radius: 6px; }
+    button { padding: 6px 16px; margin: 4px; }
+    input { padding: 6px; }
+    table { border-collapse: collapse; }
+    td, th { border: 1px solid #999; padding: 4px 10px; }
+    .spacer { height: 1200px; background: linear-gradient(#eee, #ddd); }
+    #captcha-sim { display: none; }
+    #captcha-sim .nc_1_wrapper { padding: 10px; border: 1px solid orange; }
+  </style>
+</head>
+<body>
+  <h1>EasyBow 自测页面</h1>
+
+  <div class="box">
+    <label for="kw">搜索词：</label>
+    <input id="kw" placeholder="请输入搜索内容">
+    <button id="submit-btn">提交</button>
+    <button id="clear-btn" onclick="document.getElementById('kw').value=''; return false;">清空</button>
+    <p id="form-result">（未提交）</p>
+    <label for="stubborn-input">框架控制字段：</label>
+    <input id="stubborn-input" placeholder="模拟框架强制清空">
+  </div>
+
+  <div class="box">
+    <a href="#" id="link-a" onclick="document.getElementById('link-result').textContent='链接被点击'; return false;">点我试试</a>
+    <p id="link-result">（链接未点击）</p>
+  </div>
+
+  <div class="box">
+    <table id="data-table">
+      <tr><th>订单号</th><th>买家</th><th>金额</th><th>状态</th></tr>
+      <tr><td>A1024</td><td>张三</td><td>89.50</td><td>已发货</td></tr>
+      <tr><td>A1025</td><td>李四</td><td>129.00</td><td>待付款</td></tr>
+      <tr><td>A1026</td><td>王五</td><td>45.80</td><td>已完成</td></tr>
+    </table>
+  </div>
+
+  <div class="box">
+    <p>同源 iframe（模拟聚水潭式嵌套布局）：</p>
+    <iframe id="inner" srcdoc="
+      <html><body style='font-family:sans-serif'>
+        <h3>内嵌区域</h3>
+        <input id='inner-input' placeholder='iframe 内输入框'>
+        <button id='inner-btn' onclick=&quot;document.getElementById('inner-out').textContent='iframe按钮已点击'&quot;>iframe 按钮</button>
+        <p id='inner-out'>（iframe 内未操作）</p>
+      </body></html>
+    " width="400" height="120"></iframe>
+  </div>
+
+  <div class="box">
+    <p>图片资源抓取测试：</p>
+    <img id="img-main" alt="商品主图" width="320" height="320"
+      src="data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='320' height='320'%3E%3Crect width='320' height='320' fill='%234f86da'/%3E%3C/svg%3E">
+    <img id="img-icon" alt="icon" width="16" height="16"
+      src="data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'%3E%3Crect width='16' height='16' fill='%23ccc'/%3E%3C/svg%3E">
+    <div id="img-detail" title="详情图背景" style="width: 400px; height: 200px; background-image: url(&quot;data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='400' height='200'%3E%3Crect width='400' height='200' fill='%23dfe9fd'/%3E%3C/svg%3E&quot;)"></div>
+  </div>
+
+  <div class="box">
+    <p>富文本粘贴测试区（paste_rich / paste_image 动作验证）：</p>
+    <div id="rich-area" contenteditable="true" style="min-height: 110px; border: 1px dashed #4f86da; padding: 8px; outline: none;">（点此编辑）</div>
+  </div>
+
+  <div class="box" id="captcha-sim">
+    <div class="nc_1_wrapper">请按住滑块，拖动到最右边</div>
+  </div>
+
+  <div class="box">
+    <p>自绘滑块（拖动测试）：</p>
+    <div id="slider-track" style="position: relative; width: 360px; height: 28px; background: #e5e5e5; border-radius: 14px; user-select: none;">
+      <button id="slider-handle" title="滑块手柄" style="position: absolute; left: 0; top: 0; width: 52px; height: 28px; border: none; border-radius: 14px; background: #4f86da; color: #fff; cursor: grab; font-size: 12px;">拖我</button>
+    </div>
+    <p>滑块进度：<b id="slider-val">0</b>%</p>
+  </div>
+
+  <div class="spacer">（占位高度，用于滚动测试）</div>
+  <p id="bottom-marker">已到页面底部</p>
+
+  <script>
+    document.getElementById('submit-btn').addEventListener('click', function () {
+      var v = document.getElementById('kw').value
+      document.getElementById('form-result').textContent = v ? '已提交: ' + v : '输入为空'
+    })
+    // 给自测用的开关
+    window.__showCaptcha = function () { document.getElementById('captcha-sim').style.display = 'block' }
+    window.__getInputValue = function () { return document.getElementById('kw').value }
+    // 模拟框架控制输入框：任何输入都被清空（测试"输入未生效如实报告"）
+    document.getElementById('stubborn-input').addEventListener('input', function () {
+      this.value = ''
+    })
+    // 自绘滑块：按住手柄横向拖动，进度按轨道百分比显示
+    ;(function () {
+      var track = document.getElementById('slider-track')
+      var handle = document.getElementById('slider-handle')
+      var val = document.getElementById('slider-val')
+      var dragging = false
+      function setPct(clientX) {
+        var r = track.getBoundingClientRect()
+        var pct = Math.max(0, Math.min(100, ((clientX - r.left - 26) / (r.width - 52)) * 100))
+        handle.style.left = ((r.width - 52) * pct / 100) + 'px'
+        val.textContent = Math.round(pct)
+      }
+      handle.addEventListener('mousedown', function (e) { dragging = true; e.preventDefault() })
+      document.addEventListener('mousemove', function (e) { if (dragging) setPct(e.clientX) })
+      document.addEventListener('mouseup', function (e) { if (dragging) { dragging = false; setPct(e.clientX) } })
+    })()
+  </script>
+</body>
+</html>

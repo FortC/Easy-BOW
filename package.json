@@ -1,0 +1,40 @@
+{
+  "name": "easybow",
+  "version": "1.1.0",
+  "description": "EasyBow — AI 浏览器：内置大模型自动操作 + 跨页签数据搬运 + 本地免费 OCR",
+  "main": "out/main/index.js",
+  "author": "clb <lamthebest@foxmail.com>",
+  "license": "MIT",
+  "scripts": {
+    "sync-ocr": "node scripts/sync-ocr-web.mjs",
+    "dev": "electron-vite dev",
+    "selftest": "electron-vite dev -- --selftest",
+    "start": "electron-vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "build": "node scripts/sync-ocr-web.mjs && electron-vite build",
+    "postinstall": "electron-builder install-app-deps",
+    "dist": "node scripts/sync-ocr-web.mjs && electron-vite build && electron-builder --win nsis portable",
+    "dist:dir": "node scripts/sync-ocr-web.mjs && electron-vite build && electron-builder --win --dir",
+    "selftest:prod": "node scripts/sync-ocr-web.mjs && electron-vite build && electron out/main/index.js --selftest"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.131.0",
+    "@huggingface/transformers": "^4.3.1",
+    "onnxruntime-node": "^1.30.0",
+    "openai": "^7.28.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^44.6.0",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "onnxruntime-web": "1.20.1",
+    "typescript": "^7.0.2",
+    "vite": "^7.3.7"
+  }
+}

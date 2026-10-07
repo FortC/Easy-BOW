@@ -1,0 +1,139 @@
+import { useEffect, useState } from 'react'
+import type { KBEntry } from '@shared/types'
+
+/**
+ * 问题经验库：积累「某站点某问题的正确处理方式」，任务执行时按域名注入 AI 提示词，
+ * 避免重复踩坑（如：腾讯文档点正文即可编辑，不要找输入框）。
+ */
+export default function KnowledgeModal(props: { onClose: () => void }) {
+  const [list, setList] = useState<KBEntry[]>([])
+  const [loaded, setLoaded] = useState(false)
+  const [editing, setEditing] = useState<KBEntry | null>(null)
+  const [domain, setDomain] = useState('')
+  const [problem, setProblem] = useState('')
+  const [solution, setSolution] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    window.easybow.getKB().then((l) => {
+      setList(l)
+      setLoaded(true)
+    })
+  }, [])
+
+  const persist = async (next: KBEntry[]) => {
+    setSaving(true)
+    try {
+      setList(await window.easybow.setKB(next))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const resetForm = () => {
+    setEditing(null)
+    setDomain('')
+    setProblem('')
+    setSolution('')
+  }
+
+  const submit = async () => {
+    if (!solution.trim()) return
+    const entry: KBEntry = {
+      id: editing?.id ?? Date.now(),
+      domain: domain.trim(),
+      problem: problem.trim(),
+      solution: solution.trim(),
+      enabled: true
+    }
+    const next = editing ? list.map((e) => (e.id === editing.id ? entry : e)) : [entry, ...list]
+    await persist(next)
+    resetForm()
+  }
+
+  return (
+    <div className="modal-mask">
+      <div className="modal kb-modal">
+        <h3>
+          📚 问题经验库
+          <span className="close-x" onClick={props.onClose}>
+            ✕
+          </span>
+        </h3>
+        <p className="kb-intro">
+          把踩过的坑记在这里：AI 执行任务遇到匹配的站点时会看到对应做法，不再重复犯错。
+          域名留空表示对所有站点生效。
+        </p>
+
+        <div className="kb-form">
+          <div className="form-inline">
+            <div className="form-row">
+              <label>站点域名（如 docs.qq.com，留空=全局）</label>
+              <input value={domain} placeholder="docs.qq.com" onChange={(e) => setDomain(e.target.value.trim())} />
+            </div>
+            <div className="form-row">
+              <label>问题描述（简短）</label>
+              <input value={problem} placeholder="如：找不到输入框" onChange={(e) => setProblem(e.target.value)} />
+            </div>
+          </div>
+          <div className="form-row">
+            <label>正确做法（AI 将按此执行）</label>
+            <textarea
+              className="kb-solution"
+              value={solution}
+              placeholder={'如：点击正文区域直接进入编辑状态，然后对正文输入；不要用浏览器查找(Ctrl+F)输入'}
+              onChange={(e) => setSolution(e.target.value)}
+            />
+          </div>
+          <div className="kb-form-ops">
+            <button className="btn primary" onClick={submit} disabled={!solution.trim() || saving}>
+              {editing ? '保存修改' : '＋ 添加'}
+            </button>
+            {editing && (
+              <button className="btn" onClick={resetForm}>
+                取消编辑
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="kb-list">
+          {!loaded ? (
+            <div className="kb-empty">加载中…</div>
+          ) : list.length === 0 ? (
+            <div className="kb-empty">还没有经验条目，添加一条吧</div>
+          ) : (
+            list.map((e) => (
+              <div key={e.id} className={`kb-item${e.enabled ? '' : ' off'}`}>
+                <div className="kb-item-head">
+                  <span className="kb-domain">{e.domain || '全局'}</span>
+                  <span className="kb-problem">{e.problem || '（无标题）'}</span>
+                  <span className="kb-item-ops">
+                    <button title={e.enabled ? '停用' : '启用'} onClick={() => persist(list.map((x) => (x.id === e.id ? { ...x, enabled: !x.enabled } : x)))}>
+                      {e.enabled ? '✅' : '⛔'}
+                    </button>
+                    <button
+                      title="编辑"
+                      onClick={() => {
+                        setEditing(e)
+                        setDomain(e.domain)
+                        setProblem(e.problem)
+                        setSolution(e.solution)
+                      }}
+                    >
+                      ✎
+                    </button>
+                    <button title="删除" onClick={() => persist(list.filter((x) => x.id !== e.id))}>
+                      🗑
+                    </button>
+                  </span>
+                </div>
+                <div className="kb-solution-text">{e.solution}</div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}

@@ -1,0 +1,44 @@
+appId: com.easybow.app
+productName: EasyBow
+copyright: MIT
+directories:
+  buildResources: build
+files:
+  - out/**
+  - package.json
+  - "!**/*.map"
+  # 本地推理原生二进制只保留 win-x64（onnxruntime-node 默认带全平台，共 289MB）
+  - "!node_modules/onnxruntime-node/bin/napi-v6/darwin/**"
+  - "!node_modules/onnxruntime-node/bin/napi-v6/linux/**"
+  - "!node_modules/onnxruntime-node/bin/napi-v6/win32/arm64/**"
+# 原生模块与动态加载的推理库必须解包出 asar 才能在运行时 require
+asarUnpack:
+  - "node_modules/onnxruntime-node/**"
+  - "**/@huggingface/transformers/**"
+# onnxruntime-web 只在构建期拷贝到 resources/ocr/ort（worker 页面经 file:// 加载），
+# 不随 node_modules 打包
+extraResources:
+  - from: resources/ocr
+    to: ocr
+  - from: resources/testpage.html
+    to: testpage.html
+  - from: resources/overlay.html
+    to: overlay.html
+  - from: resources/overlay-preload.js
+    to: overlay-preload.js
+win:
+  target:
+    - nsis
+    - portable
+  fileAssociations: []
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: EasyBow
+  artifactName: EasyBow-Setup-${version}.${ext}
+portable:
+  artifactName: EasyBow-Portable-${version}.${ext}
+electronDownload:
+  mirror: https://npmmirror.com/mirrors/electron/
