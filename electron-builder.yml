@@ -11,10 +11,37 @@ files:
   - "!node_modules/onnxruntime-node/bin/napi-v6/darwin/**"
   - "!node_modules/onnxruntime-node/bin/napi-v6/linux/**"
   - "!node_modules/onnxruntime-node/bin/napi-v6/win32/arm64/**"
+  # ort-fast（WASM 推理）只需单线程经典变体；jsep/jspi/asyncify 为 GPU/代理/可中断场景，
+  # all/webgl/webgpu bundle 为浏览器其他后端
+  - "!node_modules/ort-fast/dist/ort-wasm-simd-threaded.jsep.wasm"
+  - "!node_modules/ort-fast/dist/ort-wasm-simd-threaded.jsep.mjs"
+  - "!node_modules/ort-fast/dist/ort-wasm-simd-threaded.jsep.bundle.min.mjs"
+  - "!node_modules/ort-fast/dist/ort-wasm-simd-threaded.jspi.wasm"
+  - "!node_modules/ort-fast/dist/ort-wasm-simd-threaded.jspi.mjs"
+  - "!node_modules/ort-fast/dist/ort-wasm-simd-threaded.asyncify.wasm"
+  - "!node_modules/ort-fast/dist/ort-wasm-simd-threaded.asyncify.mjs"
+  - "!node_modules/ort-fast/dist/ort-wasm-simd-threaded.asyncify.bundle.min.mjs"
+  - "!node_modules/ort-fast/dist/ort.all.js"
+  - "!node_modules/ort-fast/dist/ort.all.mjs"
+  - "!node_modules/ort-fast/dist/ort.all.min.js"
+  - "!node_modules/ort-fast/dist/ort.all.min.mjs"
+  - "!node_modules/ort-fast/dist/ort.all.bundle.min.js"
+  - "!node_modules/ort-fast/dist/ort.all.bundle.min.mjs"
+  - "!node_modules/ort-fast/dist/ort.webgl.js"
+  - "!node_modules/ort-fast/dist/ort.webgl.mjs"
+  - "!node_modules/ort-fast/dist/ort.webgl.min.js"
+  - "!node_modules/ort-fast/dist/ort.webgl.min.mjs"
+  - "!node_modules/ort-fast/dist/ort.webgpu.js"
+  - "!node_modules/ort-fast/dist/ort.webgpu.mjs"
+  - "!node_modules/ort-fast/dist/ort.webgpu.bundle.min.mjs"
+  - "!node_modules/ort-fast/dist/ort.jspi.js"
+  - "!node_modules/ort-fast/dist/ort.jspi.mjs"
 # 原生模块与动态加载的推理库必须解包出 asar 才能在运行时 require
 asarUnpack:
   - "node_modules/onnxruntime-node/**"
   - "**/@huggingface/transformers/**"
+  # WASM 推理运行时（wasm 二进制需真实文件路径加载）
+  - "node_modules/ort-fast/**"
 # onnxruntime-web 只在构建期拷贝到 resources/ocr/ort（worker 页面经 file:// 加载），
 # 不随 node_modules 打包
 extraResources:
@@ -26,6 +53,9 @@ extraResources:
     to: overlay.html
   - from: resources/overlay-preload.js
     to: overlay-preload.js
+  # 本地快速决策模型内置（用户免下载；由 scripts/fetch-fastmodel.mjs 在构建前拉取）
+  - from: resources/fastmodel
+    to: fastmodel
 win:
   target:
     - nsis

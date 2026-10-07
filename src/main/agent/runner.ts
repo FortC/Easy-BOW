@@ -403,7 +403,7 @@ export class AgentRunner {
           } else {
             localCooldown = 10
           }
-          if (this.fastllm!.genMs > 8000) localDisabled = true // 本地推理 >8s，失去加速意义
+          if (this.fastllm!.genMs > 10000) localDisabled = true // 本地推理 >10s（WASM 单线程），失去加速意义
         } catch {
           localCooldown = 10
         }

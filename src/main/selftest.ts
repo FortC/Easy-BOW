@@ -173,6 +173,15 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
           !!w2 && w2.working === false && w2.barVisible === false,
           `working→${w2?.working} 状态条→${w2?.barVisible}`
         )
+        // 终结态 3s 硬兜底：setWorking(false) 后无论内部时序，覆盖层必须彻底拆除（输入拦截归零）
+        const m1 = ex.overlay.debugMainState()
+        await sleep(3300)
+        const m2 = ex.overlay.debugMainState()
+        check(
+          '任务结束3秒硬解除遮罩',
+          m1.hasHardTimer && m2.shown === false && m2.visible === false,
+          `停止工作后已安排硬释放=${m1.hasHardTimer}，3.3s后 shown=${m2.shown} 视图可见=${m2.visible}`
+        )
       }
     } else {
       check('输入+点击提交', false, `kwIdx=${kwIdx} submitIdx=${submitIdx}`)
@@ -621,6 +630,54 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
           hasIt && Array.isArray(cancelled) && Array.isArray(delOk) && !delOk.some((s: any) => s.id === sid),
           `创建=${hasIt} 取消后顺延nextRun=${!!cancelled?.find?.((s: any) => s.id === sid)} 删除=${!delOk?.some?.((s: any) => s.id === sid)}`
         )
+
+        // 弹窗 UI：任务描述框样式已与全局设计语言统一（真实断言 + 截图供人工核对）
+        if (!app.isPackaged) {
+          try {
+            await ui.executeJavaScript(
+              `(() => { const b = Array.from(document.querySelectorAll('button')).find(x => (x.textContent||'').includes('定时')); b && b.click(); })()`,
+              true
+            )
+            await sleep(700) // 等弹窗弹入动画结束
+            const styleInfo = await ui.executeJavaScript(
+              `(() => {
+                const ta = document.querySelector('.sch-task-input');
+                const inp = document.querySelector('.modal .form-row input');
+                if (!ta || !inp) return null;
+                const a = getComputedStyle(ta), b = getComputedStyle(inp);
+                return {
+                  taRadius: a.borderRadius, inpRadius: b.borderRadius,
+                  taBorder: a.borderColor, inpBorder: b.borderColor,
+                  taFont: a.fontFamily.slice(0, 30), inpFont: b.fontFamily.slice(0, 30),
+                  taPad: a.padding, sameRadius: a.borderRadius === b.borderRadius,
+                  sameBorder: a.borderColor === b.borderColor, sameFont: a.fontFamily === b.fontFamily
+                };
+              })()`,
+              true
+            )
+            check(
+              '定时任务弹窗UI统一',
+              !!styleInfo && styleInfo.sameRadius && styleInfo.sameBorder && styleInfo.sameFont && styleInfo.taRadius !== '0px',
+              styleInfo
+                ? `任务框 radius=${styleInfo.taRadius}/输入框=${styleInfo.inpRadius} 边框色一致=${styleInfo.sameBorder} 字体一致=${styleInfo.sameFont}`
+                : '弹窗未打开或元素缺失'
+            )
+            const w = deps.getWin?.()
+            if (w && !w.isDestroyed()) {
+              const img = await w.webContents.capturePage()
+              if (!img.isEmpty()) {
+                const { writeFileSync } = await import('fs')
+                writeFileSync(join(process.cwd(), 'schedule-modal.png'), img.toPNG())
+              }
+            }
+            await ui.executeJavaScript(
+              `(() => { const x = document.querySelector('.modal h3 .close-x'); x && x.click(); })()`,
+              true
+            )
+          } catch (e: any) {
+            check('定时任务弹窗UI统一', false, String(e?.message || e))
+          }
+        }
       } else {
         check('定时任务(IPC 创建/取消/删除)', false, 'UI webContents 不可用')
       }

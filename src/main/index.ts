@@ -11,6 +11,7 @@ import { listCCSwitchProviders } from './ccswitch'
 import { recordHistory, touchHistoryTitle, listHistory, removeHistory, clearHistory } from './history'
 import { formatCandidates } from './extractor'
 import { runSelftest } from './selftest'
+import { runFastllmTest, isFastllmTest } from './fastllm-test'
 import { tryInitOcr, ocrEnhanceExtract, ocrPageText } from './ocr'
 import { FastLlm } from './fastllm'
 import { Scheduler } from './scheduler'
@@ -263,8 +264,8 @@ function registerIpc(): void {
     ])
     return { ok: true, message: `连接成功，模型回复: ${r.text.slice(0, 50)}`, usage: r.usage }
   })
-  // 本地快速决策模型（混合模式）
-  ipcMain.handle('fastllm:status', () => fastllm.status)
+  // 本地快速决策模型（混合模式）；bundled=模型已内置安装包（免下载）
+  ipcMain.handle('fastllm:status', () => ({ ...fastllm.status, bundled: !!FastLlm.bundledModelDir() }))
   ipcMain.handle('fastllm:init', () => fastllm.init())
   // 定时任务
   ipcMain.handle('schedules:get', () => scheduler.list())
@@ -319,7 +320,7 @@ function registerIpc(): void {
   })
 }
 
-const gotLock = app.requestSingleInstanceLock()
+const gotLock = isFastllmTest(process.argv) || app.requestSingleInstanceLock()
 if (!gotLock) {
   app.quit()
 } else {
@@ -332,6 +333,10 @@ if (!gotLock) {
 
   app.whenReady().then(async () => {
     registerIpc()
+    if (isFastllmTest(process.argv)) {
+      await runFastllmTest((code) => app.exit(code))
+      return
+    }
     if (process.argv.includes('--selftest')) {
       await runSelftest({
         createWindow,

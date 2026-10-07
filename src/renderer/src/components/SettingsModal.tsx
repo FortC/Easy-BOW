@@ -206,15 +206,23 @@ export default function SettingsModal(props: {
           </select>
           <div className="field-hint">
             {fast?.state === 'ready'
-              ? '⚡ 本地快速决策模型已就绪（Qwen2.5-0.5B int4，仅本机推理，不发数据上云）'
+              ? '⚡ 本地快速决策模型已就绪（Qwen2.5-0.5B int8，仅本机推理，不发数据上云）'
               : fast?.state === 'downloading' || fast?.state === 'loading'
                 ? `本地模型${fast.state === 'downloading' ? '下载' : '加载'}中${fast.progress ? ` ${Math.round(fast.progress * 100)}%` : ''}：${fast.detail || ''}`
-                : '混合模式需先下载本地快速决策模型（Qwen2.5-0.5B int4，约 400MB，来源 hf-mirror，仅本机使用）；未就绪时自动等效纯大模型模式'}
+                : fast?.bundled
+                  ? '安装包已内置本地快速决策模型（Qwen2.5-0.5B int8），点击下方按钮加载即可，无需下载'
+                  : '混合模式需先下载本地快速决策模型（Qwen2.5-0.5B int8，约 500MB，来源 hf-mirror，仅本机使用）；未就绪时自动等效纯大模型模式'}
           </div>
           {fast?.state !== 'ready' && (
             <div style={{ marginTop: 6, display: 'flex', gap: 8, alignItems: 'center' }}>
               <button className="btn" onClick={startFastInit} disabled={fastBusy || fast?.state === 'downloading' || fast?.state === 'loading'}>
-                {fastBusy || fast?.state === 'downloading' || fast?.state === 'loading' ? '处理中…' : fast?.state === 'error' ? '重试下载' : '下载并加载本地模型'}
+                {fastBusy || fast?.state === 'downloading' || fast?.state === 'loading'
+                  ? '处理中…'
+                  : fast?.state === 'error'
+                    ? '重试加载'
+                    : fast?.bundled
+                      ? '加载内置本地模型'
+                      : '下载并加载本地模型'}
               </button>
               {fast?.state === 'error' && <span className="field-hint" style={{ marginTop: 0 }}>{fast.detail}</span>}
             </div>

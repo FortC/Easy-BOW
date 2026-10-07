@@ -4,3 +4,10 @@ dist/
 *.log
 *.tsbuildinfo
 .DS_Store
+resources/fastmodel/
+overlay-demo.png
+overlay-working.png
+schedule-modal.png
+selftest-trace.log
+fastllm-test-trace.log
+*.part

@@ -16,9 +16,27 @@ export class Overlay {
   private shown = false
   private working = false
   private hideTimer: NodeJS.Timeout | null = null
+  /** 终结兜底计时：停止工作 3 秒后无论如何彻底拆除覆盖层（用户卡在"任务完成仍无法操作浏览器外区域"） */
+  private hardTimer: NodeJS.Timeout | null = null
   private bounds: Electron.Rectangle | null = null
   /** 最近一次推送的状态条文本（重新显示时恢复） */
   private lastStatus = ''
+
+  /** 停止工作 3 秒后的硬释放：清一切计时/墨迹并拆视图，保证输入拦截归零 */
+  private armHardRelease(): void {
+    if (this.hardTimer) clearTimeout(this.hardTimer)
+    this.hardTimer = setTimeout(() => {
+      this.hardTimer = null
+      this.forceHide()
+    }, 3000).unref?.()
+  }
+
+  private cancelHardRelease(): void {
+    if (this.hardTimer) {
+      clearTimeout(this.hardTimer)
+      this.hardTimer = null
+    }
+  }
 
   constructor(win: BrowserWindow) {
     this.win = win
@@ -103,6 +121,7 @@ export class Overlay {
 
   /** 开始一批动作：显示覆盖层（延迟隐藏计时取消） */
   async begin(): Promise<void> {
+    this.cancelHardRelease()
     if (this.hideTimer) {
       clearTimeout(this.hideTimer)
       this.hideTimer = null
@@ -120,6 +139,7 @@ export class Overlay {
   setWorking(working: boolean): void {
     this.working = working
     if (working) {
+      this.cancelHardRelease()
       if (this.hideTimer) {
         clearTimeout(this.hideTimer)
         this.hideTimer = null
@@ -133,6 +153,8 @@ export class Overlay {
     } else {
       // 停止工作：若没有待隐藏计时则安排隐藏（清掉墨迹）
       if (this.shown && !this.hideTimer) this.end()
+      // 硬兜底：3 秒后彻底拆除（无论内部状态如何，输入拦截必须归零）
+      this.armHardRelease()
     }
     this.js(`window.__ovl && window.__ovl.setWorking(${working})`)
   }
@@ -180,12 +202,24 @@ export class Overlay {
   }
 
   forceHide(): void {
+    this.cancelHardRelease()
     if (this.hideTimer) {
       clearTimeout(this.hideTimer)
       this.hideTimer = null
     }
     this.shown = false
+    // 清墨迹，避免下次显示时旧轨迹闪现
+    this.js('window.__ovl && window.__ovl.clear()')
     this.detach()
+  }
+
+  /** 调试/自测：仅主进程侧状态（不触碰页面 JS，视图隐藏后也不会挂起） */
+  debugMainState(): { shown: boolean; working: boolean; visible: boolean; hasHardTimer: boolean } {
+    let visible = false
+    try {
+      visible = (this.view as unknown as { getVisible(): boolean }).getVisible()
+    } catch {}
+    return { shown: this.shown, working: this.working, visible, hasHardTimer: !!this.hardTimer }
   }
 
   /** 调试/自测：读取动画状态（光标位置、累计移动/点击数、状态条）+ 主进程侧视图诊断 */

@@ -46,11 +46,11 @@ export const DEFAULT_SETTINGS: Settings = {
 
 export const MAX_TABS = 5
 
-/** 布局常量（渲染进程与主进程共同遵守，用于摆放浏览器视图） */
+/** 布局常量（渲染进程与主进程共同遵守，用于摆放浏览器视图；面板实际宽度以 styles.css 为准） */
 export const LAYOUT = {
   TAB_BAR_H: 36,
   TOOLBAR_H: 44,
-  PANEL_W: 380
+  PANEL_W: 420
 }
 
 export interface TabInfo {
@@ -183,6 +183,8 @@ export interface FastLlmState {
   state: 'idle' | 'downloading' | 'loading' | 'ready' | 'error'
   progress?: number
   detail?: string
+  /** 模型已内置在安装包中（无需下载） */
+  bundled?: boolean
 }
 
 /** 定时任务：到点自动把任务描述交给 AI 执行 */
