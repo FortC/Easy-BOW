@@ -173,14 +173,21 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
           !!w2 && w2.working === false && w2.barVisible === false,
           `working→${w2?.working} 状态条→${w2?.barVisible}`
         )
-        // 终结态 3s 硬兜底：setWorking(false) 后无论内部时序，覆盖层必须彻底拆除（输入拦截归零）
+        // 终结态立即彻底拆除：setWorking(false) 同步完成，不再依赖兜底计时。
+        // 关键断言是"视图已从窗口视图栈卸载"——只切可见性的透明视图残留在栈里时，
+        // Chromium 输入路由仍可能把鼠标事件派发给它（任务结束后页面点不动、切页签也被拦）
         const m1 = ex.overlay.debugMainState()
-        await sleep(3300)
+        await sleep(3300) // 复核：无任何计时器/事件会把它重新挂回或重新可见
         const m2 = ex.overlay.debugMainState()
         check(
-          '任务结束3秒硬解除遮罩',
-          m1.hasHardTimer && m2.shown === false && m2.visible === false,
-          `停止工作后已安排硬释放=${m1.hasHardTimer}，3.3s后 shown=${m2.shown} 视图可见=${m2.visible}`
+          '任务结束立即拆除遮罩(视图已卸载)',
+          m1.shown === false &&
+            m1.visible === false &&
+            m1.isChild === false &&
+            m2.shown === false &&
+            m2.visible === false &&
+            m2.isChild === false,
+          `停止后 shown=${m1.shown} 可见=${m1.visible} 在视图栈=${m1.isChild}；3.3s复核 在视图栈=${m2.isChild}`
         )
       }
     } else {

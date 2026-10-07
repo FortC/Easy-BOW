@@ -324,7 +324,14 @@ function registerIpc(): void {
   })
 }
 
-const gotLock = isFastllmTest(process.argv) || app.requestSingleInstanceLock()
+// 自测模式：独立临时 userData + 绕过单实例锁，保证开发者开着正式应用也能随时跑自测
+// （共享真实 profile 会撞 Chromium 缓存锁，且定时任务/浏览历史会被自测污染）
+const isSelftest = process.argv.includes('--selftest')
+if (isSelftest) {
+  app.setPath('userData', join(app.getPath('temp'), `easybow-selftest-${Date.now()}`))
+}
+
+const gotLock = isFastllmTest(process.argv) || isSelftest || app.requestSingleInstanceLock()
 if (!gotLock) {
   app.quit()
 } else {
@@ -341,7 +348,7 @@ if (!gotLock) {
       await runFastllmTest((code) => app.exit(code))
       return
     }
-    if (process.argv.includes('--selftest')) {
+    if (isSelftest) {
       await runSelftest({
         createWindow,
         getTabManager: () => tabManager,

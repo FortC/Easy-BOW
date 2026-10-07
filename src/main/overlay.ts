@@ -16,27 +16,9 @@ export class Overlay {
   private shown = false
   private working = false
   private hideTimer: NodeJS.Timeout | null = null
-  /** 终结兜底计时：停止工作 3 秒后无论如何彻底拆除覆盖层（用户卡在"任务完成仍无法操作浏览器外区域"） */
-  private hardTimer: NodeJS.Timeout | null = null
   private bounds: Electron.Rectangle | null = null
   /** 最近一次推送的状态条文本（重新显示时恢复） */
   private lastStatus = ''
-
-  /** 停止工作 3 秒后的硬释放：清一切计时/墨迹并拆视图，保证输入拦截归零 */
-  private armHardRelease(): void {
-    if (this.hardTimer) clearTimeout(this.hardTimer)
-    this.hardTimer = setTimeout(() => {
-      this.hardTimer = null
-      this.forceHide()
-    }, 3000).unref?.()
-  }
-
-  private cancelHardRelease(): void {
-    if (this.hardTimer) {
-      clearTimeout(this.hardTimer)
-      this.hardTimer = null
-    }
-  }
 
   constructor(win: BrowserWindow) {
     this.win = win
@@ -64,6 +46,7 @@ export class Overlay {
     this.bounds = bounds
     if (!this.shown || browserHidden || !bounds) {
       this.detach()
+      this.unmount()
       return
     }
     this.attach(bounds)
@@ -74,9 +57,10 @@ export class Overlay {
     if (!b) return
     try {
       // 常驻挂载 + 可见性切换（避免反复拆装视图）；仅在不在最顶层时重新置顶（页签切换会把页签视图压到覆盖层上面）
+      // 视图可能已被 unmount 整体卸载：removeChildView 对非子视图会抛错导致重挂失败，需先判断
       const cv = this.win.contentView
       if (cv.children[cv.children.length - 1] !== this.view) {
-        cv.removeChildView(this.view)
+        if (cv.children.includes(this.view)) cv.removeChildView(this.view)
         cv.addChildView(this.view)
       }
       this.view.setBounds(b)
@@ -87,6 +71,22 @@ export class Overlay {
   private detach(): void {
     try {
       this.view.setVisible(false)
+    } catch {}
+  }
+
+  /**
+   * 物理卸载覆盖层视图：从窗口视图栈移除并把尺寸归零。
+   * setVisible(false) 只切可见性——透明视图残留在视图栈里时，Chromium 输入路由
+   * 在部分环境下仍可能把鼠标事件派发给它（表现为任务结束后页面"点不动"，
+   * 且切到哪个页签都被拦）。卸载 + 归零后输入拦截在物理上不可能发生，
+   * attach() 会在下次 begin/setWorking(true) 时按需重新挂载。
+   */
+  private unmount(): void {
+    try {
+      this.win.contentView.removeChildView(this.view)
+    } catch {}
+    try {
+      this.view.setBounds({ x: 0, y: 0, width: 0, height: 0 })
     } catch {}
   }
 
@@ -121,7 +121,6 @@ export class Overlay {
 
   /** 开始一批动作：显示覆盖层（延迟隐藏计时取消） */
   async begin(): Promise<void> {
-    this.cancelHardRelease()
     if (this.hideTimer) {
       clearTimeout(this.hideTimer)
       this.hideTimer = null
@@ -135,11 +134,10 @@ export class Overlay {
     await this.ready()
   }
 
-  /** AI 工作状态：true 时持续显示（淡蓝遮罩+水波纹+顶部状态条），false 时若无动作批则隐藏 */
+  /** AI 工作状态：true 时持续显示（淡蓝遮罩+水波纹+顶部状态条），false 时立即彻底拆除 */
   setWorking(working: boolean): void {
     this.working = working
     if (working) {
-      this.cancelHardRelease()
       if (this.hideTimer) {
         clearTimeout(this.hideTimer)
         this.hideTimer = null
@@ -151,10 +149,9 @@ export class Overlay {
       // 恢复状态条文本（页面侧状态条随 working 显隐）
       this.js(`window.__ovl && window.__ovl.setStatus(${JSON.stringify(this.lastStatus)})`)
     } else {
-      // 停止工作：若没有待隐藏计时则安排隐藏（清掉墨迹）
-      if (this.shown && !this.hideTimer) this.end()
-      // 硬兜底：3 秒后彻底拆除（无论内部状态如何，输入拦截必须归零）
-      this.armHardRelease()
+      // 停止工作（暂停/验证码/任务结束）：同步立即拆除并卸载视图——
+      // 用户从这一刻起就要操作页面，任何"等待淡出/兜底计时"的窗口期都是输入拦截残留
+      this.forceHide()
     }
     this.js(`window.__ovl && window.__ovl.setWorking(${working})`)
   }
@@ -177,6 +174,7 @@ export class Overlay {
       if (!this.working) {
         this.shown = false
         this.detach()
+        this.unmount()
       }
     }, 700)
   }
@@ -202,7 +200,6 @@ export class Overlay {
   }
 
   forceHide(): void {
-    this.cancelHardRelease()
     if (this.hideTimer) {
       clearTimeout(this.hideTimer)
       this.hideTimer = null
@@ -211,15 +208,20 @@ export class Overlay {
     // 清墨迹，避免下次显示时旧轨迹闪现
     this.js('window.__ovl && window.__ovl.clear()')
     this.detach()
+    this.unmount()
   }
 
   /** 调试/自测：仅主进程侧状态（不触碰页面 JS，视图隐藏后也不会挂起） */
-  debugMainState(): { shown: boolean; working: boolean; visible: boolean; hasHardTimer: boolean } {
+  debugMainState(): { shown: boolean; working: boolean; visible: boolean; isChild: boolean } {
     let visible = false
     try {
       visible = (this.view as unknown as { getVisible(): boolean }).getVisible()
     } catch {}
-    return { shown: this.shown, working: this.working, visible, hasHardTimer: !!this.hardTimer }
+    let isChild = false
+    try {
+      isChild = this.win.contentView.children.includes(this.view)
+    } catch {}
+    return { shown: this.shown, working: this.working, visible, isChild }
   }
 
   /** 调试/自测：读取动画状态（光标位置、累计移动/点击数、状态条）+ 主进程侧视图诊断 */
