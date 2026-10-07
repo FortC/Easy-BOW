@@ -284,7 +284,7 @@ export function formatCandidates(res: ExtractResult, withCoords = false): string
 }
 
 /** 在页面上下文中按 framePaths+path 定位元素，返回页面绝对坐标（供 CDP 点击） */
-export const RESOLVE_FN = String(function resolve(framePaths: number[][], path: number[]) {
+export const RESOLVE_FN = String(function resolve(framePaths: number[][], path: number[], expectTag?: string) {
   function walk(doc: Document, p: number[]): Element | null {
     let el: Element = doc.documentElement
     for (const i of p) {
@@ -311,6 +311,9 @@ export const RESOLVE_FN = String(function resolve(framePaths: number[][], path: 
   }
   const el = walk(doc, path)
   if (!el) return { found: false }
+  // 标签校验：children 序号路径在 SPA 重渲染/虚拟滚动后可能落到错误节点上，
+  // 标签不符视为失效（上层会重提取并按文本重定位），杜绝"点错元素还报成功"
+  if (expectTag && el.tagName !== expectTag) return { found: false }
   try {
     ;(el as any).scrollIntoView({ block: 'center', inline: 'nearest' })
   } catch {}

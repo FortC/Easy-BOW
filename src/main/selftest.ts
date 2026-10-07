@@ -324,6 +324,40 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
       check('图片资源抓取(主图/详情图)', false, String(e?.message || e))
     }
 
+    // 7.8 SPA 重挂载后的元素重定位：旧序号路径指向错误节点（标签不符）时，
+    // 必须重提取并按 标签+文本 重定位到正确元素（防"点错元素还报成功"）
+    try {
+      const dynIdx = res.candidates.findIndex((c) => c.text === '动态按钮A')
+      const remountIdx = res.candidates.findIndex((c) => c.text === '触发重挂载')
+      if (dynIdx < 0 || remountIdx < 0) throw new Error(`元素列表缺少动态区（dyn=${dynIdx} remount=${remountIdx}）`)
+      // 1) 点"触发重挂载"：dyn-wrap 内部被替换，旧快照里动态按钮的序号路径从此指向 <i>占位</i>
+      await ex.executeBatch(
+        [{ name: 'click', index: remountIdx }],
+        { memory: {}, signal: new AbortController().signal, settings: { speed: 'normal' } as any }
+      )
+      const remounted = await tm.active()!.cdp.evaluate<string>(
+        String(() => document.getElementById('dyn-flag')!.textContent),
+        []
+      )
+      // 2) 仍按旧快照序号点"动态按钮A"：路径失效 → 标签校验拦下 → 重提取+文本重定位 → 点中真按钮
+      const clickOut = await ex.executeBatch(
+        [{ name: 'click', index: dynIdx }],
+        { memory: {}, signal: new AbortController().signal, settings: { speed: 'normal' } as any }
+      )
+      await sleep(300)
+      const flag = await tm.active()!.cdp.evaluate<string>(
+        String(() => document.getElementById('dyn-flag')!.textContent),
+        []
+      )
+      check(
+        'SPA重挂载重定位(标签校验+文本重定位)',
+        remounted === 'remounted' && flag === 'dyn-clicked' && !clickOut[0].error,
+        `重挂载=${remounted} 旧序号点击后=${flag}（应点到真按钮而非占位元素）`
+      )
+    } catch (e: any) {
+      check('SPA重挂载重定位(标签校验+文本重定位)', false, String(e?.message || e))
+    }
+
     // 8.5 UI 挂载检查（React 界面是否渲染）
     try {
       await sleep(1500)
@@ -623,12 +657,31 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
         )
         const hasIt = Array.isArray(created) && created.some((s: any) => s.name === '自测定时' && s.nextRun > Date.now())
         const sid = created.find((s: any) => s.name === '自测定时')?.id
+        // 切换策略字段清理：interval → daily 后，旧策略字段（intervalMin）必须被清掉，
+        // 而不是残留 undefined/旧值（JSON 序列化后字段应不存在）
+        const switched = sid != null
+          ? await ui.executeJavaScript(
+              `window.easybow.saveSchedule(${JSON.stringify({
+                name: '自测定时',
+                task: '自测：什么都不做',
+                enabled: true,
+                type: 'daily',
+                dailyMinute: 540,
+                id: sid
+              })})`,
+              true
+            )
+          : null
+        const sw = switched?.find?.((s: any) => s.id === sid)
+        // 修复前：Object.assign 不触碰缺席键，旧策略字段残留旧值（如 intervalMin=60）
+        const switchClean =
+          !!sw && sw.type === 'daily' && sw.dailyMinute === 540 && sw.intervalMin === undefined && sw.at === undefined
         const cancelled = sid != null ? await ui.executeJavaScript(`window.easybow.cancelScheduledRun(${sid})`, true) : null
         const delOk = sid != null ? await ui.executeJavaScript(`window.easybow.deleteSchedule(${sid})`, true) : null
         check(
           '定时任务(IPC 创建/取消/删除)',
-          hasIt && Array.isArray(cancelled) && Array.isArray(delOk) && !delOk.some((s: any) => s.id === sid),
-          `创建=${hasIt} 取消后顺延nextRun=${!!cancelled?.find?.((s: any) => s.id === sid)} 删除=${!delOk?.some?.((s: any) => s.id === sid)}`
+          hasIt && switchClean && Array.isArray(cancelled) && Array.isArray(delOk) && !delOk.some((s: any) => s.id === sid),
+          `创建=${hasIt} 策略切换字段清理=${switchClean}（旧 intervalMin=${sw?.intervalMin ?? '无'}） 删除=${!delOk?.some?.((s: any) => s.id === sid)}`
         )
 
         // 弹窗 UI：任务描述框样式已与全局设计语言统一（真实断言 + 截图供人工核对）
@@ -722,6 +775,22 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
       }
     } catch (e: any) {
       check('OCR整页识别', false, String(e?.message || e))
+    }
+
+    // 9.9 页签关闭时清理提取快照（内存泄漏回归：snapshots 只增不减）
+    try {
+      tm.newTab('about:blank') // 显式加载，未 commit 的页面会让 CDP evaluate 挂起
+      await sleep(800)
+      const blank = tm.active()
+      if (!blank) throw new Error('新页签不可用')
+      await ex.extract(blank)
+      const hadSnap = !!ex.getSnapshot(blank.id)
+      tm.closeTab(blank.id)
+      await sleep(200)
+      const leaked = !!ex.getSnapshot(blank.id)
+      check('页签关闭清理快照', hadSnap && !leaked, `关闭前有快照=${hadSnap} 关闭后残留=${leaked}`)
+    } catch (e: any) {
+      check('页签关闭清理快照', false, String(e?.message || e))
     }
   } catch (e: any) {
     check('自测流程', false, String(e?.stack || e))

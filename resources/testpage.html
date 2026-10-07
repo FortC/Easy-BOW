@@ -80,6 +80,14 @@
     <p>滑块进度：<b id="slider-val">0</b>%</p>
   </div>
 
+  <!-- SPA 重渲染模拟：remountBtn 替换 dyn-wrap 内部结构（子节点序号漂移），
+       自测验证序号路径失效后按 标签+文本 重定位 的兜底 -->
+  <div style="margin-top: 24px; padding: 12px; border: 1px dashed #bbb;">
+    <div id="dyn-wrap"><button id="dyn-btn">动态按钮A</button></div>
+    <button id="remount-btn">触发重挂载</button>
+    <span id="dyn-flag" style="margin-left: 10px;"></span>
+  </div>
+
   <div class="spacer">（占位高度，用于滚动测试）</div>
   <p id="bottom-marker">已到页面底部</p>
 
@@ -87,6 +95,17 @@
     document.getElementById('submit-btn').addEventListener('click', function () {
       var v = document.getElementById('kw').value
       document.getElementById('form-result').textContent = v ? '已提交: ' + v : '输入为空'
+    })
+    // SPA 重挂载：替换 dyn-wrap 内部（前面插入两个占位元素使旧序号路径指向错误节点）
+    document.getElementById('remount-btn').addEventListener('click', function () {
+      var w = document.getElementById('dyn-wrap')
+      w.innerHTML = '<i>占位1</i><i>占位2</i><button id="dyn-btn">动态按钮A</button>'
+      document.getElementById('dyn-flag').textContent = 'remounted'
+    })
+    document.getElementById('dyn-wrap').addEventListener('click', function (e) {
+      if (e.target && e.target.id === 'dyn-btn') {
+        document.getElementById('dyn-flag').textContent = 'dyn-clicked'
+      }
     })
     // 给自测用的开关
     window.__showCaptcha = function () { document.getElementById('captcha-sim').style.display = 'block' }

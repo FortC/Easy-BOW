@@ -125,7 +125,7 @@ function createWindow(): void {
   // 心跳看门狗：主进程侧每 8s 探测一次 UI 渲染器，连续 2 次无应答即重建。
   // 覆盖 busy-loop 与阻塞两类卡死（unresponsive 事件在部分场景不会触发）
   let hbMisses = 0
-  setInterval(() => {
+  const hbTimer = setInterval(() => {
     if (!win || win.isDestroyed()) return
     let loading = false
     try {
@@ -151,6 +151,9 @@ function createWindow(): void {
       }
     })
   }, 8000)
+  // 窗口销毁时释放探针：否则 macOS activate 等路径反复 createWindow 会累积多份看门狗，
+  // 各自独立计数的防崩溃冷却会被集体绕过
+  win.on('closed', () => clearInterval(hbTimer))
   // 自愈后重新上报浏览器区域（新渲染器启动时也会自行上报，这里兜底）
   win.webContents.on('did-finish-load', () => tabManager?.onWindowResized())
 
@@ -160,6 +163,7 @@ function createWindow(): void {
   tabManager.onTitle = (url, title) => touchHistoryTitle(url, title)
   executor = new Executor(tabManager)
   executor.setMaxElementsProvider(() => getSettings().maxElements)
+  tabManager.onTabClosed = (id) => executor.dropSnapshots(id)
   runner = new AgentRunner(tabManager, executor, sendEvent)
   // 本地快速决策模型（混合模式）：ready 前不参与决策，任务零影响
   fastllm = new FastLlm(sendEvent)

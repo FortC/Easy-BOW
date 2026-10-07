@@ -93,22 +93,36 @@ export class Scheduler {
   }
 
   save(input: Omit<Schedule, 'id' | 'createdAt' | 'nextRun' | 'lastRun'> & { id?: number }): Schedule[] {
-    if (input.id != null) {
-      const s = this.schedules.find((x) => x.id === input.id)
-      if (!s) throw new Error(`定时任务 ${input.id} 不存在`)
-      Object.assign(s, input)
+    // 前端按策略条件展开字段（改 interval 时不带 at/dailyMinute）：
+    // 过滤 undefined 防止整体覆盖写入 undefined，并按当前策略清理异构字段，
+    // 避免脏数据潜伏（undefined 在 JSON 持久化时自然丢弃）
+    const patch = Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined)) as typeof input
+    if (patch.id != null) {
+      const s = this.schedules.find((x) => x.id === patch.id)
+      if (!s) throw new Error(`定时任务 ${patch.id} 不存在`)
+      Object.assign(s, patch)
+      if (s.type === 'once') {
+        s.dailyMinute = undefined
+        s.intervalMin = undefined
+      } else if (s.type === 'daily') {
+        s.at = undefined
+        s.intervalMin = undefined
+      } else {
+        s.at = undefined
+        s.dailyMinute = undefined
+      }
       s.nextRun = computeNextRun(s)
       this.cancelledThisRound.delete(s.id)
     } else {
       const s: Schedule = {
         id: this.nextId++,
-        name: input.name || input.task.slice(0, 20) || '未命名任务',
-        task: input.task,
-        enabled: input.enabled,
-        type: input.type,
-        at: input.at,
-        dailyMinute: input.dailyMinute,
-        intervalMin: input.intervalMin,
+        name: patch.name || patch.task.slice(0, 20) || '未命名任务',
+        task: patch.task,
+        enabled: patch.enabled,
+        type: patch.type,
+        at: patch.at,
+        dailyMinute: patch.dailyMinute,
+        intervalMin: patch.intervalMin,
         createdAt: Date.now(),
         nextRun: 0
       }

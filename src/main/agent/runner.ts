@@ -417,6 +417,10 @@ export class AgentRunner {
       if (localParsed) {
         // ⚡ 本地直出：跳过云端调用，直接进入动作执行（token 0）
         localUsed = true
+        // 上一步结果已在 buildLocalPrompt 消费，这里同样清空——
+        // 否则混合模式连续命中时旧页面文本（read_content 最长 6200 字/步）无限累积，
+        // 既污染本地小模型上下文，恢复云端后第一步还会把陈旧数据整包灌进提示词
+        this.lastResults = []
         llmOut = {
           text: JSON.stringify({ thought: localParsed.thought, actions: localParsed.actions }),
           usage: { inputTokens: 0, outputTokens: 0 }

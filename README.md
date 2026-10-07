@@ -30,7 +30,7 @@
 ```bash
 npm install          # 首次安装依赖（.npmrc 已配置国内镜像；postinstall 自动打 WASM 推理补丁）
 npm run dev          # 开发模式（热更新）
-npm run selftest:prod # 自测：36 项检查（CDP/元素提取/iframe/视觉构造/文档粘贴/遮罩硬解除/定时任务/OCR/UI）
+npm run selftest:prod # 自测：39 项检查（CDP/元素提取/iframe/视觉构造/文档粘贴/遮罩硬解除/定时任务/OCR/UI）
 npm run fetch:model  # （可选）预拉取本地快速决策模型到 resources/fastmodel
 ```
 
@@ -40,8 +40,8 @@ npm run fetch:model  # （可选）预拉取本地快速决策模型到 resource
 npm run dist         # 自动拉取模型 + 构建 + 打包：安装包 + 便携版到 dist/
 ```
 
-- `dist/EasyBow-Setup-1.1.1.exe` — NSIS 安装包（约 476MB，**已内置本地快速决策模型**，装完即用）
-- `dist/EasyBow-Portable-1.1.1.exe` — 免安装便携版（同内置）
+- `dist/EasyBow-Setup-1.1.2.exe` — NSIS 安装包（约 476MB，**已内置本地快速决策模型**，装完即用）
+- `dist/EasyBow-Portable-1.1.2.exe` — 免安装便携版（同内置）
 
 ### 使用步骤
 

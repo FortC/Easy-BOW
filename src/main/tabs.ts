@@ -35,6 +35,9 @@ export class TabManager {
   onLayout: ((rect: { x: number; y: number; width: number; height: number } | null, hidden: boolean) => void) | null = null
   /** 导航发生回调（浏览历史记录用）：url + 当时的页签标题 */
   onHistory: ((url: string, title: string) => void) | null = null
+
+  /** 页签关闭回调（执行器据此清理该页签的提取快照） */
+  onTabClosed: ((id: number) => void) | null = null
   /** 页面标题更新回调（历史记录回填标题用） */
   onTitle: ((url: string, title: string) => void) | null = null
 
@@ -209,6 +212,7 @@ export class TabManager {
       ;(tab.view.webContents as any).destroy?.()
     } catch {}
     this.tabs.splice(idx, 1)
+    this.onTabClosed?.(id)
 
     if (this.tabs.length === 0) {
       // 至少保留一个页签

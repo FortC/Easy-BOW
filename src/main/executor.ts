@@ -154,6 +154,11 @@ export class Executor {
     return this.snapshots.get(tabId)
   }
 
+  /** 页签关闭时清理其提取快照（Map 只增不减会随页签开闭累积泄漏） */
+  dropSnapshots(tabId: number): void {
+    this.snapshots.delete(tabId)
+  }
+
   formatForPrompt(res: ExtractResult, limit: number, withCoords = false): string {
     const sliced: ExtractResult = { ...res, candidates: res.candidates.slice(0, limit) }
     return formatCandidates(sliced, withCoords)
@@ -178,17 +183,21 @@ export class Executor {
     return this.sleep(ms, signal)
   }
 
-  private async resolveIndex(t: Tab, index: number, expectTag?: string): Promise<Resolved> {
+  private async resolveIndex(t: Tab, index: number): Promise<Resolved> {
     const snap = this.snapshots.get(t.id)
     if (!snap || index < 0 || index >= snap.candidates.length) return { found: false }
     const cand = snap.candidates[index]
-    const r = await t.cdp.evaluate<Resolved>(RESOLVE_FN, [cand.framePaths, cand.path])
-    if (!r.found && expectTag) {
-      // DOM 变动：重新提取一次再试
+    const r = await t.cdp.evaluate<Resolved>(RESOLVE_FN, [cand.framePaths, cand.path, cand.tag])
+    if (!r.found) {
+      // DOM 变动（SPA 重渲染/虚拟滚动/懒加载占位）：重新提取一次，
+      // 优先按 标签+文本 重定位（重渲染后序号会漂移，直接复用 index 不可靠）
       const fresh = await this.extract(t)
-      const c2 = fresh.candidates[index]
+      const c2 =
+        (cand.text
+          ? fresh.candidates.find((c) => c.tag === cand.tag && c.text === cand.text)
+          : undefined) ?? fresh.candidates[index]
       if (!c2) return { found: false }
-      return t.cdp.evaluate<Resolved>(RESOLVE_FN, [c2.framePaths, c2.path])
+      return t.cdp.evaluate<Resolved>(RESOLVE_FN, [c2.framePaths, c2.path, c2.tag])
     }
     return r
   }
@@ -323,7 +332,10 @@ export class Executor {
           a.result = actual ? `输入不完整(${how})，实际为"${actual}"，目标"${text.slice(0, 30)}"` : `输入未生效(${how})，输入框仍为空`
           a.error = a.result
         } else {
+          // 回读失败（元素已从 DOM 消失/iframe 卸载）：效果无法证实，按失败上报，
+          // 否则会污染 repeat 重放与混合模式"上一步全成功"门禁
           a.result = `已输入(输入法通道，无法回读验证)`
+          a.error = '输入结果无法回读验证（目标元素可能已失效）'
         }
         return false
       }
