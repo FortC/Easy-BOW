@@ -1,6 +1,7 @@
 import { BrowserWindow, WebContentsView, session, app, Notification } from 'electron'
 import { join } from 'path'
 import { Cdp } from './cdp'
+import { friendlyNavError } from './navError'
 import { MAX_TABS, type TabInfo } from '@shared/types'
 
 export interface Broadcast {
@@ -203,7 +204,8 @@ export class TabManager {
     this.layout()
     if (url) {
       wc.loadURL(url).catch((e) => {
-        this.broadcast('toast', { message: `页面加载失败: ${e.message}`, kind: 'error' })
+        const msg = friendlyNavError(e)
+        if (msg) this.broadcast('toast', { message: `页面加载失败：${msg}`, kind: 'error' })
       })
     }
     this.emitTabs()
@@ -298,7 +300,9 @@ export class TabManager {
     try {
       await t.view.webContents.loadURL(target)
     } catch (e: any) {
-      this.broadcast('toast', { message: `导航失败: ${e?.message || e}`, kind: 'error' })
+      // 错误码翻译成人话；ERR_ABORTED（页面自身跳转接管）静默不弹
+      const msg = friendlyNavError(e)
+      if (msg) this.broadcast('toast', { message: `导航失败：${msg}`, kind: 'error' })
     } finally {
       t.loading = false
       this.emitTabs()

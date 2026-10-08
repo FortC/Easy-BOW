@@ -183,6 +183,9 @@ body {
 .nav-btn:hover:not(:disabled) { background: var(--hover-bg); color: var(--text); }
 .nav-btn:disabled { opacity: 0.35; cursor: default; }
 .nav-btn.active { background: #e1efff; color: var(--accent); }
+/* 图标+中文文字按钮：解决纯图标辨识度低的问题（收藏/历史/测试/面板/设置） */
+.nav-btn.with-label { width: auto; padding: 0 10px; gap: 4px; }
+.nav-btn .lbl { font-size: var(--fs-sm); font-weight: 500; letter-spacing: 0.5px; white-space: nowrap; }
 .addr {
   flex: 1; min-width: 0;
   height: 30px;
@@ -656,6 +659,8 @@ img.hdrop-fav { object-fit: contain; }
   animation: popIn var(--t-base) var(--ease);
 }
 .modal.is-closing { animation: popOut var(--t-fast) var(--ease) forwards; }
+/* 加宽弹窗（设置等字段多的表单）：三列布局列宽更充裕，长标签基本不换行 */
+.modal.wide { width: min(720px, 94vw); }
 /* 三段式：头部固定（✕ 始终可见）+ 内容区独立滚动 + 底部操作区固定 */
 .modal-head {
   flex: none;
@@ -691,9 +696,14 @@ img.hdrop-fav { object-fit: contain; }
 .form-row select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(51, 112, 255, 0.1); }
 .form-row input:disabled,
 .form-row select:disabled { background: var(--input-bg); color: var(--text2); cursor: not-allowed; }
-.form-inline { display: flex; gap: 12px; align-items: flex-start; }
-.form-inline .form-row { flex: 1; min-width: 0; }
+/* 底部对齐 + 行内 margin 归一：此前 .form-row:last-child 的 margin-bottom:0 与 flex-end
+   组合会让每排「最后一列」整体下沉 12px（margin 盒参与对齐）。现在间距由容器统一承担 */
+.form-inline { display: flex; gap: 12px; align-items: flex-end; margin-bottom: 12px; }
+.form-inline:last-child { margin-bottom: 0; }
+.form-inline .form-row { flex: 1; min-width: 0; margin-bottom: 0; }
 .form-inline .form-row.no-flex { flex: none; }
+/* 标签统一预留两行高度：多列表单的标签顶边与输入框双向对齐，长标签换行不挤歪同排控件 */
+.form-inline .form-row > label { min-height: 36px; }
 
 /* 行内组合控件（如 API Key 输入 + 显示/隐藏按钮） */
 .form-row-inline { display: flex; gap: 8px; }
@@ -999,6 +1009,9 @@ img.hdrop-fav { object-fit: contain; }
   .tab { min-width: 64px; max-width: 120px; }
   .toolbar { gap: 4px; padding: 0 6px; }
   .nav-btn { width: 28px; height: 28px; }
+  /* 窄窗口隐藏文字标签，退回纯图标，把宽度留给地址栏 */
+  .nav-btn .lbl { display: none; }
+  .nav-btn.with-label { width: 28px; padding: 0; gap: 0; }
 }
 
 /* ==========================================================================

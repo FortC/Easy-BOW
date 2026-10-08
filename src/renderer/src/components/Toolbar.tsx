@@ -72,7 +72,7 @@ export default function Toolbar(props: {
         }}
       />
       <button
-        className="nav-btn fav-btn"
+        className="nav-btn with-label fav-btn"
         title={props.isFav ? '移除收藏（收藏栏）' : '收藏当前网站（加入收藏栏）'}
         aria-label={props.isFav ? '移除收藏' : '收藏当前网站'}
         aria-pressed={props.isFav}
@@ -81,18 +81,21 @@ export default function Toolbar(props: {
         style={props.isFav ? { color: '#f5a623' } : undefined}
       >
         {props.isFav ? '★' : '☆'}
+        <span className="lbl">收藏</span>
       </button>
       <button
-        className={`nav-btn${props.historyOpen ? ' active' : ''}`}
+        className={`nav-btn with-label${props.historyOpen ? ' active' : ''}`}
         title="历史页面（快速重新打开）"
         aria-label="历史页面"
         aria-expanded={props.historyOpen}
         onClick={props.onHistory}
       >
         🕐
+        <span className="lbl">历史</span>
       </button>
-      <button className="nav-btn" title="浏览器仿真测试（需求→用例→执行→报告）" aria-label="浏览器仿真测试" onClick={props.onTest}>
+      <button className="nav-btn with-label" title="浏览器仿真测试（需求→用例→执行→报告）" aria-label="浏览器仿真测试" onClick={props.onTest}>
         🧪
+        <span className="lbl">测试</span>
       </button>
       {pauseable && (
         <button
@@ -104,16 +107,18 @@ export default function Toolbar(props: {
         </button>
       )}
       <button
-        className="nav-btn"
+        className="nav-btn with-label"
         title={props.panelCollapsed ? '展开 AI 任务面板（Ctrl+B）' : '收起 AI 任务面板，把整屏留给网页（Ctrl+B）'}
         aria-label={props.panelCollapsed ? '展开任务面板' : '收起任务面板'}
         aria-pressed={props.panelCollapsed}
         onClick={props.onTogglePanel}
       >
         {props.panelCollapsed ? '◧' : '◨'}
+        <span className="lbl">面板</span>
       </button>
-      <button className="nav-btn" title="设置" aria-label="设置" onClick={props.onSettings}>
+      <button className="nav-btn with-label" title="设置" aria-label="设置" onClick={props.onSettings}>
         ⚙
+        <span className="lbl">设置</span>
       </button>
     </div>
   )

@@ -128,7 +128,7 @@ export default function SettingsModal(props: {
     <div className="modal-mask" onClick={onBackdropClick}>
       <div
         ref={bodyRef}
-        className={`modal${closing ? ' is-closing' : ''}`}
+        className={`modal wide${closing ? ' is-closing' : ''}`}
         role="dialog"
         aria-modal="true"
         aria-label="设置 — AI 接口"
