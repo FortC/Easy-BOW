@@ -69,14 +69,11 @@ export function parseAssertionLine(raw: string): TestAssertion {
 }
 
 /** 解析测试数据表（| k | v | 行；跳过表头与分隔行） */
-function parseVars(lines: string[], startIdx: number): { vars: Record<string, string>; end: number } {
+function parseVarTable(lines: string[], i: number): { vars: Record<string, string>; end: number } {
   const vars: Record<string, string> = {}
-  let i = startIdx
   let sawSep = false
   for (; i < lines.length; i++) {
     const l = lines[i].trim()
-    if (!l) break
-    if (l.startsWith('###')) break
     if (!l.startsWith('|')) break
     const cells = l.split('|').map((c) => c.trim()).filter((c, idx, arr) => !(idx === 0 && c === '') && !(idx === arr.length - 1 && c === ''))
     if (cells.every((c) => /^-+$/.test(c))) {
@@ -90,6 +87,55 @@ function parseVars(lines: string[], startIdx: number): { vars: Record<string, st
     }
   }
   return { vars, end: i }
+}
+
+/**
+ * 解析测试数据区块：支持多组（数据驱动）——
+ *   ## 测试数据
+ *   | a | 1 |                 ← 表格在 ### 之前 = 默认组（单组用例即此前行为）
+ *   ### 组1: 正确凭据
+ *   | username | ok | ...
+ *   ### 组2: 错误密码
+ *   | username | bad | ...
+ * 有 ### 小节时返回 groups；否则 groups 为 undefined（兼容单组）。
+ */
+function parseDataSection(lines: string[], startIdx: number): {
+  vars: Record<string, string>
+  groups: Array<{ name: string; vars: Record<string, string> }> | undefined
+  end: number
+} {
+  const groups: Array<{ name: string; vars: Record<string, string> }> = []
+  let vars: Record<string, string> = {}
+  let i = startIdx
+  // ### 前的裸表格 = 默认组
+  while (i < lines.length) {
+    const l = lines[i].trim()
+    if (!l) { i++; continue }
+    if (l.startsWith('## ')) break
+    if (/^#{3,4}\s/.test(l)) break
+    if (l.startsWith('|')) {
+      const r = parseVarTable(lines, i)
+      vars = { ...vars, ...r.vars }
+      i = r.end
+      continue
+    }
+    break // 其他内容（不该出现）终止
+  }
+  // ### 组名 小节
+  while (i < lines.length) {
+    const l = lines[i].trim()
+    if (!l) { i++; continue }
+    if (l.startsWith('## ')) break
+    const m = l.match(/^#{3,4}\s*(.+)$/)
+    if (!m) break
+    const name = m[1].trim()
+    i++
+    const r = parseVarTable(lines, i)
+    groups.push({ name, vars: r.vars })
+    i = r.end
+  }
+  const hasGroups = groups.length > 0
+  return { vars, groups: hasGroups ? groups : undefined, end: i }
 }
 
 /**
@@ -149,13 +195,15 @@ export function parseTestCase(md: string): ParseResult {
   if (!name) return { ok: false, error: '缺少用例名（第一行应为「# TESTCASE: 用例名」）' }
 
   let vars: Record<string, string> = {}
+  let groups: Array<{ name: string; vars: Record<string, string> }> | undefined
   const steps: TestStep[] = []
   let i = 0
   for (; i < lines.length; i++) {
     const l = lines[i].trim()
     if (/^##\s*测试数据/.test(l)) {
-      const r = parseVars(lines, i + 1)
+      const r = parseDataSection(lines, i + 1)
       vars = r.vars
+      groups = r.groups
       i = r.end - 1
     } else if (/^##\s*步骤/.test(l)) {
       const r = parseSteps(lines, i + 1, false)
@@ -173,14 +221,20 @@ export function parseTestCase(md: string): ParseResult {
   for (let k = 0; k < steps.length; k++) {
     if (!steps[k].action) return { ok: false, error: `步骤「${steps[k].title}」缺少「- 操作: …」描述` }
   }
-  return { ok: true, tc: { name, vars, steps } }
+  return { ok: true, tc: groups ? { name, vars, steps, groups } : { name, vars, steps } }
 }
 
 /** 概要（UI 校验预览用） */
-export function summarize(tc: TestCase): { steps: number; assertions: number; vars: string[] } {
+export function summarize(tc: TestCase): {
+  steps: number
+  assertions: number
+  vars: string[]
+  groups?: number
+} {
   return {
     steps: tc.steps.length,
     assertions: tc.steps.reduce((n, s) => n + s.assertions.length, 0),
-    vars: Object.keys(tc.vars)
+    vars: Object.keys(tc.vars),
+    groups: tc.groups?.length
   }
 }

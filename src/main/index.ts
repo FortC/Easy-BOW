@@ -25,6 +25,15 @@ import type { KBEntry, MainEvent, Schedule, Settings, TestEnv } from '@shared/ty
 // 禁用站点 webview 的默认菜单干扰
 process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true'
 
+// 后台/最小化运行支持（默认关）：抑制 Chromium 后台节流（渲染/定时器/被遮挡窗口），
+// 保证测试或任务在窗口最小化时仍全速执行。commandLine 开关须在 app ready 前设置，故重启生效。
+// 默认关闭=与历史行为逐字节一致（开关只在设置里显式打开才追加）。
+if (getSettings().bgRun) {
+  app.commandLine.appendSwitch('disable-renderer-backgrounding')
+  app.commandLine.appendSwitch('disable-background-timer-throttling')
+  app.commandLine.appendSwitch('disable-backgrounding-occluded-windows')
+}
+
 // 关于面板（Windows 经菜单/代码触发；联系方式与发布人档案一致）
 app.setAboutPanelOptions({
   applicationName: 'EasyBow',
@@ -318,20 +327,21 @@ function registerIpc(): void {
     if (!s.apiKey) throw new Error('请先在「设置」中配置 AI 接口')
     return convertRequirement(createProvider(s), String(reqMd || ''), mode === 'prd' ? 'prd' : 'rough')
   })
-  // 用例 MD 校验（UI 预览步骤/断言/变量）
+  // 用例 MD 校验（UI 预览步骤/断言/变量/数据组）
   ipcMain.handle('test:parse', (_e, md: string) => {
     const r = parseTestCase(String(md || ''))
     if (!r.ok || !r.tc) return { ok: false, error: r.error }
     const s = summarize(r.tc)
-    return { ok: true, name: r.tc.name, steps: s.steps, assertions: s.assertions, vars: s.vars }
+    return { ok: true, name: r.tc.name, steps: s.steps, assertions: s.assertions, vars: s.vars, groups: s.groups }
   })
-  // 运行测试（环境档案按名解析：base_url 注入记忆 + 生产保护标记）
+  // 运行测试（环境档案按名解析：base_url 注入记忆 + 生产保护标记；fillPreview=智能填充前人工预览）
   ipcMain.handle(
     'test:start',
-    ok((md: string, opts: { envName?: string; failFast: boolean }) => {
+    ok((md: string, opts: { envName?: string; failFast: boolean; fillPreview?: boolean }) => {
       const env = findTestEnv(opts?.envName)
       return runner.startTestRun(String(md || ''), {
         failFast: opts?.failFast !== false,
+        fillPreview: !!opts?.fillPreview,
         env: env ? { name: env.name, baseUrl: env.baseUrl, protected: env.protected } : undefined
       })
     })

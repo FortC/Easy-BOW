@@ -140,6 +140,50 @@
     </script>
   </div>
 
+  <!-- P1 测试功能区：文件上传 / hover 菜单 / 提交后校验错误（软断言） -->
+  <div class="box">
+    <p>上传与悬停与校验错误测试区：</p>
+    <input type="file" id="up-file">
+    <button id="up-check">检查已选文件</button>
+    <span id="up-result">（未选择文件）</span>
+    <br><br>
+    <div id="hover-menu-wrap" style="position: relative; display: inline-block;">
+      <button id="hover-trigger">更多操作 ▾</button>
+      <div id="hover-menu" style="display: none; position: absolute; left: 0; top: 100%; background: #fff; border: 1px solid #ccc; padding: 6px; z-index: 10; white-space: nowrap;">
+        <button id="hover-item-a">导出全部数据</button>
+      </div>
+    </div>
+    <span id="hover-flag">（未悬停）</span>
+    <br><br>
+    <button id="save-btn">保存设置</button>
+    <span id="save-ok"></span>
+    <p class="error-msg" id="save-error" style="color: #d9393a; display: none;"></p>
+    <script>
+      document.getElementById('up-check').addEventListener('click', function () {
+        var f = document.getElementById('up-file').files[0]
+        document.getElementById('up-result').textContent = f ? ('已选: ' + f.name + ' (' + f.size + 'B)') : '（未选择文件）'
+      })
+      ;(function () {
+        var wrap = document.getElementById('hover-menu-wrap')
+        var menu = document.getElementById('hover-menu')
+        wrap.addEventListener('mouseenter', function () {
+          menu.style.display = 'block'
+          document.getElementById('hover-flag').textContent = 'hovered'
+        })
+        wrap.addEventListener('mouseleave', function () { menu.style.display = 'none' })
+        document.getElementById('hover-item-a').addEventListener('click', function () {
+          document.getElementById('hover-flag').textContent = 'menu-clicked'
+        })
+      })()
+      document.getElementById('save-btn').addEventListener('click', function () {
+        var err = document.getElementById('save-error')
+        err.textContent = '名称重复，保存失败'
+        err.style.display = 'block'
+        document.getElementById('save-ok').textContent = ''
+      })
+    </script>
+  </div>
+
   <div class="spacer">（占位高度，用于滚动测试）</div>
   <p id="bottom-marker">已到页面底部</p>
 

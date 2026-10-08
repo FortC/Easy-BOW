@@ -31,10 +31,13 @@ export default function TestPanel(props: {
   const [converting, setConverting] = useState(false)
   // ② 用例与运行
   const [caseMd, setCaseMd] = useState('')
-  const [parsed, setParsed] = useState<{ ok: boolean; error?: string; name?: string; steps?: number; assertions?: number; vars?: string[] } | null>(null)
+  const [parsed, setParsed] = useState<
+    { ok: boolean; error?: string; name?: string; steps?: number; assertions?: number; vars?: string[]; groups?: number } | null
+  >(null)
   const [envs, setEnvs] = useState<TestEnv[]>([])
   const [envName, setEnvName] = useState('')
   const [failFast, setFailFast] = useState(true)
+  const [fillPreview, setFillPreview] = useState(false)
   const [envDraft, setEnvDraft] = useState<TestEnv | null>(null)
   const [run, setRun] = useState<TestRunStatus | null>(null)
   // ③ 报告
@@ -99,7 +102,7 @@ export default function TestPanel(props: {
         props.onToast(`用例校验未通过: ${v.error}`, 'error')
         return
       }
-      await window.easybow.testStart(caseMd, { envName: envName || undefined, failFast })
+      await window.easybow.testStart(caseMd, { envName: envName || undefined, failFast, fillPreview })
       props.onToast(`测试已启动（独立测试页签${envName ? ` · ${envName}` : ''}）`, 'success')
       setReportContent(null)
     } catch (e: any) {
@@ -227,6 +230,13 @@ export default function TestPanel(props: {
                   <option value="all">跑完全部步骤</option>
                 </select>
               </div>
+              <div className="form-row">
+                <label>填充预览</label>
+                <select value={fillPreview ? '1' : '0'} onChange={(e) => setFillPreview(e.target.value === '1')}>
+                  <option value="0">关闭（智能填充直接执行）</option>
+                  <option value="1">开启（AI 填充值先人工确认，首次跑陌生站点建议开）</option>
+                </select>
+              </div>
               <div className="form-row test-run-btns">
                 <button className="btn" onClick={doParse} disabled={!caseMd.trim()}>
                   校验
@@ -244,7 +254,7 @@ export default function TestPanel(props: {
             {parsed && (
               <div className={`field-hint ${parsed.ok ? '' : 'test-parse-err'}`}>
                 {parsed.ok
-                  ? `✅ ${parsed.name}：${parsed.steps} 步骤 / ${parsed.assertions} 断言${parsed.vars?.length ? ` · 变量: ${parsed.vars.join(', ')}` : ''}`
+                  ? `✅ ${parsed.name}：${parsed.steps} 步骤 / ${parsed.assertions} 断言${parsed.groups ? ` · ${parsed.groups} 组数据驱动` : ''}${parsed.vars?.length ? ` · 变量: ${parsed.vars.join(', ')}` : ''}`
                   : `❌ ${parsed.error}`}
               </div>
             )}
@@ -305,7 +315,8 @@ export default function TestPanel(props: {
                 <div className={`test-run-banner ${RUN_VERDICT[run.state]?.cls || ''}`}>
                   <b>{RUN_VERDICT[run.state]?.text || run.state}</b>
                   <span>
-                    {run.caseName} · 步骤 {Math.min(run.currentStep || 0, run.totalSteps)}/{run.totalSteps} · 通过 {run.passed} · 失败 {run.failed}
+                    {run.caseName}
+                    {run.groupName ? ` · 组「${run.groupName}」` : ''} · 步骤 {Math.min(run.currentStep || 0, run.totalSteps)}/{run.totalSteps} · 通过 {run.passed} · 失败 {run.failed}
                     {run.envName ? ` · ${run.envName}` : ''}
                   </span>
                   {run.state !== 'running' && (

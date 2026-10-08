@@ -1069,11 +1069,91 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
         new Map([[2, 'data:image/jpeg;base64,' + Buffer.from('fake-jpeg').toString('base64')]])
       )
       const rc = readFileSync(reportPath, 'utf-8')
+      const htmlOk = existsSync(joinP(dirname(reportPath), 'report.html'))
+      const htmlContent = htmlOk ? readFileSync(joinP(dirname(reportPath), 'report.html'), 'utf-8') : ''
       check(
         '测试报告生成',
-        reportPath.endsWith('report.md') && rc.includes('❌ 失败') && rc.includes('步骤二') && rc.includes('实际: /z') && existsSync(joinP(dirname(reportPath), 'shots', 'step-2.jpg')),
-        reportPath
+        reportPath.endsWith('report.md') && rc.includes('❌ 失败') && rc.includes('步骤二') && rc.includes('实际: /z') && existsSync(joinP(dirname(reportPath), 'shots', 'step-2.jpg')) && htmlOk && htmlContent.includes('❌ 失败') && htmlContent.includes('step-2.jpg'),
+        `${reportPath}（HTML ${htmlOk ? '✓' : '缺失'}）`
       )
+
+      // 10.11 文件上传：{{变量}}路径解析 + DOM.setFileInputFiles 真实喂文件
+      {
+        const { writeFileSync: wf } = await import('fs')
+        const tmpFile = join(process.cwd(), 'selftest-upload-tmp.txt')
+        wf(tmpFile, 'easybow upload selftest\n', 'utf-8')
+        // 给文件框一个可识别的 title（提取器对空值 input 的 text 回退到 title）
+        await ftab.cdp.evaluate(String(function markUp() { (document.getElementById('up-file') as HTMLInputElement).title = '自测上传框' }), [])
+        const snapUp = await ex.extract(ftab)
+        const upIdx = snapUp.candidates.findIndex((c) => c.text === '自测上传框')
+        const upCtx = { memory: { 合同: tmpFile }, signal: new AbortController().signal, settings: { speed: 'normal' } as any }
+        const upBatch = await ex.executeBatch([{ name: 'upload', index: upIdx, path: '{{合同}}' }] as any, upCtx)
+        const upState = await ftab.cdp.evaluate<string>(
+          String(function readUp() { const f = (document.getElementById('up-file') as HTMLInputElement).files?.[0]; return f ? f.name : '' }),
+          []
+        )
+        check(
+          '文件上传(DOM.setFileInputFiles+{{变量}}路径)',
+          upIdx >= 0 && !upBatch[0]?.error && upState === 'selftest-upload-tmp.txt',
+          `idx=${upIdx} error=${upBatch[0]?.error || '无'} 已选=${upState || '无'}`
+        )
+      }
+
+      // 10.12 hover 悬停展开（CDP 无按键 mouseMoved → mouseenter/CSS :hover）
+      {
+        await ftab.cdp.evaluate(String(function scrollHover() { (document.getElementById('hover-trigger') as HTMLElement).scrollIntoView({ block: 'center' }) }), [])
+        await sleep(300)
+        const snapHv = await ex.extract(ftab)
+        const hvIdx = snapHv.candidates.findIndex((c) => c.text.includes('更多操作'))
+        const hvBatch = await ex.executeBatch([{ name: 'hover', index: hvIdx }] as any, passCtx)
+        const hvFlag = await ftab.cdp.evaluate<string>(String(function readHv() { return document.getElementById('hover-flag')!.textContent || '' }), [])
+        check('hover悬停展开', hvIdx >= 0 && !hvBatch[0]?.error && hvFlag === 'hovered', `idx=${hvIdx} error=${hvBatch[0]?.error || '无'} flag=${hvFlag}`)
+      }
+
+      // 10.13 提交后软断言：提交类点击后发现「可见的」校验错误提示（用例没写断言也能兜住）
+      {
+        // 上一项 hover 展开的菜单是 absolute+z-index，会盖住下方的保存按钮——先收起再点
+        await ftab.cdp.evaluate(
+          String(function closeMenu() { (document.getElementById('hover-menu') as HTMLElement).style.display = 'none' }),
+          []
+        )
+        await ftab.cdp.evaluate(String(function scrollSave() { (document.getElementById('save-btn') as HTMLElement).scrollIntoView({ block: 'center' }) }), [])
+        await sleep(300)
+        const snapSv = await ex.extract(ftab)
+        const svIdx = snapSv.candidates.findIndex((c) => c.text.trim() === '保存设置')
+        const softErrors: string[] = []
+        const svBatch = await ex.executeBatch(
+          [{ name: 'click', index: svIdx }] as any,
+          { ...passCtx, softAssert: true, softErrors }
+        )
+        check(
+          '提交后软断言(校验错误兜底)',
+          svIdx >= 0 && !svBatch[0]?.error && softErrors.length === 1 && softErrors[0].includes('名称重复') && (svBatch[0]?.result || '').includes('⚠'),
+          `idx=${svIdx} soft=${JSON.stringify(softErrors)} result=${(svBatch[0]?.result || '').slice(0, 60)}`
+        )
+      }
+
+      // 10.14 多组数据解析（数据驱动）：### 组名 小节 → groups
+      {
+        const groupMd = [
+          '# TESTCASE: 登录多组',
+          '## 测试数据',
+          '### 组1: 正确凭据',
+          '| password | Right@1 |',
+          '### 组2: 错误密码',
+          '| password | wrong |',
+          '## 步骤',
+          '### 步骤 1: 登录',
+          '- 操作: 输入 {{password}} 提交',
+          '- 预期: [URL] 包含 /home'
+        ].join('\n')
+        const gr = parseTestCase(groupMd)
+        const gOk =
+          !!gr.tc?.groups && gr.tc.groups.length === 2 && gr.tc.groups[0].name === '组1: 正确凭据' && gr.tc.groups[0].vars.password === 'Right@1' && gr.tc.groups[1].vars.password === 'wrong'
+        const single = parseTestCase(sampleMd)
+        const sOk = single.tc?.groups === undefined && single.tc?.vars.username === 'test01'
+        check('多组数据解析(数据驱动)', gOk && sOk, `双组=${gOk} 单组兼容=${sOk}`)
+      }
     } catch (e: any) {
       check('仿真测试功能', false, String(e?.stack || e))
     }

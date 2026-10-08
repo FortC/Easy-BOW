@@ -84,7 +84,65 @@ export function writeTestReport(run: TestRunStatus, tc: TestCase, shots: Map<num
   lines.push('```')
   const reportPath = join(dir, 'report.md')
   writeFileSync(reportPath, lines.join('\n'), 'utf-8')
+  // 同目录产出 HTML 版（可直接浏览器打开/发同事；截图相对引用 shots/）
+  try {
+    writeFileSync(join(dir, 'report.html'), renderHtmlReport(run), 'utf-8')
+  } catch {
+    /* HTML 写失败不影响 MD 报告 */
+  }
   return reportPath
+}
+
+/** HTML 版报告（独立文件、内联样式，截图相对路径引用同目录 shots/） */
+function renderHtmlReport(run: TestRunStatus): string {
+  const esc = (s: unknown): string =>
+    String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+  const badge =
+    run.state === 'passed'
+      ? '<span class="b ok">✅ 通过</span>'
+      : run.state === 'failed'
+        ? '<span class="b bad">❌ 失败</span>'
+        : `<span class="b warn">${run.state === 'stopped' ? '⏹️ 已停止' : '⚠️ 异常'}</span>`
+  const dur = run.endedAt && run.startedAt ? Math.round((run.endedAt - run.startedAt) / 1000) : null
+  const rows = run.steps
+    .map((s) => {
+      const mark = s.status === 'passed' ? '✅' : s.status === 'failed' ? '❌' : s.status === 'skipped' ? '⏭️' : '⏳'
+      const asserts = s.assertions
+        .map(
+          (a) =>
+            `<div class="a ${a.passed ? 'ok' : 'bad'}"><span>${a.passed ? '✓' : '✗'}</span><code>${esc(a.raw)}</code>${
+              a.passed ? '' : `<em>实际: ${esc(a.actual || '(未取得)')}</em>`
+            }</div>`
+        )
+        .join('')
+      const shot = s.shotFile ? `<img src="${esc(s.shotFile)}" alt="失败截图" loading="lazy">` : ''
+      return `<div class="step ${s.status}"><div class="h"><span>${mark}</span><b>${s.index}. ${esc(s.title)}</b><span class="m">${esc(
+        s.error || ''
+      )}</span></div>${asserts ? `<div class="as">${asserts}</div>` : ''}${shot}</div>`
+    })
+    .join('')
+  return `<!DOCTYPE html>
+<html lang="zh"><head><meta charset="UTF-8"><title>测试报告: ${esc(run.caseName)}</title>
+<style>
+body{font-family:"Segoe UI","Microsoft YaHei",sans-serif;max-width:860px;margin:24px auto;padding:0 16px;color:#1f2329;background:#fafbfc}
+h1{font-size:20px}.meta{font-size:13px;color:#646a73;margin:8px 0 16px;line-height:1.9}
+.b{padding:2px 10px;border-radius:10px;font-size:13px}.b.ok{background:#e8f7ec;color:#2e9e44}.b.bad{background:#fdeeee;color:#d9393a}.b.warn{background:#fff7e8;color:#b26a00}
+.step{border:1px solid #eceef1;border-radius:8px;padding:8px 12px;margin:6px 0;background:#fff}
+.step.failed{border-color:#f2c1c1}.step.passed{border-color:#cdebd4}
+.h{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:13.5px}.m{color:#d9393a;font-size:12px}
+.as{margin-top:6px;padding-left:18px}.a{font-size:12.5px;margin:2px 0}.a em{color:#d9393a;font-style:normal;margin-left:6px}
+code{background:#f4f5f7;padding:0 4px;border-radius:3px;font-size:12px}
+img{max-width:100%;border:1px solid #e5e6eb;border-radius:6px;margin-top:8px}
+</style></head><body>
+<h1>测试报告: ${esc(run.caseName)} ${badge}</h1>
+<div class="meta">
+通过 ${run.passed}/${run.totalSteps} 步${run.envName ? ` · 环境: ${esc(run.envName)}` : ''}${run.groupName ? ` · 组: ${esc(run.groupName)}` : ''}${
+    dur != null ? ` · 耗时 ${dur}s` : ''
+  } · Token 输入 ${run.tokens?.input || 0} / 输出 ${run.tokens?.output || 0}<br>
+开始: ${esc(new Date(run.startedAt || Date.now()).toLocaleString('zh-CN', { hour12: false }))}
+</div>
+${rows}
+</body></html>`
 }
 
 /** 用例回显（与 parser 输入规范一致的 MD） */

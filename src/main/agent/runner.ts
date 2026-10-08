@@ -18,7 +18,9 @@ import type {
   MainEvent,
   TestCase,
   TestAssertion,
-  TestRunStatus
+  TestGroup,
+  TestRunStatus,
+  TestStepResult
 } from '@shared/types'
 
 type Broadcast = (ev: MainEvent) => void
@@ -34,6 +36,8 @@ interface TestExecCtx {
   failFast: boolean
   /** 生产保护环境：提交类点击需人工确认（透传给 executor） */
   protectedSubmit: boolean
+  /** 智能填充前弹人工预览确认 */
+  fillPreview: boolean
   envName?: string
   /** 当前测试步骤已消耗的模型步数（预算保护用） */
   perStepModelSteps: number
@@ -83,6 +87,7 @@ function parseModelJson(text: string): { thought: string; actions: AgentAction[]
         negate: a.negate === true ? true : undefined,
         data: a.data && typeof a.data === 'object' && !Array.isArray(a.data) ? a.data : undefined,
         onlyRequired: a.onlyRequired === true ? true : undefined,
+        path: a.path != null ? String(a.path) : undefined,
         result: a.result != null ? String(a.result) : undefined
       }))
     return { thought, actions }
@@ -122,6 +127,13 @@ export class AgentRunner {
   private testCtx: TestExecCtx | null = null
   /** 最近一次测试运行的状态（结束后保留供 UI 查询，直到下次运行） */
   private testRun: TestRunStatus | null = null
+  /** 测试模式跨步骤软断言收集（提交后校验错误提示；executor 推入，步骤判定时消费） */
+  private testSoftErrors: string[] = []
+  /** 数据驱动多组：收集模式（单组 run 不写报告，由合并器统一写） */
+  private testCollectMode = false
+  private testGroupResults: Array<{ name: string; run: TestRunStatus; shots: Map<number, string> }> = []
+  /** 单组 run 完成回调（execTestSequence 顺序执行用） */
+  private testDoneResolve: ((run: TestRunStatus) => void) | null = null
 
   constructor(tabManager: TabManager, executor: Executor, broadcast: Broadcast) {
     this.tabManager = tabManager
@@ -222,80 +234,190 @@ export class AgentRunner {
   }
 
   /**
-   * 启动测试运行：解析用例 MD → 独立测试页签（独立登录分区）→ 复用主循环执行
-   * （loop 内所有测试行为以 testCtx 为门卫；finishTest 统一收尾）。
+   * 启动测试运行：解析用例 MD → 数据组（缺省单组）→ 逐组在独立测试页签执行 → 报告。
+   * 入口只做同步校验（快速把错误抛给 UI），执行序列异步跑。
    */
   async startTestRun(
     md: string,
-    opts: { failFast: boolean; env?: { name: string; baseUrl: string; protected: boolean } }
+    opts: { failFast: boolean; fillPreview?: boolean; env?: { name: string; baseUrl: string; protected: boolean } }
   ): Promise<void> {
     if (this.state.state === 'running' || this.state.state === 'paused') {
       throw new Error('已有任务在运行，请先停止')
     }
     const settings = getSettings()
     if (!settings.apiKey) throw new Error('请先在「设置」中配置 AI 接口（baseURL / API Key / 模型）')
-    const provider = createProvider(settings)
     const parsed = parseTestCase(md)
     if (!parsed.ok || !parsed.tc) throw new Error(`测试用例解析失败: ${parsed.error}`)
-
-    // 独立测试页签（登录态与日常浏览互不污染）；页签满时让用户先关页签
-    const tab = this.tabManager.ensureTestTab()
-    tab.cdp.setDialogPolicy('accept') // JS 原生弹窗自动应答（仅测试期间启用，结束即关闭）
-
-    this.testCtx = {
-      tc: parsed.tc,
-      stepIdx: 0,
-      failFast: opts.failFast,
-      protectedSubmit: !!opts.env?.protected,
-      envName: opts.env?.name,
-      perStepModelSteps: 0
-    }
-    this.testRun = {
-      state: 'running',
-      caseName: parsed.tc.name,
-      envName: opts.env?.name,
-      totalSteps: parsed.tc.steps.length,
-      currentStep: 0,
-      steps: parsed.tc.steps.map((s, i) => ({
-        index: i + 1,
-        title: s.title,
-        status: 'pending',
-        assertions: [],
-        modelSteps: 0
-      })),
-      passed: 0,
-      failed: 0,
-      startedAt: Date.now(),
-      tokens: { input: 0, output: 0 }
-    }
-    this.broadcastTestRun()
-
-    const task = `🧪 测试: ${parsed.tc.name}`
-    this.steps = []
-    this.lastResults = []
-    this.pendingGuidance = []
-    this.lastExecutedActions = []
-    this.loginHintedHosts.clear()
-    this.abortCtrl = new AbortController()
-    this.pauseRequested = false
-    this.setState({
-      state: 'running',
-      task,
-      stepCount: 0,
-      statusText: `测试启动: ${parsed.tc.name}`,
-      usage: { inputTokens: 0, outputTokens: 0, steps: 0 },
-      // 测试数据变量 + 环境 base_url 注入记忆（{{变量}} 替换全链路生效）
-      memory: { ...parsed.tc.vars, ...(opts.env?.baseUrl ? { base_url: opts.env.baseUrl } : {}) },
-      result: undefined
+    const tc = parsed.tc
+    // 数据驱动多组：数据区含 ### 组名 小节时逐组跑同一脚本；缺省单组（向后兼容）
+    const groups: TestGroup[] = tc.groups?.length ? tc.groups : [{ name: '', vars: tc.vars }]
+    void this.execTestSequence(tc, groups, settings, opts).catch((e) => {
+      this.setState({ state: 'error', statusText: `测试异常: ${e?.message || e}` })
+      this.broadcast({ channel: 'toast', message: `测试异常: ${e?.message || e}`, kind: 'error' })
+      if (this.testCtx) this.finishTest()
     })
-    this.loop(task, provider, settings)
-      .catch((e) => {
-        this.setState({ state: 'error', statusText: `测试异常: ${e?.message || e}` })
-        this.broadcast({ channel: 'toast', message: `测试异常: ${e?.message || e}`, kind: 'error' })
+  }
+
+  /** 数据驱动：逐组顺序执行（上一组跑完再下一组；中途停止则跳出），最后合并报告 */
+  private async execTestSequence(
+    tc: TestCase,
+    groups: TestGroup[],
+    settings: Settings,
+    opts: { failFast: boolean; fillPreview?: boolean; env?: { name: string; baseUrl: string; protected: boolean } }
+  ): Promise<void> {
+    const multi = groups.length > 1
+    if (multi) this.testGroupResults = []
+    this.testCollectMode = multi
+    let stoppedEarly = false
+    try {
+      for (let gi = 0; gi < groups.length; gi++) {
+        if (this.state.state === 'stopped') {
+          stoppedEarly = true
+          break
+        }
+        if (gi > 0) await new Promise((r) => setTimeout(r, 1200)) // 组间稍歇，界面/遮罩状态落地
+        await this.runTestOnce(tc, groups[gi], settings, opts)
+      }
+    } finally {
+      if (this.state.state === 'stopped') stoppedEarly = true
+      this.testCollectMode = false
+      const results = this.testGroupResults
+      this.testGroupResults = []
+      if (multi && results.length) {
+        const merged = this.mergeGroupRuns(results, tc, opts.env?.name, stoppedEarly)
+        this.testRun = merged
+        this.broadcastTestRun()
+        const verdict =
+          merged.state === 'passed' ? '✅ 全部通过' : merged.state === 'stopped' ? '⏹️ 已停止' : `❌ 失败 ${merged.failed}/${merged.totalSteps} 步`
+        this.broadcast({ channel: 'toast', message: `多组测试结束: ${verdict}`, kind: merged.state === 'passed' ? 'success' : 'error' })
+        this.setState({
+          state: merged.state === 'stopped' ? 'stopped' : 'done',
+          statusText: `测试结束: ${verdict}（${results.length} 组）`,
+          result: `${verdict}（${results.length} 组 · 通过 ${merged.passed}/${merged.totalSteps}）${merged.reportPath ? `\n报告: ${merged.reportPath}` : ''}`,
+          stepCount: this.steps.length
+        })
+      }
+    }
+  }
+
+  /** 合并多组结果：步骤展平（组名前缀）+ 截图重定位 + 汇总判定 + 写合并报告 */
+  private mergeGroupRuns(
+    results: Array<{ name: string; run: TestRunStatus; shots: Map<number, string> }>,
+    tc: TestCase,
+    envName: string | undefined,
+    stoppedEarly: boolean
+  ): TestRunStatus {
+    const steps: TestStepResult[] = []
+    const shotMap = new Map<number, string>()
+    let si = 0
+    for (const g of results) {
+      for (const s of g.run.steps) {
+        si++
+        steps.push({ ...s, index: si, title: `[${g.name}] ${s.title}` })
+        if (s.status === 'failed' && g.shots.has(s.index)) shotMap.set(si, g.shots.get(s.index)!)
+      }
+    }
+    const passed = steps.filter((s) => s.status === 'passed').length
+    const failed = steps.length - passed
+    const merged: TestRunStatus = {
+      state: stoppedEarly ? 'stopped' : failed === 0 ? 'passed' : 'failed',
+      caseName: tc.name,
+      envName,
+      totalSteps: steps.length,
+      currentStep: steps.length,
+      steps,
+      passed,
+      failed,
+      startedAt: results[0].run.startedAt,
+      endedAt: results[results.length - 1].run.endedAt || Date.now(),
+      tokens: results.reduce((acc, r) => ({ input: acc.input + (r.run.tokens?.input || 0), output: acc.output + (r.run.tokens?.output || 0) }), { input: 0, output: 0 })
+    }
+    try {
+      merged.reportPath = writeTestReport(merged, tc, shotMap)
+    } catch (e) {
+      console.error('[easybow] 多组测试报告写入失败:', e)
+    }
+    return merged
+  }
+
+  /** 单组运行：setup → 复用主循环 → finishTest 收尾（Promise 在收尾时兑现） */
+  private runTestOnce(
+    tc: TestCase,
+    group: TestGroup,
+    settings: Settings,
+    opts: { failFast: boolean; fillPreview?: boolean; env?: { name: string; baseUrl: string; protected: boolean } }
+  ): Promise<TestRunStatus> {
+    return new Promise<TestRunStatus>((resolve) => {
+      const provider = createProvider(settings)
+      // 独立测试页签（登录态与日常浏览互不污染）；页签满时让用户先关页签
+      const tab = this.tabManager.ensureTestTab()
+      tab.cdp.setDialogPolicy('accept') // JS 原生弹窗自动应答（仅测试期间启用，结束即关闭）
+
+      this.testSoftErrors = []
+      this.testCtx = {
+        tc,
+        stepIdx: 0,
+        failFast: opts.failFast,
+        protectedSubmit: !!opts.env?.protected,
+        fillPreview: !!opts.fillPreview,
+        envName: opts.env?.name,
+        perStepModelSteps: 0
+      }
+      this.testRun = {
+        state: 'running',
+        caseName: tc.name,
+        envName: opts.env?.name,
+        groupName: group.name || undefined,
+        totalSteps: tc.steps.length,
+        currentStep: 0,
+        steps: tc.steps.map((s, i) => ({
+          index: i + 1,
+          title: s.title,
+          status: 'pending',
+          assertions: [],
+          modelSteps: 0
+        })),
+        passed: 0,
+        failed: 0,
+        startedAt: Date.now(),
+        tokens: { input: 0, output: 0 }
+      }
+      this.broadcastTestRun()
+
+      const task = `🧪 测试: ${tc.name}${group.name ? ` [${group.name}]` : ''}`
+      this.steps = []
+      this.lastResults = []
+      this.pendingGuidance = []
+      this.lastExecutedActions = []
+      this.loginHintedHosts.clear()
+      this.abortCtrl = new AbortController()
+      this.pauseRequested = false
+      this.setState({
+        state: 'running',
+        task,
+        stepCount: 0,
+        statusText: `测试启动: ${task.slice(3)}`,
+        usage: { inputTokens: 0, outputTokens: 0, steps: 0 },
+        // 本组数据变量 + 环境 base_url 注入记忆（{{变量}} 替换全链路生效）
+        memory: { ...group.vars, ...(opts.env?.baseUrl ? { base_url: opts.env.baseUrl } : {}) },
+        result: undefined
       })
-      .finally(() => {
-        if (this.testCtx) this.finishTest()
-      })
+      this.testDoneResolve = resolve
+      this.loop(task, provider, settings)
+        .catch((e) => {
+          this.setState({ state: 'error', statusText: `测试异常: ${e?.message || e}` })
+          this.broadcast({ channel: 'toast', message: `测试异常: ${e?.message || e}`, kind: 'error' })
+        })
+        .finally(() => {
+          if (this.testCtx) this.finishTest()
+          // 兜底：finishTest 未兑现（不应发生）也必须解锁序列
+          if (this.testDoneResolve) {
+            const r = this.testDoneResolve
+            this.testDoneResolve = null
+            r(this.getTestRunStatus() || ({} as TestRunStatus))
+          }
+        })
+    })
   }
 
   /**
@@ -339,10 +461,15 @@ export class AgentRunner {
         }
       }
     }
-    try {
-      run.reportPath = writeTestReport(run, tctx.tc, shots)
-    } catch (e) {
-      console.error('[easybow] 测试报告写入失败:', e)
+    if (this.testCollectMode) {
+      // 多组收集模式：本组结果与截图暂存，报告由 mergeGroupRuns 统一写
+      this.testGroupResults.push({ name: run.groupName || '', run: this.getTestRunStatus()!, shots })
+    } else {
+      try {
+        run.reportPath = writeTestReport(run, tctx.tc, shots)
+      } catch (e) {
+        console.error('[easybow] 测试报告写入失败:', e)
+      }
     }
     this.testCtx = null
     this.broadcastTestRun()
@@ -355,6 +482,10 @@ export class AgentRunner {
       result: `${verdict}（通过 ${run.passed}/${run.totalSteps}）${run.reportPath ? `\n报告: ${run.reportPath}` : ''}`,
       stepCount: this.steps.length
     })
+    // 兑现 execTestSequence 的等待（多组时进入下一组）
+    const done = this.testDoneResolve
+    this.testDoneResolve = null
+    if (done) done(this.getTestRunStatus() || ({} as TestRunStatus))
   }
 
   /** 测试脚本区块（注入每步 user 消息；含当前步骤每条预期应输出的确切 expect JSON） */
@@ -418,6 +549,13 @@ export class AgentRunner {
         actual: e.error ? e.error.replace(/^断言失败:.*实际=/, '').slice(0, 150) : undefined
       })
     }
+    // 软断言（提交后校验错误提示，executor 在 click 时推入）：并入断言展示与判定
+    for (const msg of this.testSoftErrors) {
+      const raw = `[自动] ${msg}`
+      if (!cur.assertions.some((x) => x.raw === raw)) {
+        cur.assertions.push({ raw, kind: 'soft', passed: false, actual: msg })
+      }
+    }
     // 弹窗应答记录反馈给模型
     const dlg = this.tabManager.getTestTab()?.cdp.consumeDialogs()
     if (dlg) this.lastResults.push(`系统提示: 页面原生弹窗已按脚本自动应答: ${dlg}`)
@@ -427,7 +565,7 @@ export class AgentRunner {
 
     if (stepDoneSignal && !hardFail) {
       const scriptStep = tctx.tc.steps[tctx.stepIdx]
-      const missing = (scriptStep?.assertions.length || 0) - cur.assertions.length
+      const missing = Math.max(0, (scriptStep?.assertions.length || 0) - cur.assertions.filter((x) => x.kind !== 'soft').length)
       if (assertFail || missing > 0) {
         cur.status = 'failed'
         if (!cur.error) cur.error = assertFail ? '断言失败' : `有 ${missing} 条预期未输出断言`
@@ -438,9 +576,10 @@ export class AgentRunner {
         this.broadcastTestRun()
         return false // fail-fast：直接结束循环，finishTest 收尾
       }
-      // 推进到下一步骤
+      // 推进到下一步骤（软断言随步骤消费清空）
       tctx.stepIdx++
       tctx.perStepModelSteps = 0
+      this.testSoftErrors = []
       run.passed = run.steps.filter((s) => s.status === 'passed').length
       run.failed = run.steps.filter((s) => s.status === 'failed' || s.status === 'skipped').length
       if (tctx.stepIdx >= tctx.tc.steps.length) {
@@ -871,7 +1010,11 @@ export class AgentRunner {
           signal,
           settings: getSettings(),
           prevActions: this.lastExecutedActions,
-          protectedSubmit: this.testCtx?.protectedSubmit
+          protectedSubmit: this.testCtx?.protectedSubmit,
+          // 测试模式专属执行开关（普通任务恒缺省，executor 分支不进入）
+          softAssert: this.testCtx ? true : undefined,
+          fillPreview: this.testCtx?.fillPreview,
+          softErrors: this.testCtx ? this.testSoftErrors : undefined
         }
       )
       // 只认实际执行成功的 done（暂停/出错打断批次时不应误判完成）

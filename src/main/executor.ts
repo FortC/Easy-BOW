@@ -11,8 +11,9 @@ import {
   formatCandidates
 } from './extractor'
 import { mdToHtml, mdToPlain } from './markdown'
-import { EXPECT_TEXT_FN, EXPECT_SEL_FN } from './testcase/assertions'
+import { EXPECT_TEXT_FN, EXPECT_SEL_FN, SOFT_ERR_FN } from './testcase/assertions'
 import { FORM_FIELDS_FN, FORM_SET_FN, type FormField } from './testcase/fields'
+import { existsSync, statSync } from 'fs'
 import type { AgentAction, Settings } from '@shared/types'
 
 export interface ExecContext {
@@ -23,6 +24,12 @@ export interface ExecContext {
   prevActions?: AgentAction[]
   /** 测试模式：生产保护环境下为 true，提交类点击前需人工确认（普通任务恒缺省） */
   protectedSubmit?: boolean
+  /** 测试模式：提交类点击后自动软断言（页面校验错误提示兜底；普通任务恒缺省） */
+  softAssert?: boolean
+  /** 测试模式：智能填充前弹人工预览确认（普通任务恒缺省） */
+  fillPreview?: boolean
+  /** 测试模式跨步骤共享：软断言收集（runner 持有数组，步骤完成时统一判定） */
+  softErrors?: string[]
 }
 
 interface Resolved {
@@ -108,6 +115,58 @@ const READ_VALUE_FN = String(function readValue(framePaths: number[][], path: nu
 const SCROLL_FN = String(function scrollTo(where: string) {
   if (where === 'top') window.scrollTo({ top: 0 })
   else if (where === 'bottom') window.scrollTo({ top: document.documentElement.scrollHeight })
+})
+
+/** upload 动作用：按 framePaths+path 找到元素并返回引用（配合 evaluateRef → DOM.setFileInputFiles） */
+const UPLOAD_FIND_FN = String(function findEl(framePaths: number[][], path: number[]) {
+  function walk(doc: Document, p: number[]): Element | null {
+    let el: Element = doc.documentElement
+    for (const i of p) {
+      const next = el.children[i]
+      if (!next) return null
+      el = next
+    }
+    return el
+  }
+  let doc: Document = document
+  for (const fp of framePaths) {
+    const f = walk(doc, fp)
+    if (!f || f.tagName !== 'IFRAME') return null
+    try {
+      doc = (f as HTMLIFrameElement).contentDocument as Document
+    } catch {
+      return null
+    }
+    if (!doc) return null
+  }
+  return walk(doc, path)
+})
+
+/** upload 动作用：回读文件框已选文件数（-1=元素不是 input[type=file]） */
+const UPLOAD_COUNT_FN = String(function countFiles(framePaths: number[][], path: number[]) {
+  function walk(doc: Document, p: number[]): Element | null {
+    let el: Element = doc.documentElement
+    for (const i of p) {
+      const next = el.children[i]
+      if (!next) return null
+      el = next
+    }
+    return el
+  }
+  let doc: Document = document
+  for (const fp of framePaths) {
+    const f = walk(doc, fp)
+    if (!f || f.tagName !== 'IFRAME') return null
+    try {
+      doc = (f as HTMLIFrameElement).contentDocument as Document
+    } catch {
+      return null
+    }
+    if (!doc) return null
+  }
+  const el = walk(doc, path) as HTMLInputElement | null
+  if (!el || el.tagName !== 'INPUT') return -1
+  return el.files ? el.files.length : 0
 })
 
 function rand(min: number, max: number): number {
@@ -281,25 +340,24 @@ export class Executor {
         const r = await this.resolveIndex(t, a.index)
         if (!r.found) throw new Error(`元素[${a.index}]已失效（页面可能已变化）`)
         if (r.w === 0 || r.h === 0) throw new Error(`元素[${a.index}]不可见`)
+        const snap = this.snapshots.get(t.id)
+        const cand = snap?.candidates[a.index]
+        const label = `${cand?.text || ''} ${cand?.extra || ''}`.trim()
+        const submitish = /提交|确定|保存|下单|支付|发布|删除|结算/.test(label)
         // 测试模式生产保护：提交/删除类点击需人工确认（普通任务 protectedSubmit 恒缺省，零影响）
-        if (ctx.protectedSubmit) {
-          const snap = this.snapshots.get(t.id)
-          const cand = snap?.candidates[a.index]
-          const label = `${cand?.text || ''} ${cand?.extra || ''}`.trim()
-          if (/提交|确定|保存|下单|支付|发布|删除|结算/.test(label)) {
-            const choice = await dialog.showMessageBox({
-              type: 'warning',
-              buttons: ['允许本次', '拦截'],
-              defaultId: 1,
-              cancelId: 1,
-              message: `生产环境保护：测试即将点击「${label.slice(0, 30)}」`,
-              detail: '当前环境被标记为生产保护，请人工确认本次提交可以执行。'
-            })
-            if (choice.response !== 0) {
-              a.result = `已拦截提交类点击「${label.slice(0, 30)}」（生产环境保护）`
-              a.error = a.result
-              return false
-            }
+        if (ctx.protectedSubmit && submitish) {
+          const choice = await dialog.showMessageBox({
+            type: 'warning',
+            buttons: ['允许本次', '拦截'],
+            defaultId: 1,
+            cancelId: 1,
+            message: `生产环境保护：测试即将点击「${label.slice(0, 30)}」`,
+            detail: '当前环境被标记为生产保护，请人工确认本次提交可以执行。'
+          })
+          if (choice.response !== 0) {
+            a.result = `已拦截提交类点击「${label.slice(0, 30)}」（生产环境保护）`
+            a.error = a.result
+            return false
           }
         }
         await this.sleep(160, ctx.signal)
@@ -315,6 +373,19 @@ export class Executor {
           } catch {}
         }
         a.result = `点击(${Math.round(r.x!)},${Math.round(r.y!)})`
+        // 测试模式软断言：提交类点击后 1.2s 检查「可见的」表单校验错误提示——
+        // 用例没写这类断言时也能兜住「提交失败但静默通过」（普通任务 softAssert 恒缺省）
+        if (ctx.softAssert && submitish && !a.error) {
+          await this.sleep(1200, ctx.signal)
+          const soft = await t.cdp
+            .evaluate<{ hit: boolean; sel?: string; text?: string }>(SOFT_ERR_FN, [])
+            .catch(() => ({ hit: false }) as { hit: boolean; sel?: string; text?: string })
+          if (soft?.hit) {
+            const msg = `提交后出现校验错误提示: ${soft.text}（${soft.sel}）`
+            a.result = `${a.result} ⚠${msg}`
+            ctx.softErrors?.push(msg)
+          }
+        }
         return false
       }
       case 'type': {
@@ -740,6 +811,26 @@ export class Executor {
             onlyRequired: !!a.onlyRequired
           })
         }
+        // 填充预览模式：AI 推断的「字段→值」映射先人工确认再执行（首次跑陌生站点建议开）
+        if (ctx.fillPreview) {
+          const preview = plan
+            .slice(0, 30)
+            .map((p) => {
+              const f = fields[p.index]
+              const name = f ? (f.label || f.placeholder || f.name || f.id || `#${p.index}`) : `#${p.index}`
+              return `${name} = ${p.value || '(勾选:' + (p.check ? '是' : '否') + ')'}${p.reason ? `  ← ${p.reason}` : ''}`
+            })
+            .join('\n')
+          const choice = await dialog.showMessageBox({
+            type: 'info',
+            buttons: ['执行填充', '取消'],
+            defaultId: 0,
+            cancelId: 1,
+            message: '智能填充预览（确认后开始填充）',
+            detail: preview.slice(0, 900)
+          })
+          if (choice.response !== 0) throw new Error('智能填充已被人工取消（预览模式）')
+        }
         const lines: string[] = []
         let fails = 0
         for (const item of plan) {
@@ -756,6 +847,69 @@ export class Executor {
         }
         a.result = `智能填充 ${plan.length - fails}/${plan.length} 个字段:\n` + lines.slice(0, 20).join('\n')
         if (fails) a.error = `${fails} 个字段填充未通过回读验证`
+        return false
+      }
+      case 'hover': {
+        // 悬停展开（导航下拉等 hover 菜单）：无按键 mouseMoved 触发 CSS :hover / mouseenter
+        const t = tm.active()
+        if (!t) throw new Error('没有可用页签')
+        if (a.index == null) throw new Error('hover 需要 index')
+        const r = await this.resolveIndex(t, a.index)
+        if (!r.found) throw new Error(`元素[${a.index}]已失效（页面可能已变化）`)
+        if (r.w === 0 || r.h === 0) throw new Error(`元素[${a.index}]不可见`)
+        await this.sleep(140, ctx.signal)
+        const x = r.x! + rand(-2, 2)
+        const y = r.y! + rand(-2, 2)
+        if (this.overlay) {
+          try {
+            await this.overlay.moveTo(x, y)
+          } catch {}
+        }
+        await t.cdp.mouseHover(x, y)
+        await this.sleep(180, ctx.signal)
+        // 同点微移一次，确保 hover 状态稳定建立
+        await t.cdp.mouseHover(x + 1, y + 1)
+        await this.sleep(120, ctx.signal)
+        a.result = `悬停(${Math.round(x)},${Math.round(y)})`
+        return false
+      }
+      case 'upload': {
+        // 文件上传：CDP DOM.setFileInputFiles（input[type=file] 只能这样喂文件，
+        // type/insertText 均无效）。路径支持 {{变量}}（测试数据表 @路径 约定）。
+        const t = tm.active()
+        if (!t) throw new Error('没有可用页签')
+        if (a.index == null) throw new Error('upload 需要 index')
+        if (!a.path) throw new Error('upload 需要 path（本地文件路径）')
+        let p = a.path.replace(/\{\{([^}]+)\}\}/g, (_m, k) => ctx.memory[String(k).trim()] ?? _m)
+        if (p.startsWith('@')) p = p.slice(1)
+        p = p.replace(/^"|"$/g, '')
+        if (!existsSync(p)) throw new Error(`文件不存在: ${p}`)
+        const st = statSync(p)
+        if (!st.isFile()) throw new Error(`不是文件: ${p}`)
+        if (st.size > 50 * 1024 * 1024) throw new Error('文件超过 50MB 上限')
+        const [framePaths, path] = await this.pathsFor(t, a.index)
+        const objectId = await t.cdp.evaluateRef(UPLOAD_FIND_FN, [framePaths, path])
+        if (!objectId) throw new Error(`元素[${a.index}]未找到（应为 input[type=file]）`)
+        // DOM 域命令需先 enable；requestNode 还要求 DOM agent 已拉取过文档（否则 nodeId=0）
+        await t.cdp.send('DOM.enable', {})
+        // 首选：现代协议支持 objectId 直传
+        let set = false
+        try {
+          await t.cdp.send('DOM.setFileInputFiles', { files: [p], objectId })
+          set = true
+        } catch {
+          /* 旧协议回退 nodeId 路径 */
+        }
+        if (!set) {
+          await t.cdp.send('DOM.getDocument', { depth: 0 })
+          const node = await t.cdp.send<{ nodeId: number }>('DOM.requestNode', { objectId })
+          if (!node?.nodeId) throw new Error('DOM.requestNode 未返回 nodeId')
+          await t.cdp.send('DOM.setFileInputFiles', { files: [p], nodeId: node.nodeId })
+        }
+        // 回读确认文件真的挂上了（CDP 命令成功≠生效）
+        const upCount = await t.cdp.evaluate<number>(UPLOAD_COUNT_FN, [framePaths, path]).catch(() => -1)
+        if (upCount === 0) throw new Error('文件未挂载到 input[type=file]（setFileInputFiles 未生效）')
+        a.result = `已选择文件 ${p.split(/[\\/]/).pop()}（${Math.round(st.size / 1024)}KB）`
         return false
       }
       case 'test_step_done': {

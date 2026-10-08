@@ -63,3 +63,31 @@ export const EXPECT_SEL_FN = String(function expectSel(selector: string, mode: '
   const t = String(el.innerText != null ? el.innerText : el.textContent || '').replace(/\s+/g, ' ').trim()
   return { ok: true, count: nodes.length, v: t.slice(0, 120) }
 })
+
+/**
+ * 提交后软断言求值：检查常见表单校验错误选择器中是否有「可见且非空文案」的元素
+ * （display/visibility/尺寸三重过滤，避免隐藏的预置错误节点误报）。
+ */
+export const SOFT_ERR_FN = String(function softErr() {
+  const SELS = [
+    '.error-msg', '[role="alert"]', '.ant-form-item-explain-error', '.el-form-item__error',
+    '.field-error', '.invalid-feedback', '.form-error', '.help-error'
+  ]
+  for (const s of SELS) {
+    let nodes: NodeList
+    try {
+      nodes = document.querySelectorAll(s)
+    } catch {
+      continue
+    }
+    for (const el of Array.from(nodes)) {
+      const e = el as HTMLElement
+      const st = getComputedStyle(e)
+      const r = e.getBoundingClientRect()
+      if (st.display === 'none' || st.visibility === 'hidden' || r.width <= 0 || r.height <= 0) continue
+      const t = (e.innerText || '').trim().slice(0, 60)
+      if (t) return { hit: true, sel: s, text: t }
+    }
+  }
+  return { hit: false }
+})

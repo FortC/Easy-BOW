@@ -28,6 +28,8 @@ export interface Settings {
   vision: boolean
   /** 拟人化速度：normal 正常 / slow 慢速（风控敏感站点） */
   speed: 'normal' | 'slow'
+  /** 支持后台/最小化运行（抑制 Chromium 后台节流；重启应用后生效，默认关=与历史行为一致） */
+  bgRun?: boolean
   homepage: string
 }
 
@@ -41,6 +43,7 @@ export const DEFAULT_SETTINGS: Settings = {
   aiMode: 'hybrid',
   vision: false,
   speed: 'normal',
+  bgRun: false,
   homepage: 'https://www.baidu.com'
 }
 
@@ -114,6 +117,8 @@ export type ActionName =
   | 'expect'
   | 'test_step_done'
   | 'fill_form'
+  | 'upload'
+  | 'hover'
 
 /** expect 断言类型 */
 export type ExpectKind =
@@ -146,6 +151,8 @@ export interface AgentAction {
   data?: Record<string, string>
   /** fill_form：只填必填项 */
   onlyRequired?: boolean
+  /** upload：本地文件绝对路径（支持 {{变量}}，测试数据表用 @路径 约定） */
+  path?: string
   /** 执行结果摘要（主进程回填） */
   result?: string
   /** 执行错误（主进程回填） */
@@ -213,12 +220,20 @@ export interface TestStep {
   dialog?: 'accept' | 'dismiss'
 }
 
+/** 数据驱动：一组测试数据（### 组名 小节；缺省单组=vars） */
+export interface TestGroup {
+  name: string
+  vars: Record<string, string>
+}
+
 /** 解析后的测试用例（parser 产物） */
 export interface TestCase {
   name: string
   /** 数据表变量（注入任务记忆，{{变量}} 处替换） */
   vars: Record<string, string>
   steps: TestStep[]
+  /** 多组数据驱动（数据区含 ### 组名 小节时存在；runner 逐组执行同一脚本） */
+  groups?: TestGroup[]
 }
 
 export interface TestAssertionResult {
@@ -251,6 +266,8 @@ export interface TestRunStatus {
   state: TestRunState
   caseName: string
   envName?: string
+  /** 数据驱动多组时的当前组名 */
+  groupName?: string
   totalSteps: number
   /** 当前执行到的步骤（1-based；0=未开始） */
   currentStep: number
@@ -393,9 +410,13 @@ export interface EasybowApi {
     steps?: number
     assertions?: number
     vars?: string[]
+    groups?: number
   }>
   /** 运行测试：解析 MD → 独立测试页签（独立登录分区）执行 → 报告 */
-  testStart(md: string, opts: { envName?: string; failFast: boolean }): Promise<void>
+  testStart(
+    md: string,
+    opts: { envName?: string; failFast: boolean; fillPreview?: boolean }
+  ): Promise<void>
   /** 停止测试（与停止任务同一管线） */
   testStop(): Promise<void>
   /** 当前/最近一次测试运行状态 */

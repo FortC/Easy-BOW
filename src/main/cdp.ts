@@ -81,6 +81,21 @@ export class Cdp {
     return ro.value as T
   }
 
+  /**
+   * 在页面执行函数并返回元素引用（objectId，不走 returnByValue）——
+   * 供 DOM.requestNode / DOM.setFileInputFiles 等需要 nodeId 的 CDP 命令用（文件上传）。
+   */
+  async evaluateRef(fn: string, args: unknown[] = []): Promise<string | null> {
+    const expr = `(${fn})(${args.map((a) => JSON.stringify(a)).join(',')})`
+    const res = await this.send<{ result?: { objectId?: string; type?: string } }>('Runtime.evaluate', {
+      expression: expr,
+      returnByValue: false
+    })
+    const ro = res.result
+    if (!ro || ro.type === 'undefined' || !ro.objectId) return null
+    return ro.objectId
+  }
+
   /** 视口截图（jpeg dataURL；quality 越高越清晰，视觉模式发模型用高质量） */
   async screenshotJpeg(quality = 45): Promise<string | null> {
     try {
@@ -128,6 +143,11 @@ export class Cdp {
   /** 按下鼠标（拖动起点） */
   async mouseDown(x: number, y: number): Promise<void> {
     await this.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 })
+  }
+
+  /** 无按键悬停（触发 CSS :hover / mouseenter；hover 菜单展开用） */
+  async mouseHover(x: number, y: number): Promise<void> {
+    await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0 })
   }
 
   /** 拖动中的移动（保持左键按下） */

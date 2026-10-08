@@ -270,6 +270,13 @@ export default function SettingsModal(props: {
             </select>
           </div>
           <div className="form-row">
+            <label>后台/最小化运行</label>
+            <select value={s.bgRun ? '1' : '0'} onChange={(e) => set({ bgRun: e.target.value === '1' })}>
+              <option value="0">关闭（默认：最小化时页面可能被节流降速）</option>
+              <option value="1">开启（窗口最小化仍全速执行；修改后重启应用生效）</option>
+            </select>
+          </div>
+          <div className="form-row">
             <label>主页</label>
             <input value={s.homepage} onChange={(e) => set({ homepage: e.target.value.trim() })} />
           </div>
