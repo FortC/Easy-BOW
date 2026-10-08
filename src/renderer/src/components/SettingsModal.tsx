@@ -252,6 +252,15 @@ export default function SettingsModal(props: {
           <div className="field-hint">模型不支持图片时会自动降级为元素列表模式，任务不会中断；「测试连接」会顺带探测视觉支持</div>
         </div>
 
+        <div className="form-row">
+          <label>视觉兜底（元素列表连续定位不到目标时，自动临时开几步截图，让模型「看图定位」并支持按截图坐标点击）</label>
+          <select value={s.visionFallback === false ? '0' : '1'} onChange={(e) => set({ visionFallback: e.target.value === '1' })}>
+            <option value="1">开启（默认：疑难页面才发图，平时 0 图片费用）</option>
+            <option value="0">关闭（任何情况下都不发截图）</option>
+          </select>
+          <div className="field-hint">只在「元素失效/不可见/页面提不出元素」连着发生时触发，连点 3 步后自动回到常规模式；模型不支持图片时改用本地 OCR 文字兜底</div>
+        </div>
+
         <div className="form-inline">
           <div className="form-row">
             <label>单任务最大步数（{s.maxSteps}）</label>

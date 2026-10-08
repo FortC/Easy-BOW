@@ -83,6 +83,16 @@ export class FastLlm {
     return this.lastGenMs
   }
 
+  /** 退出清理：释放 ONNX 会话持有的内存/WASM 堆（大模型常驻会拖住进程退出） */
+  dispose(): void {
+    try {
+      ;(this.model as any)?.dispose?.()
+    } catch {}
+    this.model = null
+    this.tokenizer = null
+    this.loading = false
+  }
+
   /**
    * 模型文件根目录（transformers.js 的 cacheDir 布局：REPO/config.json、REPO/onnx/model_*.onnx）：
    * 1) 安装包内置 resources/fastmodel（打包进发行版，离线即用）

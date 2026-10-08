@@ -173,6 +173,11 @@ function rand(min: number, max: number): number {
   return min + Math.random() * (max - min)
 }
 
+/** 视口尺寸（CSS 像素）：截图归一化坐标 → 实际点击坐标换算用 */
+const VIEWPORT_FN = String(function viewportSize() {
+  return { w: window.innerWidth || 0, h: window.innerHeight || 0 }
+})
+
 /** 剪贴板写入带超时保护：个别环境下异步写可能不返回，挂死会卡住整个 Agent 循环 */
 function clipboardWriteTimeout(ms = 8000): Promise<never> {
   return new Promise((_r, rej) => setTimeout(() => rej(new Error(`剪贴板写入超时(${ms}ms)`)), ms))
@@ -293,7 +298,7 @@ export class Executor {
     const out: AgentAction[] = []
     const needsOverlay =
       actions.some((a) =>
-        ['click', 'type', 'scroll', 'drag', 'paste_rich', 'paste_image'].includes(a.name)
+        ['click', 'click_xy', 'type', 'scroll', 'drag', 'paste_rich', 'paste_image'].includes(a.name)
       )
     try {
       if (needsOverlay && this.overlay && !ctx.signal.aborted) await this.overlay.begin()
@@ -386,6 +391,35 @@ export class Executor {
             ctx.softErrors?.push(msg)
           }
         }
+        return false
+      }
+      case 'click_xy': {
+        // 视觉兜底：按截图上的归一化坐标（0~1000）点击——元素列表里没有目标时用（canvas/自定义控件/图标按钮）
+        const t = tm.active()
+        if (!t) throw new Error('没有可用页签')
+        if (a.x == null || a.y == null) throw new Error('click_xy 需要 x 与 y（截图归一化坐标 0~1000）')
+        const nx = Math.max(0, Math.min(1000, a.x)) / 1000
+        const ny = Math.max(0, Math.min(1000, a.y)) / 1000
+        const vp = await t.cdp
+          .evaluate<{ w: number; h: number }>(VIEWPORT_FN, [])
+          .catch(() => null as { w: number; h: number } | null)
+        const W = vp?.w || 1280
+        const H = vp?.h || 720
+        const px = Math.round(nx * W)
+        const py = Math.round(ny * H)
+        if (this.overlay) {
+          try {
+            await this.overlay.moveTo(px, py)
+          } catch {}
+        }
+        await this.sleep(160, ctx.signal)
+        await t.cdp.mouseClick(px + rand(-2, 2), py + rand(-2, 2))
+        if (this.overlay) {
+          try {
+            await this.overlay.click(px, py)
+          } catch {}
+        }
+        a.result = `按截图坐标点击(${Math.round(a.x)},${Math.round(a.y)}) → 视口(${px},${py})`
         return false
       }
       case 'type': {

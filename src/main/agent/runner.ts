@@ -4,11 +4,21 @@ import { Cdp } from '../cdp'
 import type { TabManager } from '../tabs'
 import { getSettings } from '../settings'
 import { matchKB } from '../knowledge'
-import { buildStepMessage, SYSTEM_PROMPT, VISION_ADDON, TEST_MODE_ADDON, LOCAL_SYSTEM_PROMPT, buildLocalPrompt, type TestScriptContext } from './prompts'
+import {
+  buildStepMessage,
+  SYSTEM_PROMPT,
+  VISION_ADDON,
+  VISION_FALLBACK_ADDON,
+  TEST_MODE_ADDON,
+  LOCAL_SYSTEM_PROMPT,
+  buildLocalPrompt,
+  type TestScriptContext
+} from './prompts'
 import { createProvider, isVisionUnsupportedError, type ContentPart, type LlmProvider } from './llm'
 import { validateLocalActions, type FastLlm } from '../fastllm'
 import { ocrPageText } from '../ocr'
 import { parseTestCase } from '../testcase/parser'
+import { isLoginStep, pickWarmupUrl, probeLoginState } from './loginState'
 import { writeTestReport } from '../testcase/report'
 import { updateCaseRunStat } from '../testcase/store'
 import type {
@@ -32,6 +42,8 @@ const visionUnsupported = new Set<string>()
 
 /** 测试模式内部执行上下文（仅 startTestRun 期间存在；loop 的所有测试分支以它为门卫） */
 interface TestExecCtx {
+  /** 所属运行代号（旧循环的收尾不得污染新运行） */
+  epoch: number
   tc: TestCase
   /** 当前测试步骤（0-based） */
   stepIdx: number
@@ -45,6 +57,14 @@ interface TestExecCtx {
   caseId?: number
   /** 当前测试步骤已消耗的模型步数（预算保护用） */
   perStepModelSteps: number
+  /** 登录态复用：启动/每步探测，已登录时跳过登录类步骤 */
+  loginReuse: boolean
+  /** true=已登录 / false=需要登录 / null=未知（未知时保守不跳过） */
+  loggedIn: boolean | null
+  /** 登录态失效提示是否已注入过（同一轮只提示一次，避免刷屏） */
+  loginWarned: boolean
+  /** 探测摘要（日志/报告用） */
+  loginDetail?: string
 }
 
 /** 断言 → expect 动作（提示词里展示给模型的确切 JSON） */
@@ -94,7 +114,10 @@ function parseModelJson(text: string): { thought: string; actions: AgentAction[]
         data: a.data && typeof a.data === 'object' && !Array.isArray(a.data) ? a.data : undefined,
         onlyRequired: a.onlyRequired === true ? true : undefined,
         path: a.path != null ? String(a.path) : undefined,
-        result: a.result != null ? String(a.result) : undefined
+        result: a.result != null ? String(a.result) : undefined,
+        // 视觉兜底：click_xy 的归一化坐标（0~1000）
+        x: typeof a.x === 'number' ? a.x : undefined,
+        y: typeof a.y === 'number' ? a.y : undefined
       }))
     return { thought, actions }
   } catch {
@@ -138,8 +161,21 @@ export class AgentRunner {
   /** 数据驱动多组：收集模式（单组 run 不写报告，由合并器统一写） */
   private testCollectMode = false
   private testGroupResults: Array<{ name: string; run: TestRunStatus; shots: Map<number, string> }> = []
-  /** 单组 run 完成回调（execTestSequence 顺序执行用） */
-  private testDoneResolve: ((run: TestRunStatus) => void) | null = null
+  /** 单组 run 完成回调（execTestSequence 顺序执行用；带 epoch 防止旧循环提前兑现新运行的 Promise） */
+  private testDoneResolve: { epoch: number; resolve: (run: TestRunStatus) => void } | null = null
+  /**
+   * 运行代号：每次启动任务/测试前递增。
+   * 旧循环若卡在不可中断的调用里（CDP/模型）还没退出，新运行启动后它的 epoch 即失配 ——
+   * checkpoint 立即返回 false 退出，且它的 finally 不得收尾新运行（旧 bug：旧循环把新 run 提前标记结束，
+   * 表现为「点了运行不执行 / 一直显示执行中」）。
+   */
+  private epoch = 0
+  /** 当前进行中的主循环（供退出清理与重启动抢占用） */
+  private loopActive: Promise<void> | null = null
+  /** 视觉兜底：剩余强制带截图的步数（元素定位连续失败时点亮，倒数清零后回到常规模式） */
+  private visionFallbackLeft = 0
+  /** 连续定位失败次数（动作报「元素已失效/不可见」或页面无候选元素） */
+  private locateFailStreak = 0
 
   constructor(tabManager: TabManager, executor: Executor, broadcast: Broadcast) {
     this.tabManager = tabManager
@@ -180,11 +216,33 @@ export class AgentRunner {
   }
 
   /**
+   * 新运行启动前的统一抢占：让旧循环失效并等它退出（最多 1.5s）。
+   * 返回本次运行的代号；旧循环凭它自我识别为「已被取代」，不得再触碰共享状态。
+   */
+  private async beginRun(): Promise<number> {
+    const stale = this.loopActive
+    if (stale) {
+      // 先把旧循环判死：abort 在途调用 + epoch 递增（它的 checkpoint 会立即返回 false）
+      this.epoch++
+      try {
+        this.abortCtrl?.abort(new Error('新的运行已启动，旧循环作废'))
+      } catch {}
+      const ws = this.resumeWaiters
+      this.resumeWaiters = []
+      ws.forEach((w) => w())
+      await Promise.race([stale.catch(() => undefined), new Promise((r) => setTimeout(r, 1500))])
+    }
+    this.epoch++
+    return this.epoch
+  }
+
+  /**
    * 循环节点：统一处理暂停等待与停止判定。
    * 暂停会中断 LLM 调用（abort 信号），恢复后重建 AbortController 继续当前步骤。
    * 返回 true=继续循环，false=任务结束。
    */
-  private async checkpoint(): Promise<boolean> {
+  private async checkpoint(epoch?: number): Promise<boolean> {
+    if (epoch != null && epoch !== this.epoch) return false // 已被新运行取代：立即退场
     if (this.state.state === 'stopped') return false
     if (this.pauseRequested) {
       // 等待期间被停止时 waitIfPaused 返回 false
@@ -204,6 +262,7 @@ export class AgentRunner {
     }
     const settings = getSettings()
     if (!settings.apiKey) throw new Error('请先在「设置」中配置 AI 接口（baseURL / API Key / 模型）')
+    const epoch = await this.beginRun()
 
     const provider = createProvider(settings)
     this.steps = []
@@ -227,12 +286,14 @@ export class AgentRunner {
     // 应答文案进「上一步结果」让模型知情可纠正；beforeunload 一律阻止离开
     Cdp.defaultDialogPolicy = 'accept'
     for (const t of this.tabManager.all()) t.cdp.setDialogPolicy('accept')
-    this.loop(task, provider, settings)
+    const p = this.loop(task, provider, settings, epoch)
       .catch((e) => {
+        if (epoch !== this.epoch) return // 已被新运行取代：异常归旧循环，不影响当前状态
         this.setState({ state: 'error', statusText: `任务异常: ${e?.message || e}` })
         this.broadcast({ channel: 'toast', message: `任务异常: ${e?.message || e}`, kind: 'error' })
       })
       .finally(() => {
+        if (this.loopActive === p) this.loopActive = null
         // 任务结束解除接管（测试运行有自己的脚本级策略，不经此路径）
         if (!this.testCtx) {
           Cdp.defaultDialogPolicy = null
@@ -243,9 +304,59 @@ export class AgentRunner {
           }
         }
       })
+    this.loopActive = p
   }
 
   // ———————————————— 测试模式（feature/browser-test）————————————————
+
+  /** 强制重置卡住的测试状态（UI 看门狗 / 用户手动兜底）：把 running 判死为 stopped */
+  resetTestRun(reason = '状态已重置（上次运行未正常收尾）'): TestRunStatus | null {
+    const run = this.testRun
+    if (run && run.state === 'running') {
+      for (const s of run.steps) {
+        if (s.status === 'running' || s.status === 'pending') {
+          s.status = 'skipped'
+          if (!s.error) s.error = reason
+        }
+      }
+      run.state = 'stopped'
+      run.endedAt = Date.now()
+      run.failed = run.steps.filter((s) => s.status === 'failed' || s.status === 'skipped').length
+      run.error = reason
+    }
+    // 顺带把 Agent 状态机从「卡住的-running」拉回可启动状态
+    if (this.state.state === 'running' || this.state.state === 'paused' || this.state.state === 'captcha') {
+      this.pauseRequested = false
+      try {
+        this.abortCtrl?.abort(new Error(reason))
+      } catch {}
+      const ws = this.resumeWaiters
+      this.resumeWaiters = []
+      ws.forEach((w) => w())
+    }
+    this.testCtx = null
+    this.testDoneResolve = null
+    this.broadcastTestRun()
+    return this.getTestRunStatus()
+  }
+
+  /** 应用退出：终止在途运行并释放（不广播 UI 已销毁时的事件由 sendEvent 兜底） */
+  dispose(): void {
+    this.epoch++
+    this.pauseRequested = false
+    try {
+      this.abortCtrl?.abort(new Error('应用退出'))
+    } catch {}
+    const ws = this.resumeWaiters
+    this.resumeWaiters = []
+    ws.forEach((w) => w())
+    this.testCtx = null
+    this.testDoneResolve = null
+    try {
+      Cdp.defaultDialogPolicy = null
+      for (const t of this.tabManager.all()) t.cdp.setDialogPolicy(null)
+    } catch {}
+  }
 
   getTestRunStatus(): TestRunStatus | null {
     return this.testRun ? (JSON.parse(JSON.stringify(this.testRun)) as TestRunStatus) : null
@@ -264,6 +375,7 @@ export class AgentRunner {
     opts: {
       failFast: boolean
       fillPreview?: boolean
+      loginReuse?: boolean
       caseId?: number
       env?: { name: string; baseUrl: string; protected: boolean }
     }
@@ -276,12 +388,14 @@ export class AgentRunner {
     const parsed = parseTestCase(md)
     if (!parsed.ok || !parsed.tc) throw new Error(`测试用例解析失败: ${parsed.error}`)
     const tc = parsed.tc
+    const epoch = await this.beginRun()
     // 数据驱动多组：数据区含 ### 组名 小节时逐组跑同一脚本；缺省单组（向后兼容）
     const groups: TestGroup[] = tc.groups?.length ? tc.groups : [{ name: '', vars: tc.vars }]
-    void this.execTestSequence(tc, groups, settings, opts).catch((e) => {
+    void this.execTestSequence(tc, groups, settings, opts, epoch).catch((e) => {
+      if (epoch !== this.epoch) return
       this.setState({ state: 'error', statusText: `测试异常: ${e?.message || e}` })
       this.broadcast({ channel: 'toast', message: `测试异常: ${e?.message || e}`, kind: 'error' })
-      if (this.testCtx) this.finishTest()
+      if (this.testCtx) this.finishTest(epoch)
     })
   }
 
@@ -290,7 +404,8 @@ export class AgentRunner {
     tc: TestCase,
     groups: TestGroup[],
     settings: Settings,
-    opts: { failFast: boolean; fillPreview?: boolean; caseId?: number; env?: { name: string; baseUrl: string; protected: boolean } }
+    opts: { failFast: boolean; fillPreview?: boolean; loginReuse?: boolean; caseId?: number; env?: { name: string; baseUrl: string; protected: boolean } },
+    epoch: number
   ): Promise<void> {
     const multi = groups.length > 1
     if (multi) this.testGroupResults = []
@@ -298,18 +413,20 @@ export class AgentRunner {
     let stoppedEarly = false
     try {
       for (let gi = 0; gi < groups.length; gi++) {
+        if (epoch !== this.epoch) return // 已被新运行取代
         if (this.state.state === 'stopped') {
           stoppedEarly = true
           break
         }
         if (gi > 0) await new Promise((r) => setTimeout(r, 1200)) // 组间稍歇，界面/遮罩状态落地
-        await this.runTestOnce(tc, groups[gi], settings, opts)
+        await this.runTestOnce(tc, groups[gi], settings, opts, epoch)
       }
     } finally {
       if (this.state.state === 'stopped') stoppedEarly = true
       this.testCollectMode = false
       const results = this.testGroupResults
       this.testGroupResults = []
+      if (epoch !== this.epoch) return
       if (multi && results.length) {
         const merged = this.mergeGroupRuns(results, tc, opts.env?.name, stoppedEarly)
         this.testRun = merged
@@ -367,12 +484,19 @@ export class AgentRunner {
     return merged
   }
 
-  /** 单组运行：setup → 复用主循环 → finishTest 收尾（Promise 在收尾时兑现） */
+  /** 单组运行：setup → 登录态预热探测 → 复用主循环 → finishTest 收尾（Promise 在收尾时兑现） */
   private runTestOnce(
     tc: TestCase,
     group: TestGroup,
     settings: Settings,
-    opts: { failFast: boolean; fillPreview?: boolean; caseId?: number; env?: { name: string; baseUrl: string; protected: boolean } }
+    opts: {
+      failFast: boolean
+      fillPreview?: boolean
+      loginReuse?: boolean
+      caseId?: number
+      env?: { name: string; baseUrl: string; protected: boolean }
+    },
+    epoch: number
   ): Promise<TestRunStatus> {
     return new Promise<TestRunStatus>((resolve) => {
       const provider = createProvider(settings)
@@ -384,6 +508,7 @@ export class AgentRunner {
 
       this.testSoftErrors = []
       this.testCtx = {
+        epoch,
         tc,
         stepIdx: 0,
         failFast: opts.failFast,
@@ -391,9 +516,13 @@ export class AgentRunner {
         fillPreview: !!opts.fillPreview,
         envName: opts.env?.name,
         caseId: opts.caseId,
-        perStepModelSteps: 0
+        perStepModelSteps: 0,
+        loginReuse: opts.loginReuse !== false,
+        loggedIn: null,
+        loginWarned: false
       }
       this.testRun = {
+        runId: epoch,
         state: 'running',
         caseName: tc.name,
         envName: opts.env?.name,
@@ -420,6 +549,8 @@ export class AgentRunner {
       this.pendingGuidance = []
       this.lastExecutedActions = []
       this.loginHintedHosts.clear()
+      this.visionFallbackLeft = 0
+      this.locateFailStreak = 0
       this.abortCtrl = new AbortController()
       this.pauseRequested = false
       this.setState({
@@ -432,32 +563,138 @@ export class AgentRunner {
         memory: { ...group.vars, ...(opts.env?.baseUrl ? { base_url: opts.env.baseUrl } : {}) },
         result: undefined
       })
-      this.testDoneResolve = resolve
-      this.loop(task, provider, settings)
-        .catch((e) => {
-          this.setState({ state: 'error', statusText: `测试异常: ${e?.message || e}` })
-          this.broadcast({ channel: 'toast', message: `测试异常: ${e?.message || e}`, kind: 'error' })
-        })
-        .finally(() => {
-          if (this.testCtx) this.finishTest()
-          // 兜底：finishTest 未兑现（不应发生）也必须解锁序列
-          if (this.testDoneResolve) {
-            const r = this.testDoneResolve
+      this.testDoneResolve = { epoch, resolve }
+      // 登录态预热：先真访问目标站点（否则分区里的 Cookie 无从体现），再探测是否已登录
+      const warmup = this.testCtx.loginReuse
+        ? this.warmupLoginState(this.testCtx, opts.env?.baseUrl).catch(() => undefined)
+        : Promise.resolve()
+      warmup.then(() => {
+        if (epoch !== this.epoch) {
+          // 预热期间已被新运行取代：不要启动旧循环
+          const r = this.testDoneResolve
+          if (r && r.epoch === epoch) {
             this.testDoneResolve = null
-            r(this.getTestRunStatus() || ({} as TestRunStatus))
+            r.resolve(this.getTestRunStatus() || ({} as TestRunStatus))
           }
-        })
+          return
+        }
+        const p = this.loop(task, provider, settings, epoch)
+          .catch((e) => {
+            if (epoch !== this.epoch) return
+            this.setState({ state: 'error', statusText: `测试异常: ${e?.message || e}` })
+            this.broadcast({ channel: 'toast', message: `测试异常: ${e?.message || e}`, kind: 'error' })
+          })
+          .finally(() => {
+            if (this.loopActive === p) this.loopActive = null
+            if (this.testCtx && this.testCtx.epoch === epoch) this.finishTest(epoch)
+            // 兜底：finishTest 未兑现（不应发生）也必须解锁序列
+            const r = this.testDoneResolve
+            if (r && r.epoch === epoch) {
+              this.testDoneResolve = null
+              r.resolve(this.getTestRunStatus() || ({} as TestRunStatus))
+            }
+          })
+        this.loopActive = p
+      })
     })
+  }
+
+  /**
+   * 登录态预热：把测试页签先导航到用例的目标站点，等页面稳定后探测登录态。
+   * 命中（分区里已有有效登录）→ 后续「登录类」步骤直接跳过；失效/未知 → 照常执行登录。
+   */
+  private async warmupLoginState(tctx: TestExecCtx, baseUrl?: string): Promise<void> {
+    const url = pickWarmupUrl(tctx.tc, baseUrl)
+    const tab = this.tabManager.getTestTab()
+    if (!url || !tab) return
+    try {
+      await tab.view.webContents.loadURL(url).catch(() => undefined)
+      const deadline = Date.now() + 8000
+      while (Date.now() < deadline) {
+        let loading = false
+        try {
+          loading = tab.view.webContents.isLoading()
+        } catch {
+          break
+        }
+        if (!loading) break
+        await new Promise((r) => setTimeout(r, 200))
+      }
+      await new Promise((r) => setTimeout(r, 700))
+      const p = await probeLoginState(tab)
+      tctx.loggedIn = p.loggedIn ? true : p.needLogin ? false : null
+      tctx.loginDetail = p.detail
+      if (p.loggedIn) {
+        this.lastResults.push(
+          `系统提示: 登录态复用已命中（${p.detail}）——后续测试步骤中的「登录」操作会自动跳过，直接执行其后的业务步骤。`
+        )
+      }
+    } catch {
+      tctx.loggedIn = null
+    }
+  }
+
+  /** 每步刷新登录态（测试模式 + 登录态复用开启时；一次轻量 evaluate） */
+  private async refreshLoginState(): Promise<void> {
+    const tctx = this.testCtx
+    if (!tctx || !tctx.loginReuse) return
+    try {
+      const tab = this.tabManager.getTestTab() || this.tabManager.active()
+      const p = await probeLoginState(tab)
+      if (p.loggedIn) tctx.loggedIn = true
+      else if (p.needLogin) tctx.loggedIn = false
+      tctx.loginDetail = p.detail
+    } catch {}
+  }
+
+  /**
+   * 登录态复用判定：当前步骤是登录类且已确认登录 → 直接判过并推进到下一步。
+   * 返回 'skip' = 已跳过并推进（调用方 continue）、'end' = 已无后续步骤（应结束）、'no' = 不跳过。
+   */
+  private consumeLoginSkip(): 'no' | 'skip' | 'end' {
+    const tctx = this.testCtx
+    const run = this.testRun
+    if (!tctx || !run || !tctx.loginReuse || tctx.loggedIn !== true) return 'no'
+    const step = tctx.tc.steps[tctx.stepIdx]
+    if (!isLoginStep(step)) return 'no'
+    const cur = run.steps[tctx.stepIdx]
+    if (!cur || cur.status === 'passed' || cur.status === 'failed') return 'no'
+    cur.status = 'passed'
+    cur.note = '已复用保存的登录态，跳过登录操作'
+    cur.assertions.push({ raw: '[自动] 复用已保存登录态（跳过登录操作）', kind: 'soft', passed: true })
+    if (!this.advanceTestStep()) return 'end'
+    this.broadcastTestRun()
+    return 'skip'
+  }
+
+  /** 推进到下一步骤（软断言随步骤消费清空）；返回 false=已无后续步骤 */
+  private advanceTestStep(): boolean {
+    const tctx = this.testCtx
+    const run = this.testRun
+    if (!tctx || !run) return false
+    tctx.stepIdx++
+    tctx.perStepModelSteps = 0
+    this.testSoftErrors = []
+    run.passed = run.steps.filter((s) => s.status === 'passed').length
+    run.failed = run.steps.filter((s) => s.status === 'failed' || s.status === 'skipped').length
+    if (tctx.stepIdx >= tctx.tc.steps.length) {
+      run.currentStep = run.totalSteps
+      return false
+    }
+    run.currentStep = tctx.stepIdx + 1
+    return true
   }
 
   /**
    * 测试收尾（幂等）：未执行步骤标 skipped、算通过率、失败步骤截图落盘、写报告、
    * 关闭弹窗自动应答、清 testCtx。由 loop 结束路径（done/异常/停止/fail-fast）统一触发。
    */
-  private finishTest(): void {
+  private finishTest(epoch?: number): void {
     const tctx = this.testCtx
     const run = this.testRun
     if (!tctx || !run || run.state !== 'running') return
+    // 旧循环收尾不得污染新运行（旧 bug：点停止后立刻再运行，旧循环把新 run 提前判死）
+    if (epoch != null && (epoch !== this.epoch || tctx.epoch !== epoch)) return
     try {
       this.tabManager.getTestTab()?.cdp.setDialogPolicy(null)
       this.tabManager.getTestTab()?.cdp.setNetworkCapture(false)
@@ -523,7 +760,7 @@ export class AgentRunner {
     // 兑现 execTestSequence 的等待（多组时进入下一组）
     const done = this.testDoneResolve
     this.testDoneResolve = null
-    if (done) done(this.getTestRunStatus() || ({} as TestRunStatus))
+    if (done) done.resolve(this.getTestRunStatus() || ({} as TestRunStatus))
   }
 
   /** 测试脚本区块（注入每步 user 消息；含当前步骤每条预期应输出的确切 expect JSON） */
@@ -561,6 +798,17 @@ export class AgentRunner {
       }
     }
     if (scriptStep.dialog) lines.push(`- 弹窗: ${scriptStep.dialog === 'accept' ? '确认' : '取消'}（系统自动应答）`)
+    // 登录态复用：已登录时登录类步骤由系统直接判过；会话失效（踩到登录页）时提醒模型先登录
+    if (tctx.loginReuse) {
+      if (isLoginStep(scriptStep) && tctx.loggedIn === true) {
+        lines.push('- 系统提示: 已检测到保存的登录态，本步骤无需执行登录操作（系统会自动判过并推进）')
+      } else if (tctx.loggedIn === false && !isLoginStep(scriptStep) && !tctx.loginWarned) {
+        tctx.loginWarned = true
+        lines.push(
+          `- 系统提示: 当前页面看起来需要登录（登录态可能已失效/被踢出，探测: ${tctx.loginDetail || '—'}）。请先完成登录（填账号密码并提交）再继续本步骤的操作，不要跳过。`
+        )
+      }
+    }
     return { dataLines, progressLines, stepNo: tctx.stepIdx + 1, totalSteps: tctx.tc.steps.length, currentBlock: lines.join('\n') }
   }
 
@@ -606,6 +854,11 @@ export class AgentRunner {
         if (!cur.error) cur.error = assertFail ? '断言失败' : `有 ${missing} 条预期未输出断言`
       } else {
         cur.status = 'passed'
+      }
+      // 登录步骤真正跑通后刷新登录态标记（其后的步骤不再重复登录；失效时由每步探针重新判 false）
+      if (cur.status === 'passed' && isLoginStep(scriptStep)) {
+        tctx.loggedIn = true
+        tctx.loginWarned = false
       }
       if (cur.status === 'failed' && tctx.failFast) {
         this.broadcastTestRun()
@@ -673,6 +926,9 @@ export class AgentRunner {
     this.resumeWaiters = []
     ws.forEach((w) => w())
     this.setState({ state: 'stopped', statusText: '已停止' })
+    // 立即收尾测试状态：loop 可能卡在不可中断的 CDP/模型调用上（要等它自然退出才收尾的话，
+    // UI 会一直停在「执行中」，且「运行」按钮被禁用 → 表现为点运行没反应）
+    if (this.testCtx) this.finishTest(this.testCtx.epoch)
   }
 
   /**
@@ -739,7 +995,8 @@ export class AgentRunner {
   private async loop(
     task: string,
     provider: LlmProvider,
-    settings: Pick<Settings, 'maxSteps' | 'maxElements' | 'vision' | 'baseURL' | 'model' | 'aiMode'>
+    settings: Pick<Settings, 'maxSteps' | 'maxElements' | 'vision' | 'visionFallback' | 'baseURL' | 'model' | 'aiMode'>,
+    epoch: number
   ): Promise<void> {
     let consecutiveParseFail = 0
     let skipCaptchaCheckOnce = false
@@ -751,8 +1008,8 @@ export class AgentRunner {
     let localDisabled = false
 
     while (true) {
-      // 暂停等待 / 停止判定（返回 false 则任务结束）
-      if (!(await this.checkpoint())) return
+      // 暂停等待 / 停止判定（返回 false 则任务结束；epoch 失配=已被新运行取代）
+      if (!(await this.checkpoint(epoch))) return
       const signal = this.abortCtrl!.signal
 
       // 模型步数（人工指导不算步数预算）；测试模式放宽（一个测试步骤可能消耗多个模型步）
@@ -769,8 +1026,18 @@ export class AgentRunner {
         return
       }
 
+      // 0. 登录态复用：已登录时跳过「登录类」步骤（跳过即推进，可能直接跑完整个用例）
+      if (this.testCtx) {
+        const r = this.consumeLoginSkip()
+        if (r === 'end') return // 收尾统一走 finishTest
+        if (r === 'skip') continue
+      }
+
       const tab = this.tabManager.active()
       if (!tab) throw new Error('没有可用页签，请新建页签后再开始任务')
+
+      // 0.5 登录态刷新（测试模式 + 开启复用；一次轻量探针，约几十毫秒）
+      if (this.testCtx) await this.refreshLoginState()
 
       this.setState({ statusText: `第 ${stepN} 步：提取页面元素…` })
 
@@ -787,15 +1054,17 @@ export class AgentRunner {
         throw new Error(`页面元素提取失败: ${e?.message || e}（页面可能在加载中，稍后重试）`)
       }
 
-      // DOM 提取稀疏时 OCR 兜底（图片型页面）
-      if (extract.candidates.length < 3 && this.ocrEnhancer) {
+      // DOM 提取稀疏 / 视觉兜底生效但模型看不了图 → OCR 整页识别兜底（图片型页面、Canvas 应用）
+      const ocrWanted = extract.candidates.length < 3 || (this.visionFallbackLeft > 0 && (visionUnsupported.has(visionKey) || visionDegraded))
+      if (ocrWanted && this.ocrEnhancer) {
         try {
           const ocrText = await ocrPageText(this.tabManager)
           if (ocrText) {
-            this.lastResults.push(`[OCR整页识别] 页面可交互元素极少，以下是整页截图 OCR 文字:\n${ocrText.slice(0, 4000)}`)
+            this.lastResults.push(`[OCR整页识别] 页面可交互元素极少或截图无法发给模型，以下是整页截图 OCR 文字:\n${ocrText.slice(0, 4000)}`)
           }
         } catch {}
       }
+      if (extract.candidates.length === 0) this.locateFailStreak++ // 一个元素都提不出来：定位困难
 
       // 2. 验证码 / 登录检测
       if (!skipCaptchaCheckOnce) {
@@ -838,6 +1107,11 @@ export class AgentRunner {
       const tabsInfo = this.tabManager.infoList()
       // 视觉模式：调用模型前截一张较高质量的视口截图发给模型；截失败则本步静默走纯文本
       const visionActive = settings.vision && !visionDegraded && !visionUnsupported.has(visionKey)
+      // 视觉兜底：元素列表定位不到目标时临时开几步「看图定位」（含坐标点击），
+      // 不必为了偶尔的疑难页面全程开着视觉模式烧 token
+      const fallbackAllowed = settings.visionFallback !== false && !visionDegraded && !visionUnsupported.has(visionKey)
+      const visionForced = fallbackAllowed && this.visionFallbackLeft > 0
+      if (this.visionFallbackLeft > 0) this.visionFallbackLeft--
       const kbTips = matchKB(tab.url).map((e) => ({ domain: e.domain, problem: e.problem, solution: e.solution }))
       // 快照当前排队指导（调用成功前不出队：暂停中断重跑本步时指导不丢）
       const guidanceCount = this.pendingGuidance.length
@@ -902,12 +1176,12 @@ export class AgentRunner {
         this.setState({ statusText: `第 ${stepN} 步：⚡本地快速决策（${Math.round(this.fastllm!.genMs)}ms，未走云端）` })
       } else {
         let visionShot: string | null = null
-        if (visionActive) {
+        if (visionActive || visionForced) {
           try {
             visionShot = await tab.cdp.screenshotJpeg(70)
           } catch {}
         }
-        useVision = visionActive && !!visionShot
+        useVision = (visionActive || visionForced) && !!visionShot
         const elementLines = this.executor.formatForPrompt(extract, settings.maxElements, useVision)
         const userMsg = buildStepMessage({
           task,
@@ -926,7 +1200,7 @@ export class AgentRunner {
         })
         this.lastResults = []
         this.setState({
-          statusText: `第 ${stepN} 步：模型思考中${useVision ? '（👁视觉）' : ''}…（当前累计 ${
+          statusText: `第 ${stepN} 步：模型思考中${useVision ? (visionActive ? '（👁视觉）' : '（👁视觉兜底·看图定位）') : ''}…（当前累计 ${
             this.state.usage.inputTokens + this.state.usage.outputTokens
           } tokens）`
         })
@@ -944,8 +1218,10 @@ export class AgentRunner {
               ]
             : userMsg
         // 测试模式追加测试规则段（普通任务追加空串，提示词逐字节不变）
+        // 视觉兜底步用 FALLBACK 段：额外放行「按截图坐标点击」，解决元素列表里根本没有目标的情况
         const systemPrompt =
-          (useVision ? SYSTEM_PROMPT + VISION_ADDON : SYSTEM_PROMPT) + (this.testCtx ? TEST_MODE_ADDON : '')
+          (useVision ? SYSTEM_PROMPT + (visionActive ? VISION_ADDON : VISION_FALLBACK_ADDON) : SYSTEM_PROMPT) +
+          (this.testCtx ? TEST_MODE_ADDON : '')
 
         try {
           llmOut = await provider.chat(systemPrompt, [{ role: 'user', content }], signal)
@@ -1058,6 +1334,21 @@ export class AgentRunner {
       this.lastExecutedActions = executed
         .filter((a) => a.name !== 'done' && a.name !== 'expect' && a.name !== 'test_step_done')
         .map(({ result: _r, error: _e, ...rest }) => rest)
+
+      // 视觉兜底触发：连续定位失败（元素失效/不可见/页面提不出元素）→ 接下来 3 步带截图让模型看图定位
+      const locateFail = executed.some(
+        (a) => !!a.error && /已失效|不可见|找不到|无法定位|没有可点击|超出范围/.test(a.error)
+      )
+      if (locateFail) this.locateFailStreak++
+      else if (!locateFail && executed.some((a) => !a.error)) this.locateFailStreak = 0
+      if (this.locateFailStreak >= 2 && fallbackAllowed && this.visionFallbackLeft === 0) {
+        this.visionFallbackLeft = 3
+        this.locateFailStreak = 0
+        this.lastResults.push(
+          '系统提示: 连续定位不到目标元素，已临时开启「视觉兜底」——接下来几步会附带页面截图，你可以直接用 {"name":"click_xy","x":500,"y":300} 按截图上的归一化坐标（0~1000）点击目标；能找到元素编号时仍优先用 click index。'
+        )
+        this.setState({ statusText: `第 ${stepN} 步：元素定位失败，已开启视觉兜底（截图定位）` })
+      }
 
       // 收集动作结果供下一步（read_content / extract_images 等大文本）
       for (const a of executed) {

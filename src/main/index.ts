@@ -12,11 +12,13 @@ import { recordHistory, touchHistoryTitle, listHistory, removeHistory, clearHist
 import { formatCandidates } from './extractor'
 import { runSelftest } from './selftest'
 import { runFastllmTest, isFastllmTest } from './fastllm-test'
-import { tryInitOcr, ocrEnhanceExtract, ocrPageText } from './ocr'
+import { tryInitOcr, ocrEnhanceExtract, ocrPageText, disposeOcr } from './ocr'
 import { FastLlm } from './fastllm'
 import { Scheduler } from './scheduler'
+import { onCleanup, runCleanup, forceExitAfter } from './cleanup'
 import { convertRequirement } from './testcase/converter'
 import { parseTestCase, summarize } from './testcase/parser'
+import { stepPreview, updateStep, deleteStep, insertStep } from './testcase/edit'
 import { planFormFill } from './testcase/fields'
 import { reportsRoot, renderCaseMd } from './testcase/report'
 import {
@@ -178,6 +180,7 @@ function createWindow(): void {
   // 窗口销毁时释放探针：否则 macOS activate 等路径反复 createWindow 会累积多份看门狗，
   // 各自独立计数的防崩溃冷却会被集体绕过
   win.on('closed', () => clearInterval(hbTimer))
+  onCleanup(() => clearInterval(hbTimer))
   // 自愈后重新上报浏览器区域（新渲染器启动时也会自行上报，这里兜底）
   win.webContents.on('did-finish-load', () => tabManager?.onWindowResized())
 
@@ -219,6 +222,14 @@ function createWindow(): void {
   const overlay = new Overlay(win)
   executor.overlay = overlay
   tabManager.onLayout = (rect, hidden) => overlay.refit(rect, hidden)
+  // 退出清理：覆盖层（原生视图）/ OCR 隐藏窗口 / 定时任务 / 心跳看门狗 / 页签与 CDP 会话
+  // 不释放会留下后台残留进程，下次启动撞单实例锁或缓存锁（表现为「关闭后打不开」）
+  onCleanup(() => overlay.destroy())
+  onCleanup(() => disposeOcr())
+  onCleanup(() => scheduler.stop())
+  onCleanup(() => runner.dispose())
+  onCleanup(() => fastllm.dispose())
+  onCleanup(() => tabManager.destroyAll())
 
   // OCR 初始化（异步，模型缺失时优雅降级）
   tryInitOcr()
@@ -345,27 +356,58 @@ function registerIpc(): void {
     if (!s.apiKey) throw new Error('请先在「设置」中配置 AI 接口')
     return convertRequirement(createProvider(s), String(reqMd || ''), mode === 'prd' ? 'prd' : 'rough')
   })
-  // 用例 MD 校验（UI 预览步骤/断言/变量/数据组）
+  // 用例 MD 校验（UI 预览步骤/断言/变量/数据组 + 步骤节点明细，供面板行内编辑后重渲染）
   ipcMain.handle('test:parse', (_e, md: string) => {
     const r = parseTestCase(String(md || ''))
     if (!r.ok || !r.tc) return { ok: false, error: r.error }
     const s = summarize(r.tc)
-    return { ok: true, name: r.tc.name, steps: s.steps, assertions: s.assertions, vars: s.vars, groups: s.groups }
+    return {
+      ok: true,
+      name: r.tc.name,
+      steps: s.steps,
+      assertions: s.assertions,
+      vars: s.vars,
+      groups: s.groups,
+      stepsDetail: stepPreview(r.tc)
+    }
   })
-  // 运行测试（环境档案按名解析：base_url 注入记忆 + 生产保护标记；fillPreview=智能填充前人工预览）
+  // 行内编辑单步骤：改/删/插 → 返回新用例 MD（面板据此重新解析，其下方节点一并重建）
+  ipcMain.handle(
+    'test:editStep',
+    (_e, md: string, index: number, patch: any) => {
+      const src = String(md || '')
+      const i = Number(index)
+      if (!patch || typeof patch !== 'object') return { ok: false, error: '缺少编辑内容' }
+      if (patch.op === 'delete') return deleteStep(src, i)
+      if (patch.op === 'insert') {
+        return insertStep(src, i, { title: patch.title, action: patch.action, assertions: patch.assertions })
+      }
+      return updateStep(src, i, {
+        title: patch.title,
+        action: patch.action,
+        assertions: Array.isArray(patch.assertions) ? patch.assertions : undefined,
+        dialog: patch.dialog
+      })
+    }
+  )
+  // 运行测试（环境档案按名解析：base_url 注入记忆 + 生产保护标记；fillPreview=智能填充前人工预览；
+  // loginReuse=启动先探测已保存登录态，命中则跳过登录步骤）
   ipcMain.handle(
     'test:start',
-    ok((md: string, opts: { envName?: string; failFast: boolean; fillPreview?: boolean }) => {
+    ok((md: string, opts: { envName?: string; failFast: boolean; fillPreview?: boolean; loginReuse?: boolean }) => {
       const env = findTestEnv(opts?.envName)
       return runner.startTestRun(String(md || ''), {
         failFast: opts?.failFast !== false,
         fillPreview: !!opts?.fillPreview,
+        loginReuse: opts?.loginReuse !== false,
         env: env ? { name: env.name, baseUrl: env.baseUrl, protected: env.protected } : undefined
       })
     })
   )
   ipcMain.handle('test:stop', () => runner.stopTask())
   ipcMain.handle('test:status', () => runner.getTestRunStatus())
+  // 强制重置卡在「执行中」的测试状态（UI 看门狗/用户手动兜底）
+  ipcMain.handle('test:reset', () => runner.resetTestRun())
   // 用例库：列表/保存（带 id 更新）/删除
   ipcMain.handle('cases:get', () => listTestCases())
   ipcMain.handle(
@@ -463,7 +505,25 @@ if (!gotLock) {
     })
   })
 
+  // 退出清理：先释放全部长生命周期资源，再退出；保险丝兜底强制结束进程，
+  // 杜绝「窗口关了、进程还在后台占着锁，下次启动打不开」
+  let quitting = false
+  const shutdown = async () => {
+    if (quitting) return
+    quitting = true
+    try {
+      await runCleanup()
+    } catch {}
+    forceExitAfter(2500, 0)
+  }
+  app.on('before-quit', () => {
+    void shutdown()
+  })
   app.on('window-all-closed', () => {
     app.quit()
+  })
+  // 兜底：所有窗口已关闭但进程仍未退出（残留句柄），2s 后无条件结束
+  app.on('quit', () => {
+    void shutdown()
   })
 }

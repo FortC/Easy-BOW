@@ -1,5 +1,49 @@
 # Changelog
 
+## [1.3.0] - 2026-10-08
+
+### 新增：自动化测试工具六项优化（feature/test-tooling-polish）
+
+#### ① 登录态复用（启动不重复登录）
+
+- **根因**：测试页签虽用独立分区 `persist:easybow-test` 保存了 cookie/storage，但每次运行都从脚本第 1 步（通常是"打开登录页 / 输入账号密码"）无脑重跑，既不探测当前是否已登录，也不区分哪些步骤属于登录步骤 —— 已登录状态下再走一遍登录流程，轻则被重定向到首页导致后续步骤定位失败，重则触发风控。
+- **改动**：新增 `src/main/agent/loginState.ts`（页面侧探针 `LOGIN_PROBE_FN`：检测登录表单、退出/注销/个人中心等登录后特征、token 类 storage/cookie 键）。运行前先 `warmupLoginState()` —— 用环境 `base_url` 或脚本中第一个 http(s) URL 预热导航，等页面稳定后探测；判定优先级：URL 是登录页且有表单 → 需登录；命中登录后特征 → 已登录；两者都不确定 → 保守不跳过。执行中每步刷新登录态（登录失效会提示模型先登录）。属于登录步骤且当前已登录 → 该步直接置 passed，note 记「已复用保存的登录态，跳过登录操作」并推进指针。面板新增「登录态复用」开关（默认开），设置项 `testLoginReuse`。
+- **验证**：先跑一次含登录的用例让分区留下登录态 → 再点运行，步骤 1「登录」应显示 ✅ 且 note 为「已复用保存的登录态，跳过登录操作」，执行日志出现「已登录，可跳过登录步骤」提示；手动在测试页签退出登录后重跑，应恢复为真实执行登录。
+
+#### ② 测试用例可编辑（改一步，下方节点重生成）
+
+- **根因**：用例 MD 由 AI 一次性生成后即为只读文本，发现步骤描述不准只能回需求重生成整份 —— 成本极高，且无法在"差不多对"的基础上微调。
+- **改动**：parser 增强——步骤支持 `- 登录: 是/否` 显式标记，并按标题/操作关键词自动识别登录步骤。新增 `src/main/testcase/edit.ts`（纯字符串行内编辑，`locateStepBlocks` 按出现顺序跨「## 步骤」「## 清理」统一编号，与 parser 编号口径一致）：`updateStep / deleteStep / insertStep / stepPreview`。面板"用例与运行"页新增**步骤节点区**：每步一张节点卡（序号/标题/操作/断言/弹窗/登录标记），支持"编辑→保存并重生成"、"在下方插入"、"删除"；用例 MD 变更 600ms 防抖自动重新 `testParse` 刷新节点树；保存后用 `revisedFrom` 标记该步及其下方步骤高亮（`nodeRevise` 动画）表示已重生成。新增 IPC `test:editStep`（update/delete/insert 三种模式）。
+- **验证**：打开任一用例 → 改第 2 步的断言 → 保存，第 2 步及下方节点应高亮刷新、MD 文本同步更新（用例名/数据表/清理区块保持不变）→ 点"在下方插入"应插入为新步骤 3 且原步骤 3 顺延。
+
+#### ③ 执行中断后状态修复（不再"点了运行不执行 / 一直显示执行中"）
+
+- **根因**：Agent 主循环是单条异步长链路，停止/失败后旧循环可能仍卡在 CDP 调用或模型请求里未真正退出；此时再点运行，新循环与旧循环共享同一份 `testRun` 状态与 `testDoneResolve`，旧循环回归时会用旧结果覆盖新 run 的状态，或兑现新运行的 Promise —— 表现为"UI 显示执行中但没有任何动作"，且旧循环永远不收尾。
+- **改动**：引入 **epoch（运行代号）抢占机制**。每次 `beginRun()` 先 abort 在途调用、epoch 递增、最多等 1.5s 旧循环让位；所有关键节点（checkpoint / finishTest / execTestSequence / runTestOnce / testDoneResolve）都带 epoch 守卫，失配立即退场且不得收尾新 run。`stopTask()` 现在立即 `finishTest(this.testCtx.epoch)`，不再等 loop 自然结束。`TestRunStatus` 增加 `runId` 便于比对。新增 `resetTestRun(reason)` + IPC `test:reset`，面板内置**看门狗**：状态为 running 但 15s（连续 3 次心跳）收不到 agent 活动 → 自动重置并 toast 提示；卡死时显示"重置状态"按钮可手动点。
+- **验证**：运行中途点"停止" → 状态应立即变 stopped 而非 running；紧接着再点"运行" → 应真正重新开始执行（日志有新的导航/点击动作）；手动制造卡死（断网后运行）→ 约 15s 后出现"已自动重置运行状态"提示，面板恢复可操作。
+
+#### ④ 进程与资源清理（关掉能再打开，端口不再被占）
+
+- **根因**：退出路径分散，OCR 隐藏窗口、Overlay 的 WebContentsView、Scheduler 定时器、心跳 interval、fastllm 的 ONNX 会话都没有统一释放点；`webContents` 未 destroy 时 Electron 进程可能残留，端口/用户数据目录被锁 → 下次启动失败或行为异常。
+- **改动**：新增 `src/main/cleanup.ts`（登记式释放中心）：`onCleanup(fn)` 登记、`runCleanup()` 逆序执行且单项抛错互不影响、`forceExitAfter(ms, code)` 兜底保险丝。`index.ts` 在 `createWindow` 内登记 7 项：overlay.destroy / disposeOcr / scheduler.stop / runner.dispose / fastllm.dispose / tabManager.destroyAll / 清心跳定时器；`before-quit` 与 `quit` 均触发 `runCleanup()` + `forceExitAfter(2500, 0)`；`window-all-closed → app.quit()`。配套给 OCR 与 fastllm 各加 `dispose()`（OCR 清 pending 计时并 reject、销毁隐藏窗口、复位 ready/initing；fastllm 释放 ONNX session 与 tokenizer）。Overlay 新增 `destroy()`（清 timer、卸载、`webContents.destroy()`）。
+- **验证**：运行一次测试（会拉起 OCR + 模型）→ 关闭窗口 → 任务管理器确认 EasyBow 进程全部退出（无残留）→ 立即重新打开，应正常启动且测试页签可再次创建；连续开关 5 次无端口占用/单例拦截。
+
+#### ⑤ 视觉模型兜底（定位不到时按截图坐标点）
+
+- **根因**：文本模式/元素提取拿不到候选（元素无文本、动态渲染、iframe、canvas 控件）时，`candidates.length === 0`，模型只能靠猜，反复重试直到步骤预算耗尽 —— 是测试失败的主要来源。
+- **改动**：runner 统计连续定位失败 `locateFailStreak`，≥2 次且当前模型支持图片 → 置 `visionFallbackLeft = 3`，强制接下来 3 步带页面截图，并追加 `VISION_FALLBACK_ADDON` 提示词：允许输出 `{"name":"click_xy","x":…,"y":…}`（截图上的归一化坐标 0~1000）直接点击；同时提示先 scroll 再定位、能取到元素编号时仍优先 `click index`。executor 新增 `click_xy` 动作：归一化坐标 → `VIEWPORT_FN` 取视口尺寸 → 像素坐标 → 真实 `mouseClick`（含 overlay 轨迹），并入 `needsOverlay`。模型不支持图片时降级启用 OCR 补候选。设置页新增「视觉兜底」开关（`visionFallback`，默认开）。
+- **验证**：找一处纯图标按钮/动态列表跑测试 → 连续两次定位失败后日志出现「已临时开启视觉兜底」→ 模型应输出 click_xy 并成功点到；3 步后自动回退常规模式；在设置里关掉开关则不触发。
+
+#### ⑥ 测试界面层级优化（遮罩不再压弹层，运行可收起）
+
+- **根因**：Overlay 原生遮罩（WebContentsView）层级高于渲染层弹窗，执行中打开任何弹层都会被遮罩盖住/重叠；且测试面板是常驻大面板，执行时挡住页面无法观察执行过程。
+- **改动**：Overlay 增加 `browserHidden` 状态守卫 —— `refit()` 记录该状态，`attach()` 时若弹层打开（`browserHidden` 为真）则直接 detach + unmount，**弹层打开期间绝不挂载原生遮罩**，从根上消除重叠。`App.tsx` 新增 `testCollapsed`，`overlayOpen` 计算排除收起态。面板：运行开始自动收起、结束自动展开（只在状态变化时切一次，不覆盖手动操作）；收起态渲染右侧悬浮按钮 `.test-fab`（无遮罩、pill 造型、hover 缩放、`fabPop` 入场动画、含进度与失败数徽标），点击展开；展开态头部加"收起"按钮。
+- **验证**：执行测试时打开设置/历史等弹层 → 弹层应完整显示在最上层，无灰色遮罩覆盖；面板头部点"收起" → 收缩为右侧悬浮按钮且可观察页面执行过程 → 点悬浮按钮展开回面板；按钮上的失败数徽标与进度应与执行状态一致。
+
+### 修复
+
+- **步骤块定位正则误吞三级标题**：`edit.ts` 的 `locateStepBlocks` 原用 `/^##\s*(.+)$/`，把 `### 步骤 N` 也当二级标题，导致块列表为空、"用例里没有可编辑的步骤块"。改为 `/^##(?!#)/` 与 `/^###(?!#)/` 后，块定位与 update/delete/insert 全部正确（含跨「## 步骤」「## 清理」统一编号）。
+
 ## [1.2.2] - 2026-10-08
 
 ### 修复

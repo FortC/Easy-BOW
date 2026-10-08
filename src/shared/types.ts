@@ -26,6 +26,10 @@ export interface Settings {
   aiMode: 'hybrid' | 'cloud'
   /** 视觉模式：每步把视口截图发给模型（需模型支持图片输入，不支持时自动降级为纯元素列表） */
   vision: boolean
+  /** 视觉兜底：元素列表定位不到目标时，自动截图给模型做「看图定位」（含坐标点击），不必全程开视觉模式 */
+  visionFallback: boolean
+  /** 测试：复用已保存的登录态（启动先探测，已登录则跳过登录步骤；失效才重登） */
+  testLoginReuse: boolean
   /** 拟人化速度：normal 正常 / slow 慢速（风控敏感站点） */
   speed: 'normal' | 'slow'
   /** 支持后台/最小化运行（抑制 Chromium 后台节流；重启应用后生效，默认关=与历史行为一致） */
@@ -42,6 +46,8 @@ export const DEFAULT_SETTINGS: Settings = {
   maxElements: 80,
   aiMode: 'hybrid',
   vision: false,
+  visionFallback: true,
+  testLoginReuse: true,
   speed: 'normal',
   bgRun: false,
   homepage: 'https://www.baidu.com'
@@ -119,6 +125,8 @@ export type ActionName =
   | 'fill_form'
   | 'upload'
   | 'hover'
+  // 视觉兜底：按截图归一化坐标点击（0~1000），用于元素列表定位不到目标时
+  | 'click_xy'
 
 /** expect 断言类型 */
 export type ExpectKind =
@@ -157,6 +165,10 @@ export interface AgentAction {
   onlyRequired?: boolean
   /** upload：本地文件绝对路径（支持 {{变量}}，测试数据表用 @路径 约定） */
   path?: string
+  /** click_xy：截图上的归一化横坐标 0~1000（左上角 0，右下角 1000） */
+  x?: number
+  /** click_xy：截图上的归一化纵坐标 0~1000 */
+  y?: number
   /** 执行结果摘要（主进程回填） */
   result?: string
   /** 执行错误（主进程回填） */
@@ -236,6 +248,8 @@ export interface TestStep {
   assertions: TestAssertion[]
   /** 该步骤遇 JS 弹窗的应答覆盖（缺省=确认） */
   dialog?: 'accept' | 'dismiss'
+  /** 解析期识别为「登录类」步骤（登录态复用时可跳过其操作） */
+  login?: boolean
 }
 
 /** 数据驱动：一组测试数据（### 组名 小节；缺省单组=vars） */
@@ -273,6 +287,8 @@ export interface TestStepResult {
   /** 该步骤消耗的模型步数 */
   modelSteps: number
   error?: string
+  /** 步骤备注（如「已复用保存的登录态，跳过登录操作」） */
+  note?: string
   /** 失败截图文件名（reports/<run>/shots/ 下） */
   shotFile?: string
 }
@@ -281,6 +297,8 @@ export type TestRunState = 'running' | 'passed' | 'failed' | 'error' | 'stopped'
 
 /** 一次测试运行的全量状态（经 test-run 事件推送到测试面板） */
 export interface TestRunStatus {
+  /** 运行代号（主进程每次启动递增；旧循环的收尾不得污染新运行） */
+  runId?: number
   state: TestRunState
   caseName: string
   envName?: string
@@ -422,7 +440,7 @@ export interface EasybowApi {
     reqMd: string,
     mode: 'prd' | 'rough'
   ): Promise<{ ok: boolean; md?: string; error?: string; steps?: number; assertions?: number; attempts?: number }>
-  /** 校验测试用例 MD（解析给 UI 预览步骤数/断言数/变量） */
+  /** 校验测试用例 MD（解析给 UI 预览步骤数/断言数/变量 + 步骤节点明细，供行内编辑重渲染） */
   testParse(md: string): Promise<{
     ok: boolean
     error?: string
@@ -431,12 +449,30 @@ export interface EasybowApi {
     assertions?: number
     vars?: string[]
     groups?: number
+    /** 步骤节点明细（1-based，与 MD 中 ### 小节一一对应） */
+    stepsDetail?: Array<{
+      index: number
+      title: string
+      action: string
+      assertions: string[]
+      dialog?: 'accept' | 'dismiss'
+      login?: boolean
+      cleanup?: boolean
+    }>
   }>
+  /** 行内编辑单个步骤：改标题/操作/预期（或删除、在下方插入），返回新的用例 MD */
+  testEditStep(
+    md: string,
+    index: number,
+    patch: { op: 'update'; title?: string; action?: string; assertions?: string[]; dialog?: 'accept' | 'dismiss' | '' } | { op: 'delete' } | { op: 'insert'; title?: string; action?: string; assertions?: string[] }
+  ): Promise<{ ok: boolean; md?: string; error?: string }>
   /** 运行测试：解析 MD → 独立测试页签（独立登录分区）执行 → 报告 */
   testStart(
     md: string,
-    opts: { envName?: string; failFast: boolean; fillPreview?: boolean }
+    opts: { envName?: string; failFast: boolean; fillPreview?: boolean; loginReuse?: boolean }
   ): Promise<void>
+  /** 强制重置「卡在执行中」的测试状态（UI 看门狗/用户手动兜底） */
+  testReset(): Promise<TestRunStatus | null>
   /** 停止测试（与停止任务同一管线） */
   testStop(): Promise<void>
   /** 当前/最近一次测试运行状态 */

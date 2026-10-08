@@ -19,6 +19,8 @@ export class Overlay {
   private bounds: Electron.Rectangle | null = null
   /** 最近一次推送的状态条文本（重新显示时恢复） */
   private lastStatus = ''
+  /** 浏览器视图是否被 UI 弹层临时隐藏（隐藏期间禁止挂载覆盖层） */
+  private browserHidden = false
 
   constructor(win: BrowserWindow) {
     this.win = win
@@ -44,6 +46,7 @@ export class Overlay {
   /** 浏览器区域变化时同步（保持在最上层） */
   refit(bounds: Electron.Rectangle | null, browserHidden: boolean): void {
     this.bounds = bounds
+    this.browserHidden = browserHidden
     if (!this.shown || browserHidden || !bounds) {
       this.detach()
       this.unmount()
@@ -55,6 +58,13 @@ export class Overlay {
   private attach(bounds?: Electron.Rectangle): void {
     const b = bounds || this.bounds
     if (!b) return
+    // 弹窗打开时浏览器视图已被隐藏（UI 需要露出来）：此时绝不能把覆盖层挂上去 ——
+    // 原生视图会盖在渲染层弹窗之上并拦截鼠标，表现为「遮罩与弹层重叠、点不动」
+    if (this.browserHidden) {
+      this.detach()
+      this.unmount()
+      return
+    }
     try {
       // 常驻挂载 + 可见性切换（避免反复拆装视图）；仅在不在最顶层时重新置顶（页签切换会把页签视图压到覆盖层上面）
       // 视图可能已被 unmount 整体卸载：removeChildView 对非子视图会抛错导致重挂失败，需先判断
@@ -197,6 +207,20 @@ export class Overlay {
   /** 调试/自测：模拟点击顶部「暂停」按钮（走真实 preload→IPC 链路） */
   async debugClickPause(): Promise<void> {
     await this.js('var b = document.getElementById("btn-pause"); b && b.click()')
+  }
+
+  /** 退出清理：卸载并销毁覆盖层视图（残留的 WebContentsView 会拖住进程退出） */
+  destroy(): void {
+    if (this.hideTimer) {
+      clearTimeout(this.hideTimer)
+      this.hideTimer = null
+    }
+    this.shown = false
+    this.working = false
+    this.unmount()
+    try {
+      ;(this.view.webContents as any).destroy?.()
+    } catch {}
   }
 
   forceHide(): void {

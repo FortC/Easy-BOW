@@ -873,6 +873,80 @@ img.hdrop-fav { object-fit: contain; }
 
 /* ---------- 浏览器仿真测试面板 ---------- */
 .test-modal { width: 860px; max-width: 94vw; max-height: 90vh; }
+/* 收起态：右侧悬浮按钮（无遮罩，浏览器画面与鼠标操作完全不受影响） */
+.test-fab {
+  position: fixed; right: 18px; top: 50%; transform: translateY(-50%); z-index: 150;
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 14px; border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--panel-bg); color: var(--text);
+  box-shadow: 0 8px 24px rgba(15, 20, 30, 0.18);
+  font-family: inherit; font-size: var(--fs-body); cursor: pointer;
+  animation: fabPop var(--t-base) var(--ease);
+  transition: box-shadow var(--t-base) var(--ease), border-color var(--t-base) var(--ease),
+    transform var(--t-base) var(--ease);
+}
+.test-fab:hover { border-color: var(--accent); box-shadow: 0 10px 28px rgba(51, 112, 255, 0.24); transform: translateY(-50%) scale(1.04); }
+.test-fab:active { transform: translateY(-50%) scale(0.97); }
+.test-fab.running { border-color: var(--accent); color: var(--accent-dark); }
+.test-fab-icon { font-size: var(--fs-sub); line-height: 1; }
+.test-fab-text { font-weight: 600; white-space: nowrap; }
+.test-fab-badge {
+  min-width: 18px; height: 18px; padding: 0 5px;
+  border-radius: var(--radius-pill); background: var(--danger); color: #fff;
+  font-size: var(--fs-caption); font-weight: 600; line-height: 18px; text-align: center;
+}
+@keyframes fabPop {
+  from { opacity: 0; transform: translateY(-50%) scale(0.8); }
+  to { opacity: 1; transform: translateY(-50%) scale(1); }
+}
+/* 头部操作区（收起按钮 + 关闭） */
+.test-head-ops { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.test-head-ops .close-x { margin-left: 0; }
+
+/* 步骤节点（用例 MD 的图形化视图；编辑后其下方节点重新生成） */
+.test-nodes { margin: 12px 0; display: flex; flex-direction: column; gap: 6px; }
+.test-node {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--section-bg); padding: 8px 10px;
+  transition: border-color var(--t-base) var(--ease), background var(--t-base) var(--ease);
+}
+.test-node.revised { border-color: var(--accent); background: #f5f8ff; animation: nodeRevise var(--t-slow) var(--ease); }
+@keyframes nodeRevise {
+  0% { background: var(--chip-bg); }
+  100% { background: #f5f8ff; }
+}
+.test-node.editing { border-color: var(--accent); background: var(--panel-bg); }
+.test-node-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.test-node-head b { font-size: var(--fs-body); font-weight: 600; }
+.test-node-tag {
+  flex: none; font-size: var(--fs-caption); color: var(--accent-dark);
+  background: var(--chip-bg); border-radius: var(--radius-pill); padding: 1px 8px;
+}
+.test-node-ops { margin-left: auto; display: flex; gap: 4px; flex: none; }
+.test-node-act { margin-top: 4px; font-size: var(--fs-sm); color: var(--text2); line-height: 1.5; }
+.test-node-asserts { margin-top: 4px; display: flex; flex-wrap: wrap; gap: 4px; }
+.test-node-asserts code {
+  font-size: var(--fs-caption); color: var(--text2); background: var(--input-bg);
+  border-radius: 4px; padding: 1px 6px; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.test-node-edit { display: flex; flex-direction: column; gap: 4px; }
+.test-node-edit label { font-size: var(--fs-caption); color: var(--text2); }
+.test-node-edit input,
+.test-node-edit textarea,
+.test-node-edit select {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 6px 8px; font-size: var(--fs-body); font-family: inherit; outline: none;
+  background: var(--panel-bg); color: var(--text); width: 100%;
+  transition: border-color var(--t-base) var(--ease), box-shadow var(--t-base) var(--ease);
+}
+.test-node-edit textarea { resize: vertical; line-height: 1.5; }
+.test-node-edit select { height: 32px; }
+.test-node-edit input:focus,
+.test-node-edit textarea:focus,
+.test-node-edit select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(51, 112, 255, 0.1); }
+.test-node-edit + .test-node-ops { margin-top: 8px; display: flex; gap: 8px; }
 .test-tabs { display: flex; gap: 6px; margin-bottom: 14px; flex: none; }
 .test-tab {
   flex: 1; padding: 8px 0;

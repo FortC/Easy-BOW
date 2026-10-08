@@ -48,6 +48,8 @@ export default function App() {
   /** 定时任务弹窗预绑定的测试用例（用例库⏰ 按钮进来） */
   const [scheduleTestCase, setScheduleTestCase] = useState<{ id: number; name: string } | null>(null)
   const [testOpen, setTestOpen] = useState(false)
+  /** 测试面板收起为右侧悬浮按钮（执行期间让出画面，点击可随时展开） */
+  const [testCollapsed, setTestCollapsed] = useState(false)
   const [task, setTask] = useState('')
   const [settings, setSettings] = useState<Settings | null>(null)
   const [ocr, setOcr] = useState<{ enabled: boolean; reason?: string }>({ enabled: false })
@@ -170,8 +172,15 @@ export default function App() {
   // 是否有弹窗/浮层正在覆盖浏览器视图（原生视图会盖住渲染层，必须主动隐藏）
   // —— 单一来源：隐藏原生视图与占位提示共用它，避免两处表达式失同步
   const overlayOpen = useMemo(
-    () => settingsOpen || viewer != null || taskEditorOpen || kbOpen || historyOpen || scheduleOpen || testOpen,
-    [settingsOpen, viewer, taskEditorOpen, kbOpen, historyOpen, scheduleOpen, testOpen]
+    () =>
+      settingsOpen ||
+      viewer != null ||
+      taskEditorOpen ||
+      kbOpen ||
+      historyOpen ||
+      scheduleOpen ||
+      (testOpen && !testCollapsed),
+    [settingsOpen, viewer, taskEditorOpen, kbOpen, historyOpen, scheduleOpen, testOpen, testCollapsed]
   )
   useEffect(() => {
     window.easybow.setBrowserHidden(overlayOpen)
@@ -250,7 +259,10 @@ export default function App() {
         onTakeover={() => (status.state === 'running' ? window.easybow.pauseTask() : window.easybow.resumeTask())}
         onHistory={() => setHistoryOpen((v) => !v)}
         historyOpen={historyOpen}
-        onTest={() => setTestOpen(true)}
+        onTest={() => {
+          setTestOpen(true)
+          setTestCollapsed(false)
+        }}
         onSettings={() => setSettingsOpen(true)}
         panelCollapsed={panelCollapsed}
         onTogglePanel={() => setPanelCollapsed((v) => !v)}
@@ -332,8 +344,17 @@ export default function App() {
       )}
       <TestPanel
         open={testOpen}
-        onClose={() => setTestOpen(false)}
+        collapsed={testCollapsed}
+        onCollapsedChange={setTestCollapsed}
+        onClose={() => {
+          setTestOpen(false)
+          setTestCollapsed(false)
+        }}
         onToast={pushToast}
+        onScheduleCase={(entry) => {
+          setScheduleTestCase(entry)
+          setScheduleOpen(true)
+        }}
       />
       {settingsOpen && (
         <SettingsModal

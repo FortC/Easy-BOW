@@ -155,6 +155,14 @@ function parseDataSection(lines: string[], startIdx: number): {
   return { vars, groups: hasGroups ? groups : undefined, end: i }
 }
 
+/** 登录类步骤识别（登录态复用据此跳过其操作；显式「- 登录: 是」也支持） */
+const LOGIN_STEP_RE = /(登录|登陆|sign\s*in|log\s*in)/i
+
+function finalizeStep(cur: TestStep, explicit?: boolean): TestStep {
+  if (cur.login == null) cur.login = explicit ?? (LOGIN_STEP_RE.test(cur.title) || LOGIN_STEP_RE.test(cur.action))
+  return cur
+}
+
 /**
  * 解析步骤区块（## 步骤 或 ## 清理）内的 ### 步骤 N: 标题 小节。
  * cleanup=true 时标题加「清理:」前缀（与常规步骤区分，报告里可读）。
@@ -163,14 +171,23 @@ function parseSteps(lines: string[], startIdx: number, cleanup: boolean): { step
   const steps: TestStep[] = []
   let i = startIdx
   let cur: TestStep | null = null
+  let curLogin: boolean | undefined
   for (; i < lines.length; i++) {
     const l = lines[i].trim()
     if (!l) continue
     if (/^##\s/.test(l)) break // 下一个二级区块
     const m = l.match(/^###\s*(?:步骤\s*\d+\s*[:：]\s*)?(.+)$/)
     if (m) {
-      if (cur) steps.push(cur)
+      if (cur) steps.push(finalizeStep(cur, curLogin))
+      curLogin = undefined
       cur = { title: (cleanup ? '清理: ' : '') + m[1].trim(), action: '', assertions: [] }
+      continue
+    }
+    // 显式登录标记（- 登录: 是/否），写在步骤小节内任意位置
+    const lgM = l.match(/^[-*]\s*登录\s*[:：]\s*(是|否|true|false|yes|no)\s*$/i)
+    if (lgM && cur) {
+      const v = lgM[1].toLowerCase()
+      curLogin = v === '是' || v === 'true' || v === 'yes'
       continue
     }
     if (!cur) continue
@@ -191,7 +208,7 @@ function parseSteps(lines: string[], startIdx: number, cleanup: boolean): { step
       continue
     }
   }
-  if (cur) steps.push(cur)
+  if (cur) steps.push(finalizeStep(cur, curLogin))
   return { steps, end: i }
 }
 

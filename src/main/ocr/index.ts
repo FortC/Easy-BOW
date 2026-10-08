@@ -78,6 +78,24 @@ function callWorker(msg: Record<string, unknown>, timeoutMs = 30000, force = fal
   })
 }
 
+/**
+ * 退出清理：OCR 用的是隐藏 BrowserWindow（常驻渲染进程），不销毁会让应用退出后仍有残留进程，
+ * 表现为「关了窗口但进程还在、下次打不开/占着 userData」。
+ */
+export function disposeOcr(): void {
+  for (const [, p] of pending) {
+    clearTimeout(p.timer)
+    p.reject(new Error('应用退出'))
+  }
+  pending.clear()
+  try {
+    if (workerWin && !workerWin.isDestroyed()) workerWin.destroy()
+  } catch {}
+  workerWin = null
+  ready = false
+  initing = null
+}
+
 /** ArrayBuffer 走 IPC 需要转成可结构化克隆的形式 */
 function toTransferable(buf: Buffer): Uint8Array {
   return new Uint8Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength))
