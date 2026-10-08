@@ -116,6 +116,10 @@ export default function TaskPanel(props: {
   ocr: { enabled: boolean; reason?: string }
   task: string
   setTask: (t: string) => void
+  /** 面板已折叠（只留一条展开按钮） */
+  collapsed: boolean
+  /** 点击折叠条上的展开按钮 */
+  onExpandPanel: () => void
   onExpandEditor: () => void
   onOpenSchedule: () => void
   onOpenSettings: () => void
@@ -177,10 +181,13 @@ export default function TaskPanel(props: {
   }
 
   // 任务结束时写入历史（含步骤摘要，供历史回看）
+  // 依赖补齐 steps：原实现只依赖 status.state，steps 更新后不会重写摘要
+  const stepsRef = useRef(props.steps)
+  stepsRef.current = props.steps
   useEffect(() => {
     if ((status.state === 'done' || status.state === 'error' || status.state === 'stopped') && status.task) {
       setHist((h) => {
-        const steps = props.steps
+        const steps = stepsRef.current
           .slice(-30)
           .map((s) => ({ n: s.n, thought: (s.thought || '').slice(0, 60), actions: s.actions.map((a) => actionChip(a).text) }))
         const next = [
@@ -191,7 +198,7 @@ export default function TaskPanel(props: {
         return next
       })
     }
-  }, [status.state])
+  }, [status.state, status.task])
 
   // 任务完成（done）后弹框收集「是否正确完成」反馈（每个任务只问一次）
   useEffect(() => {
@@ -231,7 +238,17 @@ export default function TaskPanel(props: {
   const fmtTok = (n: number) => (n >= 10000 ? (n / 1000).toFixed(1) + 'k' : String(n))
 
   return (
-    <aside className="panel">
+    <aside className={`panel${props.collapsed ? ' collapsed' : ''}`}>
+      {props.collapsed && (
+        <button
+          className="panel-collapse-btn"
+          title="展开 AI 任务面板（Ctrl+B）"
+          aria-label="展开 AI 任务面板"
+          onClick={props.onExpandPanel}
+        >
+          ‹
+        </button>
+      )}
       <div className="panel-head">
         <div className="panel-title">
           AI 任务
@@ -246,9 +263,7 @@ export default function TaskPanel(props: {
           >
             📚
           </span>
-          <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text2)', fontWeight: 400 }}>
-            {props.settings ? props.settings.model || '未配置模型' : '加载中…'}
-          </span>
+          <span className="panel-model">{props.settings ? props.settings.model || '未配置模型' : '加载中…'}</span>
         </div>
       </div>
 
@@ -276,7 +291,7 @@ export default function TaskPanel(props: {
         <div className="task-controls">
           {!running ? (
             <>
-              <button className="btn primary" style={{ flex: 1 }} onClick={start} disabled={!task.trim()}>
+              <button className="btn primary btn-grow" onClick={start} disabled={!task.trim()}>
                 ▶ 开始任务
               </button>
               <button
@@ -290,11 +305,11 @@ export default function TaskPanel(props: {
           ) : (
             <>
               {status.state === 'running' ? (
-                <button className="btn warn" style={{ flex: 1 }} onClick={() => window.easybow.pauseTask()}>
+                <button className="btn warn btn-grow" onClick={() => window.easybow.pauseTask()}>
                   ⏸ 暂停
                 </button>
               ) : (
-                <button className="btn primary" style={{ flex: 1 }} onClick={() => window.easybow.resumeTask()}>
+                <button className="btn primary btn-grow" onClick={() => window.easybow.resumeTask()}>
                   ▶ 继续
                 </button>
               )}
@@ -371,7 +386,7 @@ export default function TaskPanel(props: {
         </div>
       )}
 
-      <div className="status-line">
+      <div className="status-line" role="status" aria-live="polite">
         <span className={`status-badge ${status.state}`}>{STATE_LABEL[status.state] || status.state}</span>
         <span className="status-text" title={status.statusText}>
           {status.state === 'captcha' ? '检测到验证码，请人工完成后点击「继续」' : status.statusText}
@@ -392,7 +407,16 @@ export default function TaskPanel(props: {
             <div key={h.ts} className={`hist-item-wrap${expandedTs === h.ts ? ' open' : ''}`}>
               <div
                 className="hist-item"
+                role="button"
+                tabIndex={0}
+                aria-expanded={expandedTs === h.ts}
                 onClick={() => setExpandedTs(expandedTs === h.ts ? null : h.ts)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault()
+                    setExpandedTs(expandedTs === h.ts ? null : h.ts)
+                  }
+                }}
                 title={h.result || h.task}
               >
                 <span className="h-state">{h.state === 'done' ? '✅' : h.state === 'error' ? '❌' : '⏹'}</span>
@@ -449,10 +473,14 @@ export default function TaskPanel(props: {
 
       <div className="timeline" ref={timelineRef}>
         {props.steps.length === 0 && (
-          <div style={{ color: '#b3bac4', textAlign: 'center', padding: '30px 0', lineHeight: 2 }}>
+          <div className="timeline-empty">
             操作过程将实时显示在这里
-            <br />
-            <span style={{ fontSize: 12 }}>模型只看精简元素列表，每步约 1~4k tokens</span>
+            <span className="timeline-empty-sub">模型只看精简元素列表，每步约 1~4k tokens</span>
+            <div className="timeline-empty-cta">
+              <button className="btn mini" onClick={props.onExpandEditor}>
+                ⤢ 用大编辑器写复杂任务
+              </button>
+            </div>
           </div>
         )}
         {props.steps
@@ -529,8 +557,17 @@ export default function TaskPanel(props: {
       </div>
 
       {askDone && (
-        <div className="fb-mask">
-          <div className="fb-card">
+        <div className="fb-mask" onClick={() => setAskDone(null)}>
+          <div
+            className="fb-card"
+            role="dialog"
+            aria-modal="true"
+            aria-label="任务完成反馈"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') setAskDone(null)
+            }}
+          >
             <div className="fb-title">🎉 AI 报告任务完成</div>
             <div className="fb-task" title={askDone.task}>
               {askDone.task.slice(0, 80)}

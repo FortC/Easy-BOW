@@ -33,6 +33,8 @@ export default function HistoryDropdown(props: {
   onClose: () => void
   onOpen: (url: string, newTab: boolean) => void
   onToast: (msg: string, kind?: 'info' | 'success' | 'error') => void
+  /** 顶部被定时任务倒计时条撑高时的额外偏移（px），避免面板错位 */
+  topOffset?: number
 }) {
   const [entries, setEntries] = useState<HistoryEntry[] | null>(null)
   const [query, setQuery] = useState('')
@@ -90,9 +92,15 @@ export default function HistoryDropdown(props: {
   }
 
   return (
-    <div className="hist-backdrop" onClick={props.onClose}>
-      <div className="hist-panel" onClick={(e) => e.stopPropagation()} style={{ top: LAYOUT.TAB_BAR_H + LAYOUT.TOOLBAR_H + 6 }}>
-        <div className="hist-search">
+    <div className="hdrop-backdrop" onClick={props.onClose}>
+      <div
+        className="hdrop-panel"
+        role="dialog"
+        aria-label="历史页面"
+        onClick={(e) => e.stopPropagation()}
+        style={{ top: LAYOUT.TAB_BAR_H + LAYOUT.TOOLBAR_H + 6 + (props.topOffset || 0) }}
+      >
+        <div className="hdrop-search">
           <input
             ref={inputRef}
             value={query}
@@ -100,38 +108,57 @@ export default function HistoryDropdown(props: {
             spellCheck={false}
             onChange={(e) => setQuery(e.target.value)}
           />
-          <span className="hist-count">{entries ? `${filtered.length} 条` : '…'}</span>
+          <span className="hdrop-count">{entries ? `${filtered.length} 条` : '…'}</span>
         </div>
-        <div className="hist-list">
-          {entries === null && <div className="hist-empty">加载中…</div>}
+        <div className="hdrop-list">
+          {/* 加载中：用骨架屏占位，避免「加载中…」文字与空态文案来回跳变 */}
+          {entries === null && (
+            <>
+              {[0, 1, 2, 3, 4].map((i) => (
+                <div key={i} className="skeleton skeleton-row" style={{ opacity: 1 - i * 0.16 }} />
+              ))}
+            </>
+          )}
           {entries !== null && filtered.length === 0 && (
-            <div className="hist-empty">{query ? '没有匹配的历史记录' : '还没有历史记录，浏览过的页面会出现在这里'}</div>
+            <div className="hdrop-empty">{query ? '没有匹配的历史记录' : '还没有历史记录，浏览过的页面会出现在这里'}</div>
           )}
           {filtered.map((e) => (
             <div
               key={e.url}
-              className="hist-item"
-              title={`${e.title || e.url}\n${e.url}\n单击：当前页签打开 · 中键/⊕：新页签打开`}
+              className="hdrop-row"
+              role="button"
+              tabIndex={0}
+              title={`${e.title || e.url}\n${e.url}\n单击：当前页签打开 · 空格/中键：新页签打开`}
               onClick={() => props.onOpen(e.url, false)}
+              onKeyDown={(ev) => {
+                if (ev.key === 'Enter') {
+                  ev.preventDefault()
+                  props.onOpen(e.url, false)
+                } else if (ev.key === ' ') {
+                  ev.preventDefault()
+                  props.onOpen(e.url, true)
+                }
+              }}
               onAuxClick={(ev) => {
                 if (ev.button === 1) props.onOpen(e.url, true)
               }}
             >
               {(() => {
                 const fav = faviconOf(e.url)
-                return fav ? <Favicon src={fav} /> : <span className="hist-fav">🌐</span>
+                return fav ? <Favicon src={fav} /> : <span className="hdrop-fav">🌐</span>
               })()}
-              <div className="hist-info">
-                <div className="hist-title">{e.title || e.url}</div>
-                <div className="hist-url">
+              <div className="hdrop-info">
+                <div className="hdrop-title">{e.title || e.url}</div>
+                <div className="hdrop-url">
                   {hostOf(e.url)}
-                  {e.count > 1 && <span className="hist-visits"> · 访问{e.count}次</span>}
+                  {e.count > 1 && <span className="hdrop-visits"> · 访问{e.count}次</span>}
                 </div>
               </div>
-              <span className="hist-time">{relTime(e.ts)}</span>
+              <span className="hdrop-time">{relTime(e.ts)}</span>
               <button
-                className="hist-op"
+                className="hdrop-op"
                 title="在新页签打开"
+                aria-label={`在新页签打开 ${e.title || e.url}`}
                 onClick={(ev) => {
                   ev.stopPropagation()
                   props.onOpen(e.url, true)
@@ -140,8 +167,9 @@ export default function HistoryDropdown(props: {
                 ⊕
               </button>
               <button
-                className="hist-op"
+                className="hdrop-op"
                 title="从历史中删除"
+                aria-label={`从历史中删除 ${e.title || e.url}`}
                 onClick={(ev) => {
                   ev.stopPropagation()
                   remove(e.url)
@@ -152,10 +180,10 @@ export default function HistoryDropdown(props: {
             </div>
           ))}
         </div>
-        <div className="hist-foot">
-          <span className="hist-foot-tip">单击在当前页签打开 · ⊕ 新页签打开</span>
+        <div className="hdrop-foot">
+          <span className="hdrop-foot-tip">单击在当前页签打开 · 空格/⊕ 新页签打开</span>
           {!!entries?.length && (
-            <button className="hist-clear" onClick={clear}>
+            <button className="hdrop-clear" onClick={clear}>
               清空历史
             </button>
           )}
@@ -168,6 +196,6 @@ export default function HistoryDropdown(props: {
 /** favicon 加载失败回退为 🌐 */
 function Favicon(props: { src: string }) {
   const [failed, setFailed] = useState(false)
-  if (failed) return <span className="hist-fav">🌐</span>
-  return <img className="hist-fav" src={props.src} alt="" onError={() => setFailed(true)} />
+  if (failed) return <span className="hdrop-fav">🌐</span>
+  return <img className="hdrop-fav" src={props.src} alt="" onError={() => setFailed(true)} />
 }

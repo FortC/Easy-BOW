@@ -1,6 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import type { AgentStatus, Bookmark, MainEvent, Schedule, Settings, StepRecord, TabInfo } from '@shared/types'
-import { LAYOUT } from '@shared/types'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { AgentStatus, Bookmark, MainEvent, Settings, StepRecord, TabInfo } from '@shared/types'
 import TabBar from './components/TabBar'
 import Toolbar from './components/Toolbar'
 import TaskPanel from './components/TaskPanel'
@@ -11,11 +10,14 @@ import KnowledgeModal from './components/KnowledgeModal'
 import HistoryDropdown from './components/HistoryDropdown'
 import ScheduleModal from './components/ScheduleModal'
 import TestPanel from './components/TestPanel'
+import { useDelayedUnmount } from './hooks/useDelayedUnmount'
 
 interface Toast {
   id: number
   message: string
   kind: 'info' | 'success' | 'error' | 'captcha'
+  /** 处于退场阶段（播完动画再真正移除） */
+  closing?: boolean
 }
 
 const IDLE_STATUS: AgentStatus = {
@@ -26,6 +28,11 @@ const IDLE_STATUS: AgentStatus = {
   usage: { inputTokens: 0, outputTokens: 0, steps: 0 },
   memory: {}
 }
+
+/** 定时任务倒计时条高度，与 styles.css 的 --countdown-h 保持一致 */
+const COUNTDOWN_H = 33
+/** 退场时长，与 styles.css 中 .is-closing 动画时长一致 */
+const UNMOUNT_MS = 160
 
 export default function App() {
   const [tabs, setTabs] = useState<TabInfo[]>([])
@@ -38,7 +45,7 @@ export default function App() {
   const [kbOpen, setKbOpen] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [scheduleOpen, setScheduleOpen] = useState(false)
-  /** 定时任务弹窗预绑定的测试用例（用例库 ⏰ 按钮进来） */
+  /** 定时任务弹窗预绑定的测试用例（用例库⏰ 按钮进来） */
   const [scheduleTestCase, setScheduleTestCase] = useState<{ id: number; name: string } | null>(null)
   const [testOpen, setTestOpen] = useState(false)
   const [task, setTask] = useState('')
@@ -47,14 +54,26 @@ export default function App() {
   const [viewer, setViewer] = useState<string | null>(null)
   /** 即将执行的定时任务倒计时（执行前 60s 内出现） */
   const [countdown, setCountdown] = useState<{ id: number; name: string; secondsLeft: number } | null>(null)
+  /** 右侧面板折叠态 */
+  const [panelCollapsed, setPanelCollapsed] = useState(false)
   const slotRef = useRef<HTMLDivElement>(null)
+  const addrRef = useRef<HTMLInputElement>(null)
   const toastId = useRef(1)
 
-  const pushToast = useCallback((message: string, kind: Toast['kind'] = 'info') => {
-    const id = toastId.current++
-    setToasts((t) => [...t, { id, message, kind }])
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), kind === 'captcha' ? 12000 : 5000)
+  /** 统一的 Toast 移除：先播退场动画再真正移除 */
+  const dropToast = useCallback((id: number) => {
+    setToasts((t) => t.map((x) => (x.id === id ? { ...x, closing: true } : x)))
+    window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), UNMOUNT_MS)
   }, [])
+
+  const pushToast = useCallback(
+    (message: string, kind: Toast['kind'] = 'info') => {
+      const id = toastId.current++
+      setToasts((t) => [...t, { id, message, kind }])
+      window.setTimeout(() => dropToast(id), kind === 'captcha' ? 12000 : 5000)
+    },
+    [dropToast]
+  )
 
   // 收藏栏（localStorage 持久化）
   const [bookmarks, setBookmarks] = useState<Bookmark[]>(() => {
@@ -101,10 +120,10 @@ export default function App() {
         case 'ocr-status':
           setOcr({ enabled: ev.enabled, reason: ev.reason })
           break
-        case 'schedules':
-          break
         case 'schedule-countdown':
           setCountdown(ev.secondsLeft > 0 ? { id: ev.id, name: ev.name, secondsLeft: ev.secondsLeft } : null)
+          break
+        default:
           break
       }
     })
@@ -113,10 +132,10 @@ export default function App() {
     return off
   }, [pushToast])
 
-  // 新任务开始时清空时间线
+  // 新任务开始时清空时间线（依赖 state + stepCount，而非只看 task）
   useEffect(() => {
     if (status.state === 'running' && status.stepCount === 0) setSteps([])
-  }, [status.task])
+  }, [status.state, status.stepCount])
 
   // 浏览器区域位置上报（主进程据此摆放 WebContentsView）
   useEffect(() => {
@@ -141,26 +160,62 @@ export default function App() {
     }
   }, [])
 
-  // 倒计时事件停止推送（已执行/已取消）2.5s 后自动隐藏倒计时条
+  // 倒计时停止推送（已执行/已取消）后自动隐藏倒计时条
   useEffect(() => {
     if (!countdown) return
     const t = window.setTimeout(() => setCountdown(null), 2500)
     return () => window.clearTimeout(t)
   }, [countdown])
 
-  // 弹窗/截图查看器/历史面板打开时隐藏浏览器视图（原生视图会盖住渲染层弹窗），关闭恢复
+  // 是否有弹窗/浮层正在覆盖浏览器视图（原生视图会盖住渲染层，必须主动隐藏）
+  // —— 单一来源：隐藏原生视图与占位提示共用它，避免两处表达式失同步
+  const overlayOpen = useMemo(
+    () => settingsOpen || viewer != null || taskEditorOpen || kbOpen || historyOpen || scheduleOpen || testOpen,
+    [settingsOpen, viewer, taskEditorOpen, kbOpen, historyOpen, scheduleOpen, testOpen]
+  )
   useEffect(() => {
-    const hidden = settingsOpen || viewer != null || taskEditorOpen || kbOpen || historyOpen || scheduleOpen || testOpen
-    window.easybow.setBrowserHidden(hidden)
-  }, [settingsOpen, viewer, taskEditorOpen, kbOpen, historyOpen, scheduleOpen, testOpen])
+    window.easybow.setBrowserHidden(overlayOpen)
+  }, [overlayOpen])
+
+  // 全局快捷键：Ctrl/Cmd+T 新建页签、Ctrl+W 关闭当前页、Ctrl+L 聚焦地址栏、
+  // Ctrl+B 折叠/展开任务面板、F5 刷新。Esc 交给各弹窗自行处理。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.ctrlKey || e.metaKey
+      const k = e.key.toLowerCase()
+      if (mod && k === 't') {
+        e.preventDefault()
+        window.easybow.newTab()
+      } else if (mod && k === 'w') {
+        e.preventDefault()
+        if (activeTabId >= 0) window.easybow.closeTab(activeTabId)
+      } else if (mod && k === 'l') {
+        e.preventDefault()
+        addrRef.current?.focus()
+      } else if (mod && k === 'b') {
+        e.preventDefault()
+        setPanelCollapsed((v) => !v)
+      } else if (e.key === 'F5') {
+        e.preventDefault()
+        window.easybow.reload()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [activeTabId])
+
+  // 退场动画：先播动画再卸载（常驻挂载的弹窗不需要）
+  const [taskEditorMounted] = useDelayedUnmount(taskEditorOpen, UNMOUNT_MS)
+  const [kbMounted] = useDelayedUnmount(kbOpen, UNMOUNT_MS)
+  const [scheduleMounted] = useDelayedUnmount(scheduleOpen, UNMOUNT_MS)
+  const [viewerMounted] = useDelayedUnmount(viewer != null, UNMOUNT_MS)
 
   const activeTab = tabs.find((t) => t.id === activeTabId)
-  const browserCovered = settingsOpen || viewer != null || taskEditorOpen || kbOpen || historyOpen || scheduleOpen || testOpen
 
   return (
     <div className="app">
       {countdown && (
-        <div className="sched-countdown-bar">
+        <div className="sched-countdown-bar" role="status">
           <span className="scd-icon">⏰</span>
           <span className="scd-text">
             定时任务「<b>{countdown.name}</b>」将在 <b className="scd-secs">{countdown.secondsLeft}</b> 秒后执行
@@ -192,13 +247,14 @@ export default function App() {
         onBack={() => window.easybow.goBack()}
         onForward={() => window.easybow.goForward()}
         onReload={() => window.easybow.reload()}
-        onTakeover={() =>
-          status.state === 'running' ? window.easybow.pauseTask() : window.easybow.resumeTask()
-        }
+        onTakeover={() => (status.state === 'running' ? window.easybow.pauseTask() : window.easybow.resumeTask())}
         onHistory={() => setHistoryOpen((v) => !v)}
         historyOpen={historyOpen}
         onTest={() => setTestOpen(true)}
         onSettings={() => setSettingsOpen(true)}
+        panelCollapsed={panelCollapsed}
+        onTogglePanel={() => setPanelCollapsed((v) => !v)}
+        inputRef={addrRef}
       />
       <BookmarksBar
         bookmarks={bookmarks}
@@ -209,14 +265,14 @@ export default function App() {
       <div className="main">
         <div className="browser-slot" ref={slotRef}>
           <div className="browser-placeholder">
-            {browserCovered ? (
+            {overlayOpen ? (
               <>
-                <span style={{ fontSize: 28 }}>⚙</span>
+                <span className="ph-icon">⚙</span>
                 <span>浏览器已暂时隐藏，关闭弹窗后自动恢复（页面状态不丢失）</span>
               </>
             ) : (
               <>
-                <span style={{ fontSize: 28 }}>🌐</span>
+                <span className="ph-icon">🌐</span>
                 <span>浏览器区域加载中…</span>
               </>
             )}
@@ -229,6 +285,8 @@ export default function App() {
           ocr={ocr}
           task={task}
           setTask={setTask}
+          collapsed={panelCollapsed}
+          onExpandPanel={() => setPanelCollapsed(false)}
           onExpandEditor={() => setTaskEditorOpen(true)}
           onOpenSettings={() => setSettingsOpen(true)}
           onOpenKB={() => setKbOpen(true)}
@@ -238,8 +296,13 @@ export default function App() {
         />
       </div>
 
-      {taskEditorOpen && (
-        <TaskEditorModal task={task} setTask={setTask} onClose={() => setTaskEditorOpen(false)} />
+      {taskEditorMounted && (
+        <TaskEditorModal
+          open={taskEditorOpen}
+          task={task}
+          setTask={setTask}
+          onClose={() => setTaskEditorOpen(false)}
+        />
       )}
       {historyOpen && (
         <HistoryDropdown
@@ -250,11 +313,14 @@ export default function App() {
             else window.easybow.navigate(url)
           }}
           onToast={pushToast}
+          topOffset={countdown ? COUNTDOWN_H : 0}
         />
       )}
-      {kbOpen && <KnowledgeModal onClose={() => setKbOpen(false)} />}
-      {scheduleOpen && (
+      {/* 常驻挂载：切到其它弹窗再回来时，用例草稿（可能写了很久）不会丢失 */}
+      {kbMounted && <KnowledgeModal open={kbOpen} onClose={() => setKbOpen(false)} />}
+      {scheduleMounted && (
         <ScheduleModal
+          open={scheduleOpen}
           initialTask={task}
           initialTestCase={scheduleTestCase || undefined}
           onClose={() => {
@@ -264,19 +330,14 @@ export default function App() {
           onToast={pushToast}
         />
       )}
-      {testOpen && (
-        <TestPanel
-          onClose={() => setTestOpen(false)}
-          onToast={pushToast}
-          onScheduleCase={(entry) => {
-            setScheduleTestCase(entry)
-            setTestOpen(false)
-            setScheduleOpen(true)
-          }}
-        />
-      )}
+      <TestPanel
+        open={testOpen}
+        onClose={() => setTestOpen(false)}
+        onToast={pushToast}
+      />
       {settingsOpen && (
         <SettingsModal
+          open={settingsOpen}
           initial={settings}
           onClose={() => setSettingsOpen(false)}
           onSaved={(s) => {
@@ -286,14 +347,18 @@ export default function App() {
           }}
         />
       )}
-      {viewer && (
+      {viewerMounted && viewer && (
         <div className="img-viewer" onClick={() => setViewer(null)}>
           <img src={viewer} alt="步骤截图" />
         </div>
       )}
-      <div className="toasts">
+      <div className="toasts" role="status" aria-live="polite">
         {toasts.map((t) => (
-          <div key={t.id} className={`toast ${t.kind}`}>
+          <div
+            key={t.id}
+            className={`toast ${t.kind}${t.closing ? ' is-closing' : ''}`}
+            onClick={() => dropToast(t.id)}
+          >
             {t.message}
           </div>
         ))}

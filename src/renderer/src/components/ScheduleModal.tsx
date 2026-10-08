@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { Schedule } from '@shared/types'
+import { useModalFocus } from '../hooks/useDelayedUnmount'
 
 type Policy = 'once' | 'daily' | 'interval'
 
@@ -16,6 +17,8 @@ function describe(s: Schedule): string {
 
 /** 定时任务：把任务描述交给 AI 定时执行（与 AI 对话新增 / 维护列表 / 改策略；可绑定测试用例做定时回归） */
 export default function ScheduleModal(props: {
+  /** 是否处于打开状态（组件常驻挂载，靠它控制显隐与动画） */
+  open: boolean
   initialTask: string
   /** 预绑定测试用例（来自测试面板用例库的 ⏰ 按钮）：到点跑该用例而非自由任务 */
   initialTestCase?: { id: number; name: string }
@@ -36,11 +39,25 @@ export default function ScheduleModal(props: {
   const [dailyTime, setDailyTime] = useState('09:00')
   const [intervalMin, setIntervalMin] = useState(30)
   const [saving, setSaving] = useState(false)
+  const bodyRef = useRef<HTMLDivElement>(null)
+  const { closing, requestClose, onBackdropClick } = useModalFocus(bodyRef, props.onClose, props.open)
 
   const refresh = () => window.easybow.getSchedules().then(setList).catch(() => {})
   useEffect(() => {
     refresh()
   }, [])
+
+  // 首次打开时把任务名预填一次（常驻挂载，initialTask 变化不应覆盖用户已输入的内容）
+  const prefilledRef = useRef(false)
+  useEffect(() => {
+    if (!props.open || prefilledRef.current) return
+    prefilledRef.current = true
+    if (props.initialTask && !task) setTask(props.initialTask)
+    if (props.initialTestCase) {
+      setName(`回归: ${props.initialTestCase.name}`)
+      setBoundCaseId(props.initialTestCase.id)
+    }
+  }, [props.open])
 
   const startEdit = (s: Schedule) => {
     setEditing(s)
@@ -116,14 +133,23 @@ export default function ScheduleModal(props: {
   }
 
   return (
-    <div className="modal-mask">
-      <div className="modal">
-        <h3>
-          ⏰ 定时任务{editing ? '（编辑）' : '（新增）'}
-          <span className="close-x" onClick={props.onClose}>
+    <div className="modal-mask" onClick={onBackdropClick}>
+      <div
+        ref={bodyRef}
+        className={`modal${closing ? ' is-closing' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-label="定时任务"
+        tabIndex={-1}
+      >
+        <div className="modal-head">
+          <h3>⏰ 定时任务{editing ? '（编辑）' : '（新增）'}</h3>
+          <button className="close-x" aria-label="关闭定时任务" title="关闭（Esc）" onClick={requestClose}>
             ✕
-          </span>
-        </h3>
+          </button>
+        </div>
+
+        <div className="modal-body">
 
         <div className="form-row">
           <label>任务描述（到点自动交给 AI 执行）</label>
@@ -138,7 +164,7 @@ export default function ScheduleModal(props: {
         {boundCaseId != null && (
           <div className="field-hint test-warn">
             🧪 已绑定测试用例（定时回归）：到点自动在独立测试页签执行该用例并生成报告，不执行上面的任务描述
-            <button className="btn mini" style={{ marginLeft: 8 }} onClick={() => setBoundCaseId(undefined)}>
+            <button className="btn mini unbind-btn" onClick={() => setBoundCaseId(undefined)}>
               解绑（改为普通任务）
             </button>
           </div>
@@ -184,17 +210,6 @@ export default function ScheduleModal(props: {
           </div>
         </div>
 
-        <div className="modal-foot">
-          {editing && (
-            <button className="btn" onClick={resetForm}>
-              取消编辑
-            </button>
-          )}
-          <button className="btn primary" onClick={save} disabled={saving}>
-            {editing ? '保存修改' : '创建定时任务'}
-          </button>
-        </div>
-
         {list.length > 0 && (
           <>
             <div className="sch-list-title">已有定时任务（{list.length}）</div>
@@ -229,6 +244,18 @@ export default function ScheduleModal(props: {
             <div className="field-hint">执行前 1 分钟顶部会出现倒计时提示，可一键取消本次执行</div>
           </>
         )}
+        </div>
+
+        <div className="modal-foot">
+          {editing && (
+            <button className="btn" onClick={resetForm}>
+              取消编辑
+            </button>
+          )}
+          <button className="btn primary" onClick={save} disabled={saving}>
+            {saving ? '保存中…' : editing ? '保存修改' : '创建定时任务'}
+          </button>
+        </div>
       </div>
     </div>
   )

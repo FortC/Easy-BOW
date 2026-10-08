@@ -1,7 +1,20 @@
 import { useEffect, useRef, useState } from 'react'
 import type { MainEvent, TestCaseEntry, TestEnv, TestRunStatus } from '@shared/types'
+import { useModalFocus } from '../hooks/useDelayedUnmount'
 
 type PanelTab = 'convert' | 'run' | 'reports' | 'lib'
+
+/** 用例草稿的本地持久化 key——切到其它弹窗再回来、或误关窗口都不丢 */
+const DRAFT_KEY = 'easybow.testcase.draft'
+
+function loadDraft(): { reqMd: string; caseMd: string } {
+  try {
+    const d = JSON.parse(localStorage.getItem(DRAFT_KEY) || '{}')
+    return { reqMd: typeof d.reqMd === 'string' ? d.reqMd : '', caseMd: typeof d.caseMd === 'string' ? d.caseMd : '' }
+  } catch {
+    return { reqMd: '', caseMd: '' }
+  }
+}
 
 const STEP_ICON: Record<string, string> = {
   pending: '⏳',
@@ -21,6 +34,8 @@ const RUN_VERDICT: Record<string, { text: string; cls: string }> = {
 
 /** 浏览器仿真测试面板：需求 MD → 测试用例 MD → 运行 → 报告（+用例库/失败重跑/定时回归入口） */
 export default function TestPanel(props: {
+  /** 是否处于打开状态（组件常驻挂载，靠它控制显隐，草稿不因切换弹窗而丢失） */
+  open: boolean
   onClose: () => void
   onToast: (msg: string, kind?: 'info' | 'success' | 'error') => void
   /** 用例库条目 → 打开定时任务弹窗绑定（定时回归） */
@@ -42,15 +57,34 @@ export default function TestPanel(props: {
   const [fillPreview, setFillPreview] = useState(false)
   const [envDraft, setEnvDraft] = useState<TestEnv | null>(null)
   const [run, setRun] = useState<TestRunStatus | null>(null)
-  // ③ 报告
-  const [reports, setReports] = useState<Array<{ file: string; ts: number; verdict: string }>>([])
+  // ③ 报告（null = 加载中，与「暂无报告」区分开，避免首屏文案闪烁）
+  const [reports, setReports] = useState<Array<{ file: string; ts: number; verdict: string }> | null>(null)
   const [reportContent, setReportContent] = useState<string | null>(null)
-  // ④ 用例库
-  const [cases, setCases] = useState<TestCaseEntry[]>([])
+  // ④ 用例库（同上，null = 加载中）
+  const [cases, setCases] = useState<TestCaseEntry[] | null>(null)
   const [libTags, setLibTags] = useState('')
   const [libSaving, setLibSaving] = useState(false)
   /** 本次运行用的用例 MD（失败重跑取子集用） */
   const lastRunMd = useRef('')
+  const bodyRef = useRef<HTMLDivElement>(null)
+  const { closing, requestClose, onBackdropClick } = useModalFocus(bodyRef, props.onClose, props.open)
+
+  // 打开时恢复上次未保存的用例草稿
+  useEffect(() => {
+    if (!props.open) return
+    setReqMd((v) => v || loadDraft().reqMd)
+    setCaseMd((v) => v || loadDraft().caseMd)
+  }, [props.open])
+
+  // 草稿变化即持久化（切弹窗、误关窗口都不丢）
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      try {
+        localStorage.setItem(DRAFT_KEY, JSON.stringify({ reqMd, caseMd }))
+      } catch {}
+    }, 400)
+    return () => window.clearTimeout(t)
+  }, [reqMd, caseMd])
 
   useEffect(() => {
     window.easybow.testRunStatus().then(setRun).catch(() => {})
@@ -61,8 +95,16 @@ export default function TestPanel(props: {
     return off
   }, [])
 
-  const refreshReports = () => window.easybow.testListReports().then(setReports).catch(() => {})
-  const refreshCases = () => window.easybow.getTestCases().then(setCases).catch(() => {})
+  const refreshReports = () =>
+    window.easybow
+      .testListReports()
+      .then(setReports)
+      .catch(() => setReports([]))
+  const refreshCases = () =>
+    window.easybow
+      .getTestCases()
+      .then(setCases)
+      .catch(() => setCases([]))
 
   // 运行结束后刷新用例库（最近运行结论回写展示）
   useEffect(() => {
@@ -209,42 +251,50 @@ export default function TestPanel(props: {
   const running = run?.state === 'running'
   const curEnv = envs.find((e) => e.name === envName)
 
-  return (
-    <div className="modal-mask">
-      <div className="modal test-modal">
-        <h3>
-          🧪 浏览器仿真测试
-          <span className="close-x" onClick={props.onClose}>
-            ✕
-          </span>
-        </h3>
+  if (!props.open && !closing) return null
 
-        <div className="test-tabs">
-          <button className={`test-tab${tab === 'convert' ? ' active' : ''}`} onClick={() => setTab('convert')}>
-            ① 需求 → 用例
-          </button>
-          <button className={`test-tab${tab === 'run' ? ' active' : ''}`} onClick={() => setTab('run')}>
-            ② 用例与运行
-          </button>
-          <button
-            className={`test-tab${tab === 'reports' ? ' active' : ''}`}
-            onClick={() => {
-              setTab('reports')
-              refreshReports()
-            }}
-          >
-            ③ 报告
-          </button>
-          <button
-            className={`test-tab${tab === 'lib' ? ' active' : ''}`}
-            onClick={() => {
-              setTab('lib')
-              refreshCases()
-            }}
-          >
-            ④ 用例库
+  return (
+    <div className="modal-mask" onClick={onBackdropClick}>
+      <div
+        ref={bodyRef}
+        className={`modal test-modal${closing ? ' is-closing' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-label="浏览器仿真测试"
+        tabIndex={-1}
+      >
+        <div className="modal-head">
+          <h3>🧪 浏览器仿真测试</h3>
+          <button className="close-x" aria-label="关闭测试面板" title="关闭（Esc）" onClick={requestClose}>
+            ✕
           </button>
         </div>
+
+        <div className="modal-body">
+          <div className="test-tabs" role="tablist" aria-label="测试阶段">
+            {(
+              [
+                ['convert', '① 需求 → 用例'],
+                ['run', '② 用例与运行'],
+                ['reports', '③ 报告'],
+                ['lib', '④ 用例库']
+              ] as const
+            ).map(([key, label]) => (
+              <button
+                key={key}
+                role="tab"
+                aria-selected={tab === key}
+                className={`test-tab${tab === key ? ' active' : ''}`}
+                onClick={() => {
+                  setTab(key)
+                  if (key === 'reports' && reports === null) refreshReports()
+                  if (key === 'lib' && cases === null) refreshCases()
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
 
         {tab === 'convert' && (
           <>
@@ -458,9 +508,29 @@ export default function TestPanel(props: {
                   刷新
                 </button>
               </div>
-              {reports.length === 0 && <div className="field-hint">暂无报告——运行一次测试后生成</div>}
-              {reports.map((r) => (
-                <div key={r.file} className="test-env-item" onClick={() => viewReport(r.file)}>
+              {reports === null && (
+                <>
+                  <div className="skeleton skeleton-row" />
+                  <div className="skeleton skeleton-row" style={{ opacity: 0.7 }} />
+                  <div className="skeleton skeleton-row" style={{ opacity: 0.5 }} />
+                </>
+              )}
+              {reports !== null && reports.length === 0 && <div className="field-hint">暂无报告——运行一次测试后生成</div>}
+              {reports !== null && reports.map((r) => (
+                <div
+                  key={r.file}
+                  className="test-env-item"
+                  role="button"
+                  tabIndex={0}
+                  title="点击查看报告全文"
+                  onClick={() => viewReport(r.file)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      viewReport(r.file)
+                    }
+                  }}
+                >
                   <b>{r.verdict}</b>
                   <span className="test-env-url">{r.file}</span>
                   <span className="test-step-meta">{new Date(r.ts).toLocaleString('zh-CN', { hour12: false })}</span>
@@ -493,12 +563,19 @@ export default function TestPanel(props: {
               </div>
             </div>
             <div className="test-env-list">
-              {cases.length === 0 && (
+              {cases === null && (
+              <>
+                <div className="skeleton skeleton-row" />
+                <div className="skeleton skeleton-row" style={{ opacity: 0.7 }} />
+              </>
+            )}
+            {cases !== null && cases.length === 0 && (
                 <div className="field-hint">
                   用例库为空——在「②用例与运行」编辑好用例后回到这里保存；保存后每条可一键运行、绑定定时回归（⏰）、删除
                 </div>
               )}
-              {cases.map((c) => (
+              {cases !== null &&
+              cases.map((c) => (
                 <div key={c.id} className="test-env-item">
                   <b>{c.name}</b>
                   {c.tags.map((t) => (
@@ -522,11 +599,12 @@ export default function TestPanel(props: {
                   >
                     编辑
                   </button>
-                  <button className="btn mini" title="绑定到定时任务（到点自动回归）" onClick={() => props.onScheduleCase?.({ id: c.id, name: c.name })}>
+                  <button className="btn mini" title="绑定到定时任务（到点自动回归）" aria-label={`把 ${c.name} 绑定到定时任务`} onClick={() => props.onScheduleCase?.({ id: c.id, name: c.name })}>
                     ⏰
                   </button>
                   <button
                     className="btn mini danger"
+                    aria-label={`删除用例 ${c.name}`}
                     onClick={async () => {
                       try {
                         setCases(await window.easybow.deleteTestCase(c.id))
@@ -543,6 +621,7 @@ export default function TestPanel(props: {
             </div>
           </>
         )}
+        </div>
       </div>
     </div>
   )

@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import { useModalFocus } from '../hooks/useDelayedUnmount'
 
 const TEMPLATES: { name: string; text: string }[] = [
   {
@@ -36,11 +37,15 @@ const TEMPLATES: { name: string; text: string }[] = [
 ]
 
 export default function TaskEditorModal(props: {
+  /** 是否处于打开状态（用于焦点管理，退场由 App 的延迟卸载处理） */
+  open: boolean
   task: string
   setTask: (t: string) => void
   onClose: () => void
 }) {
   const ref = useRef<HTMLTextAreaElement>(null)
+  const bodyRef = useRef<HTMLDivElement>(null)
+  const { closing, requestClose, onBackdropClick } = useModalFocus(bodyRef, props.onClose, props.open)
 
   useEffect(() => {
     ref.current?.focus()
@@ -59,55 +64,64 @@ export default function TaskEditorModal(props: {
   const lines = props.task ? props.task.split('\n').length : 0
 
   return (
-    <div className="modal-mask" onClick={(e) => e.target === e.currentTarget && props.onClose()}>
-      <div className="modal task-editor">
-        <h3>
-          ✏️ 任务描述（大编辑器）
-          <span className="close-x" onClick={props.onClose}>
+    <div className="modal-mask" onClick={onBackdropClick}>
+      <div
+        ref={bodyRef}
+        className={`modal task-editor${closing ? ' is-closing' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-label="任务描述大编辑器"
+        tabIndex={-1}
+      >
+        <div className="modal-head">
+          <h3>✏️ 任务描述（大编辑器）</h3>
+          <button className="close-x" aria-label="关闭大编辑器" title="关闭（Esc）" onClick={requestClose}>
             ✕
-          </span>
-        </h3>
-
-        <div className="form-row">
-          <label>任务模板（点击插入到末尾，按需修改）</label>
-          <div className="presets">
-            {TEMPLATES.map((t) => (
-              <span key={t.name} className="preset" onClick={() => appendTemplate(t.text)}>
-                {t.name}
-              </span>
-            ))}
-          </div>
+          </button>
         </div>
 
-        <textarea
-          ref={ref}
-          className="task-editor-input"
-          value={props.task}
-          placeholder={'详细描述任务，越具体 AI 执行越准确。\n\n例如：\n1. 在页签1打开聚水潭订单列表，读取今天前10条订单的「订单号/买家/金额/状态」并存入任务记忆\n2. 切到页签2的发货登记表单，逐条填入刚才读取的订单信息\n3. 全部填完后核对一遍，不要提交，报告填写结果'}
-          spellCheck={false}
-          onChange={(e) => props.setTask(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Escape') props.onClose()
-            // Ctrl+Enter 直接采用
-            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-              e.preventDefault()
-              props.onClose()
-            }
-          }}
-        />
+        <div className="modal-body">
+          <div className="form-row">
+            <label>任务模板（点击插入到末尾，按需修改）</label>
+            <div className="presets">
+              {TEMPLATES.map((t) => (
+                <button key={t.name} className="preset" onClick={() => appendTemplate(t.text)}>
+                  {t.name}
+                </button>
+              ))}
+            </div>
+          </div>
 
-        <div className="task-editor-foot">
+          <textarea
+            ref={ref}
+            className="task-editor-input"
+            value={props.task}
+            placeholder={
+              '详细描述任务，越具体 AI 执行越准确。\n\n例如：\n1. 在页签1打开聚水潭订单列表，读取今天前10条订单的「订单号/买家/金额/状态」并存入任务记忆\n2. 切到页签2的发货登记表单，逐条填入刚才读取的订单信息\n3. 全部填完后核对一遍，不要提交，报告填写结果'
+            }
+            spellCheck={false}
+            aria-label="任务描述"
+            onChange={(e) => props.setTask(e.target.value)}
+            onKeyDown={(e) => {
+              // Ctrl+Enter 直接采用；Esc 交给 useModalFocus 统一处理
+              if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                e.preventDefault()
+                requestClose()
+              }
+            }}
+          />
+        </div>
+
+        <div className="modal-foot">
           <span className="task-editor-count">
             {chars} 字 · {lines} 行
           </span>
-          <div className="modal-foot" style={{ margin: 0 }}>
-            <button className="btn" onClick={props.onClose}>
-              取消
-            </button>
-            <button className="btn primary" onClick={props.onClose}>
-              ✓ 使用此任务（Ctrl+Enter）
-            </button>
-          </div>
+          <button className="btn" onClick={requestClose}>
+            取消
+          </button>
+          <button className="btn primary" onClick={requestClose}>
+            ✓ 使用此任务（Ctrl+Enter）
+          </button>
         </div>
       </div>
     </div>

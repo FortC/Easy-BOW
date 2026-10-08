@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { DEFAULT_SETTINGS, type CCSwitchProviderInfo, type FastLlmState, type Protocol, type Settings } from '@shared/types'
+import { useModalFocus } from '../hooks/useDelayedUnmount'
 
 const PRESETS: { name: string; provider: Protocol; baseURL: string; model: string }[] = [
   { name: 'OpenAI', provider: 'openai', baseURL: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
@@ -12,6 +13,7 @@ const PRESETS: { name: string; provider: Protocol; baseURL: string; model: strin
 ]
 
 export default function SettingsModal(props: {
+  open?: boolean
   initial: Settings | null
   onClose: () => void
   onSaved: (s: Settings) => void
@@ -28,6 +30,9 @@ export default function SettingsModal(props: {
   const [fast, setFast] = useState<FastLlmState | null>(null)
   const [fastBusy, setFastBusy] = useState(false)
   const [version, setVersion] = useState('')
+  const bodyRef = useRef<HTMLDivElement>(null)
+  // 点遮罩不关闭（避免误触丢失正在编辑的配置），但 Esc 关闭并做焦点管理
+  const { closing, requestClose, onBackdropClick } = useModalFocus(bodyRef, props.onClose, props.open !== false)
 
   useEffect(() => {
     window.easybow.appVersion().then(setVersion).catch(() => {})
@@ -119,15 +124,24 @@ export default function SettingsModal(props: {
   }
 
   return (
-    // 不做点击遮罩关闭：避免误触外部区域丢失正在编辑的配置（用 ✕ 或保存关闭）
-    <div className="modal-mask">
-      <div className="modal">
-        <h3>
-          ⚙ 设置 — AI 接口
-          <span className="close-x" onClick={props.onClose}>
+    // 不做点击遮罩关闭：避免误触外部区域丢失正在编辑的配置（用 ✕ / Esc / 保存关闭）
+    <div className="modal-mask" onClick={onBackdropClick}>
+      <div
+        ref={bodyRef}
+        className={`modal${closing ? ' is-closing' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-label="设置 — AI 接口"
+        tabIndex={-1}
+      >
+        <div className="modal-head">
+          <h3>⚙ 设置 — AI 接口</h3>
+          <button className="close-x" aria-label="关闭设置" title="关闭（Esc）" onClick={requestClose}>
             ✕
-          </span>
-        </h3>
+          </button>
+        </div>
+
+        <div className="modal-body">
 
         <div className="form-row">
           <label>
@@ -179,9 +193,9 @@ export default function SettingsModal(props: {
 
         <div className="form-row">
           <label>API Key</label>
-          <div style={{ display: 'flex', gap: 8 }}>
+          <div className="form-row-inline">
             <input
-              style={{ flex: 1 }}
+              className="grow"
               type={showKey ? 'text' : 'password'}
               value={s.apiKey}
               placeholder="sk-…（仅保存在本机）"
@@ -214,7 +228,7 @@ export default function SettingsModal(props: {
                   : '混合模式需先下载本地快速决策模型（Qwen2.5-0.5B int8，约 500MB，来源 hf-mirror，仅本机使用）；未就绪时自动等效纯大模型模式'}
           </div>
           {fast?.state !== 'ready' && (
-            <div style={{ marginTop: 6, display: 'flex', gap: 8, alignItems: 'center' }}>
+            <div className="fast-init-row">
               <button className="btn" onClick={startFastInit} disabled={fastBusy || fast?.state === 'downloading' || fast?.state === 'loading'}>
                 {fastBusy || fast?.state === 'downloading' || fast?.state === 'loading'
                   ? '处理中…'
@@ -224,7 +238,7 @@ export default function SettingsModal(props: {
                       ? '加载内置本地模型'
                       : '下载并加载本地模型'}
               </button>
-              {fast?.state === 'error' && <span className="field-hint" style={{ marginTop: 0 }}>{fast.detail}</span>}
+              {fast?.state === 'error' && <span className="field-hint no-top">{fast.detail}</span>}
             </div>
           )}
         </div>
@@ -289,13 +303,14 @@ export default function SettingsModal(props: {
           <span>v{version || '…'}</span>
           <span>作者：clb &lt;lamthebest@foxmail.com&gt; · MIT · 问题反馈：邮件或在仓库提 Issue</span>
         </div>
+        </div>
 
         <div className="modal-foot">
           <button className="btn" onClick={test} disabled={testing || !s.apiKey || !s.model}>
             {testing ? '测试中…' : '测试连接'}
           </button>
           <button className="btn primary" onClick={save} disabled={saving}>
-            保存
+            {saving ? '保存中…' : '保存'}
           </button>
         </div>
       </div>

@@ -1,11 +1,12 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { KBEntry } from '@shared/types'
+import { useModalFocus } from '../hooks/useDelayedUnmount'
 
 /**
  * 问题经验库：积累「某站点某问题的正确处理方式」，任务执行时按域名注入 AI 提示词，
  * 避免重复踩坑（如：腾讯文档点正文即可编辑，不要找输入框）。
  */
-export default function KnowledgeModal(props: { onClose: () => void }) {
+export default function KnowledgeModal(props: { open: boolean; onClose: () => void }) {
   const [list, setList] = useState<KBEntry[]>([])
   const [loaded, setLoaded] = useState(false)
   const [editing, setEditing] = useState<KBEntry | null>(null)
@@ -13,6 +14,8 @@ export default function KnowledgeModal(props: { onClose: () => void }) {
   const [problem, setProblem] = useState('')
   const [solution, setSolution] = useState('')
   const [saving, setSaving] = useState(false)
+  const bodyRef = useRef<HTMLDivElement>(null)
+  const { closing, requestClose, onBackdropClick } = useModalFocus(bodyRef, props.onClose, props.open)
 
   useEffect(() => {
     window.easybow.getKB().then((l) => {
@@ -52,18 +55,26 @@ export default function KnowledgeModal(props: { onClose: () => void }) {
   }
 
   return (
-    <div className="modal-mask">
-      <div className="modal kb-modal">
-        <h3>
-          📚 问题经验库
-          <span className="close-x" onClick={props.onClose}>
+    <div className="modal-mask" onClick={onBackdropClick}>
+      <div
+        ref={bodyRef}
+        className={`modal kb-modal${closing ? ' is-closing' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-label="问题经验库"
+        tabIndex={-1}
+      >
+        <div className="modal-head">
+          <h3>📚 问题经验库</h3>
+          <button className="close-x" aria-label="关闭问题经验库" title="关闭（Esc）" onClick={requestClose}>
             ✕
-          </span>
-        </h3>
-        <p className="kb-intro">
-          把踩过的坑记在这里：AI 执行任务遇到匹配的站点时会看到对应做法，不再重复犯错。
-          域名留空表示对所有站点生效。
-        </p>
+          </button>
+        </div>
+
+        <div className="modal-body">
+          <p className="kb-intro">
+            把踩过的坑记在这里：AI 执行任务遇到匹配的站点时会看到对应做法，不再重复犯错。域名留空表示对所有站点生效。
+          </p>
 
         <div className="kb-form">
           <div className="form-inline">
@@ -99,7 +110,11 @@ export default function KnowledgeModal(props: { onClose: () => void }) {
 
         <div className="kb-list">
           {!loaded ? (
-            <div className="kb-empty">加载中…</div>
+            <>
+              <div className="skeleton skeleton-row" />
+              <div className="skeleton skeleton-row" style={{ opacity: 0.7 }} />
+              <div className="skeleton skeleton-row" style={{ opacity: 0.5 }} />
+            </>
           ) : list.length === 0 ? (
             <div className="kb-empty">还没有经验条目，添加一条吧</div>
           ) : (
@@ -109,11 +124,16 @@ export default function KnowledgeModal(props: { onClose: () => void }) {
                   <span className="kb-domain">{e.domain || '全局'}</span>
                   <span className="kb-problem">{e.problem || '（无标题）'}</span>
                   <span className="kb-item-ops">
-                    <button title={e.enabled ? '停用' : '启用'} onClick={() => persist(list.map((x) => (x.id === e.id ? { ...x, enabled: !x.enabled } : x)))}>
+                    <button
+                      title={e.enabled ? '停用' : '启用'}
+                      aria-label={`${e.enabled ? '停用' : '启用'} ${e.problem || e.domain || '该条目'}`}
+                      onClick={() => persist(list.map((x) => (x.id === e.id ? { ...x, enabled: !x.enabled } : x)))}
+                    >
                       {e.enabled ? '✅' : '⛔'}
                     </button>
                     <button
                       title="编辑"
+                      aria-label={`编辑 ${e.problem || e.domain || '该条目'}`}
                       onClick={() => {
                         setEditing(e)
                         setDomain(e.domain)
@@ -123,7 +143,11 @@ export default function KnowledgeModal(props: { onClose: () => void }) {
                     >
                       ✎
                     </button>
-                    <button title="删除" onClick={() => persist(list.filter((x) => x.id !== e.id))}>
+                    <button
+                      title="删除"
+                      aria-label={`删除 ${e.problem || e.domain || '该条目'}`}
+                      onClick={() => persist(list.filter((x) => x.id !== e.id))}
+                    >
                       🗑
                     </button>
                   </span>
@@ -132,6 +156,7 @@ export default function KnowledgeModal(props: { onClose: () => void }) {
               </div>
             ))
           )}
+        </div>
         </div>
       </div>
     </div>

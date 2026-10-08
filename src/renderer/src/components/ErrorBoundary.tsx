@@ -21,38 +21,12 @@ export default class ErrorBoundary extends Component<
   render() {
     if (this.state.error) {
       return (
-        <div
-          style={{
-            position: 'fixed',
-            inset: 0,
-            zIndex: 9999,
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            justifyContent: 'center',
-            gap: 14,
-            background: '#f5f6f8',
-            color: '#333',
-            fontFamily: 'system-ui, sans-serif',
-            padding: 40,
-            textAlign: 'center'
-          }}
-        >
-          <div style={{ fontSize: 40 }}>⚠</div>
-          <div style={{ fontSize: 16, fontWeight: 600 }}>界面渲染出错</div>
-          <div style={{ fontSize: 12, color: '#888', maxWidth: 520, wordBreak: 'break-all' }}>
-            {String(this.state.error?.message || this.state.error)}
-          </div>
+        <div className="eb-root">
+          <div className="eb-icon">⚠</div>
+          <div className="eb-title">界面渲染出错</div>
+          <div className="eb-msg">{String(this.state.error?.message || this.state.error)}</div>
           <button
-            style={{
-              padding: '8px 22px',
-              borderRadius: 8,
-              border: '1px solid #4f86da',
-              background: '#4f86da',
-              color: '#fff',
-              fontSize: 13,
-              cursor: 'pointer'
-            }}
+            className="btn primary"
             onClick={() => {
               this.setState({ error: null })
               location.reload()
@@ -60,7 +34,7 @@ export default class ErrorBoundary extends Component<
           >
             恢复界面
           </button>
-          <div style={{ fontSize: 11, color: '#aaa' }}>页签与网页状态不受影响</div>
+          <div className="eb-tip">页签与网页状态不受影响</div>
         </div>
       )
     }
