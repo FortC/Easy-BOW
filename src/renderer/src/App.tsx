@@ -10,6 +10,7 @@ import BookmarksBar from './components/BookmarksBar'
 import KnowledgeModal from './components/KnowledgeModal'
 import HistoryDropdown from './components/HistoryDropdown'
 import ScheduleModal from './components/ScheduleModal'
+import TestPanel from './components/TestPanel'
 
 interface Toast {
   id: number
@@ -37,6 +38,7 @@ export default function App() {
   const [kbOpen, setKbOpen] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [scheduleOpen, setScheduleOpen] = useState(false)
+  const [testOpen, setTestOpen] = useState(false)
   const [task, setTask] = useState('')
   const [settings, setSettings] = useState<Settings | null>(null)
   const [ocr, setOcr] = useState<{ enabled: boolean; reason?: string }>({ enabled: false })
@@ -146,12 +148,12 @@ export default function App() {
 
   // 弹窗/截图查看器/历史面板打开时隐藏浏览器视图（原生视图会盖住渲染层弹窗），关闭恢复
   useEffect(() => {
-    const hidden = settingsOpen || viewer != null || taskEditorOpen || kbOpen || historyOpen || scheduleOpen
+    const hidden = settingsOpen || viewer != null || taskEditorOpen || kbOpen || historyOpen || scheduleOpen || testOpen
     window.easybow.setBrowserHidden(hidden)
-  }, [settingsOpen, viewer, taskEditorOpen, kbOpen, historyOpen, scheduleOpen])
+  }, [settingsOpen, viewer, taskEditorOpen, kbOpen, historyOpen, scheduleOpen, testOpen])
 
   const activeTab = tabs.find((t) => t.id === activeTabId)
-  const browserCovered = settingsOpen || viewer != null || taskEditorOpen || kbOpen || historyOpen || scheduleOpen
+  const browserCovered = settingsOpen || viewer != null || taskEditorOpen || kbOpen || historyOpen || scheduleOpen || testOpen
 
   return (
     <div className="app">
@@ -193,6 +195,7 @@ export default function App() {
         }
         onHistory={() => setHistoryOpen((v) => !v)}
         historyOpen={historyOpen}
+        onTest={() => setTestOpen(true)}
         onSettings={() => setSettingsOpen(true)}
       />
       <BookmarksBar
@@ -251,6 +254,7 @@ export default function App() {
       {scheduleOpen && (
         <ScheduleModal initialTask={task} onClose={() => setScheduleOpen(false)} onToast={pushToast} />
       )}
+      {testOpen && <TestPanel onClose={() => setTestOpen(false)} onToast={pushToast} />}
       {settingsOpen && (
         <SettingsModal
           initial={settings}

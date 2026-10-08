@@ -110,6 +110,19 @@ export type ActionName =
   | 'switch_tab'
   | 'close_tab'
   | 'done'
+  // —— 测试模式动作（仅测试脚本使用；普通任务提示词不包含它们） ——
+  | 'expect'
+  | 'test_step_done'
+  | 'fill_form'
+
+/** expect 断言类型 */
+export type ExpectKind =
+  | 'text_visible'
+  | 'url_contains'
+  | 'title_contains'
+  | 'selector_exists'
+  | 'selector_value'
+  | 'selector_text'
 
 export interface AgentAction {
   name: ActionName
@@ -123,6 +136,16 @@ export interface AgentAction {
   direction?: 'up' | 'down' | 'left' | 'right' | 'top' | 'bottom'
   amount?: number
   seconds?: number
+  /** expect：断言类型 */
+  kind?: ExpectKind
+  /** expect：selector_* 类断言的 CSS 选择器 */
+  selector?: string
+  /** expect：断言取反（不包含/不存在） */
+  negate?: boolean
+  /** fill_form：显式字段映射（「字段描述→值」；缺省走 AI 智能填充） */
+  data?: Record<string, string>
+  /** fill_form：只填必填项 */
+  onlyRequired?: boolean
   /** 执行结果摘要（主进程回填） */
   result?: string
   /** 执行错误（主进程回填） */
@@ -147,6 +170,8 @@ export interface StepRecord {
   ts: number
   /** 用户人工指导（暂停/运行中发的消息），时间线里渲染为用户气泡 */
   userGuidance?: boolean
+  /** 测试模式：本模型步属于测试用例的第几步（时间线分组标记） */
+  testStep?: number
 }
 
 /** 暂停/运行期间用户给 AI 的人工指导（文字 + 可选截图指路） */
@@ -155,6 +180,88 @@ export interface GuidanceMessage {
   text: string
   /** jpeg dataURL（用户剪贴板截图，发送给多模态模型看图指路） */
   image?: string
+}
+
+// ———————————————— 浏览器仿真测试（feature/browser-test）————————————————
+
+/** 测试环境档案（多环境切换 + 生产保护） */
+export interface TestEnv {
+  name: string
+  baseUrl: string
+  /** 生产保护环境：提交类点击与智能填充结果需人工确认后才执行 */
+  protected: boolean
+}
+
+/** 测试用例中的一条断言（由用例 MD 的「预期」行解析而来） */
+export interface TestAssertion {
+  /** MD 原文（报告回显） */
+  raw: string
+  /** ai=未标类型的自然语言预期，由模型翻译成 expect 动作 */
+  kind: ExpectKind | 'ai'
+  value?: string
+  selector?: string
+  negate?: boolean
+}
+
+export interface TestStep {
+  title: string
+  /** 操作描述（自然语言，模型翻译成动作序列） */
+  action: string
+  /** 预期断言（可为空：纯操作步骤） */
+  assertions: TestAssertion[]
+  /** 该步骤遇 JS 弹窗的应答覆盖（缺省=确认） */
+  dialog?: 'accept' | 'dismiss'
+}
+
+/** 解析后的测试用例（parser 产物） */
+export interface TestCase {
+  name: string
+  /** 数据表变量（注入任务记忆，{{变量}} 处替换） */
+  vars: Record<string, string>
+  steps: TestStep[]
+}
+
+export interface TestAssertionResult {
+  raw: string
+  kind: string
+  passed: boolean
+  /** 断言时页面实际值（失败时定位用） */
+  actual?: string
+}
+
+export type TestStepStatus = 'pending' | 'running' | 'passed' | 'failed' | 'skipped'
+
+export interface TestStepResult {
+  /** 1-based 步骤序号 */
+  index: number
+  title: string
+  status: TestStepStatus
+  assertions: TestAssertionResult[]
+  /** 该步骤消耗的模型步数 */
+  modelSteps: number
+  error?: string
+  /** 失败截图文件名（reports/<run>/shots/ 下） */
+  shotFile?: string
+}
+
+export type TestRunState = 'running' | 'passed' | 'failed' | 'error' | 'stopped'
+
+/** 一次测试运行的全量状态（经 test-run 事件推送到测试面板） */
+export interface TestRunStatus {
+  state: TestRunState
+  caseName: string
+  envName?: string
+  totalSteps: number
+  /** 当前执行到的步骤（1-based；0=未开始） */
+  currentStep: number
+  steps: TestStepResult[]
+  passed: number
+  failed: number
+  reportPath?: string
+  error?: string
+  startedAt?: number
+  endedAt?: number
+  tokens: { input: number; output: number }
 }
 
 export type AgentRunState =
@@ -217,6 +324,8 @@ export type MainEvent =
   | { channel: 'schedules'; schedules: Schedule[] }
   /** 定时任务即将执行：secondsLeft ≤ 60 时每秒推送一次（顶部倒计时条 + 取消按钮） */
   | { channel: 'schedule-countdown'; id: number; name: string; secondsLeft: number }
+  /** 测试运行状态变更（进度/步骤结果/最终报告路径） */
+  | { channel: 'test-run'; run: TestRunStatus }
 
 export interface ExtractDebugResult {
   count: number
@@ -270,6 +379,36 @@ export interface EasybowApi {
   /** 暂停/运行中给 AI 发人工指导（文字 + 可选截图），下一步注入模型提示词 */
   sendGuidance(text: string, imageDataUrl?: string): Promise<void>
   getAgentStatus(): Promise<AgentStatus>
+  // 浏览器仿真测试
+  /** 需求 MD → 测试用例 MD（prd=PRD提炼拆用例 / rough=粗步骤补全断言），一次 LLM 调用 */
+  testConvert(
+    reqMd: string,
+    mode: 'prd' | 'rough'
+  ): Promise<{ ok: boolean; md?: string; error?: string; steps?: number; assertions?: number; attempts?: number }>
+  /** 校验测试用例 MD（解析给 UI 预览步骤数/断言数/变量） */
+  testParse(md: string): Promise<{
+    ok: boolean
+    error?: string
+    name?: string
+    steps?: number
+    assertions?: number
+    vars?: string[]
+  }>
+  /** 运行测试：解析 MD → 独立测试页签（独立登录分区）执行 → 报告 */
+  testStart(md: string, opts: { envName?: string; failFast: boolean }): Promise<void>
+  /** 停止测试（与停止任务同一管线） */
+  testStop(): Promise<void>
+  /** 当前/最近一次测试运行状态 */
+  testRunStatus(): Promise<TestRunStatus | null>
+  /** 历史报告列表 */
+  testListReports(): Promise<Array<{ file: string; ts: number; verdict: string }>>
+  /** 读取某次报告内容（Markdown） */
+  testReadReport(file: string): Promise<string>
+  /** 打开报告目录（资源管理器） */
+  testOpenReports(): Promise<void>
+  /** 测试环境档案 */
+  getTestEnvs(): Promise<TestEnv[]>
+  setTestEnvs(envs: TestEnv[]): Promise<TestEnv[]>
   // 调试
   debugExtract(): Promise<ExtractDebugResult>
   // 布局：浏览器区域（窗口内容坐标，DIP）

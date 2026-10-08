@@ -13,6 +13,7 @@ export default function Toolbar(props: {
   onTakeover: () => void
   onHistory: () => void
   historyOpen: boolean
+  onTest: () => void
   onSettings: () => void
 }) {
   const [addr, setAddr] = useState('')
@@ -65,6 +66,9 @@ export default function Toolbar(props: {
       </button>
       <button className={`nav-btn${props.historyOpen ? ' active' : ''}`} title="历史页面（快速重新打开）" onClick={props.onHistory}>
         🕐
+      </button>
+      <button className="nav-btn" title="浏览器仿真测试（需求→用例→执行→报告）" onClick={props.onTest}>
+        🧪
       </button>
       {pauseable && (
         <button

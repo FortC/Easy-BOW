@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, ipcMain } from 'electron'
+import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
 import { join } from 'path'
 import { TabManager } from './tabs'
 import { Executor } from './executor'
@@ -15,7 +15,12 @@ import { runFastllmTest, isFastllmTest } from './fastllm-test'
 import { tryInitOcr, ocrEnhanceExtract, ocrPageText } from './ocr'
 import { FastLlm } from './fastllm'
 import { Scheduler } from './scheduler'
-import type { KBEntry, MainEvent, Schedule, Settings } from '@shared/types'
+import { convertRequirement } from './testcase/converter'
+import { parseTestCase, summarize } from './testcase/parser'
+import { planFormFill } from './testcase/fields'
+import { reportsRoot } from './testcase/report'
+import { getTestEnvs, saveTestEnvs, findTestEnv, listReports, readReport } from './testcase/store'
+import type { KBEntry, MainEvent, Schedule, Settings, TestEnv } from '@shared/types'
 
 // 禁用站点 webview 的默认菜单干扰
 process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true'
@@ -164,6 +169,12 @@ function createWindow(): void {
   executor = new Executor(tabManager)
   executor.setMaxElementsProvider(() => getSettings().maxElements)
   tabManager.onTabClosed = (id) => executor.dropSnapshots(id)
+  // 智能表单填充的 LLM 规划钩子（fill_form 动作触发时调用；provider 每次按当前设置新建）
+  executor.formFillPlanner = (fields, ctx) => {
+    const s = getSettings()
+    if (!s.apiKey) return Promise.reject(new Error('智能填充需要先在「设置」中配置 AI 接口'))
+    return planFormFill(createProvider(s), fields, ctx)
+  }
   runner = new AgentRunner(tabManager, executor, sendEvent)
   // 本地快速决策模型（混合模式）：ready 前不参与决策，任务零影响
   fastllm = new FastLlm(sendEvent)
@@ -299,6 +310,42 @@ function registerIpc(): void {
   ipcMain.handle('agent:stop', () => runner.stopTask())
   ipcMain.handle('agent:status', () => runner.getStatus())
   ipcMain.handle('agent:guidance', ok((text: string, image?: string) => runner.sendGuidance(text, image)))
+
+  // —————— 浏览器仿真测试 ——————
+  // 需求 MD → 用例 MD（一次 LLM 调用，不占页签）
+  ipcMain.handle('test:convert', async (_e, reqMd: string, mode: 'prd' | 'rough') => {
+    const s = getSettings()
+    if (!s.apiKey) throw new Error('请先在「设置」中配置 AI 接口')
+    return convertRequirement(createProvider(s), String(reqMd || ''), mode === 'prd' ? 'prd' : 'rough')
+  })
+  // 用例 MD 校验（UI 预览步骤/断言/变量）
+  ipcMain.handle('test:parse', (_e, md: string) => {
+    const r = parseTestCase(String(md || ''))
+    if (!r.ok || !r.tc) return { ok: false, error: r.error }
+    const s = summarize(r.tc)
+    return { ok: true, name: r.tc.name, steps: s.steps, assertions: s.assertions, vars: s.vars }
+  })
+  // 运行测试（环境档案按名解析：base_url 注入记忆 + 生产保护标记）
+  ipcMain.handle(
+    'test:start',
+    ok((md: string, opts: { envName?: string; failFast: boolean }) => {
+      const env = findTestEnv(opts?.envName)
+      return runner.startTestRun(String(md || ''), {
+        failFast: opts?.failFast !== false,
+        env: env ? { name: env.name, baseUrl: env.baseUrl, protected: env.protected } : undefined
+      })
+    })
+  )
+  ipcMain.handle('test:stop', () => runner.stopTask())
+  ipcMain.handle('test:status', () => runner.getTestRunStatus())
+  ipcMain.handle('test:reports', () => listReports())
+  ipcMain.handle('test:report-read', ok((file: string) => readReport(file)))
+  ipcMain.handle('test:reports-open', async () => {
+    await shell.openPath(reportsRoot())
+    return true
+  })
+  ipcMain.handle('testenvs:get', () => getTestEnvs())
+  ipcMain.handle('testenvs:set', ok((envs: TestEnv[]) => saveTestEnvs(Array.isArray(envs) ? envs : [])))
 
   // 覆盖层顶部状态条的「暂停/继续」按钮（沙盒页面经 preload 转发）
   ipcMain.on('overlay:pause', () => runner.pauseTask())

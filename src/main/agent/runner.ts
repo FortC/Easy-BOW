@@ -3,23 +3,52 @@ import { DETECT_FRICTION_FN, type ExtractResult } from '../extractor'
 import type { TabManager } from '../tabs'
 import { getSettings } from '../settings'
 import { matchKB } from '../knowledge'
-import { buildStepMessage, SYSTEM_PROMPT, VISION_ADDON, LOCAL_SYSTEM_PROMPT, buildLocalPrompt } from './prompts'
+import { buildStepMessage, SYSTEM_PROMPT, VISION_ADDON, TEST_MODE_ADDON, LOCAL_SYSTEM_PROMPT, buildLocalPrompt, type TestScriptContext } from './prompts'
 import { createProvider, isVisionUnsupportedError, type ContentPart, type LlmProvider } from './llm'
 import { validateLocalActions, type FastLlm } from '../fastllm'
 import { ocrPageText } from '../ocr'
+import { parseTestCase } from '../testcase/parser'
+import { writeTestReport } from '../testcase/report'
 import type {
   AgentAction,
   AgentStatus,
   GuidanceMessage,
   Settings,
   StepRecord,
-  MainEvent
+  MainEvent,
+  TestCase,
+  TestAssertion,
+  TestRunStatus
 } from '@shared/types'
 
 type Broadcast = (ev: MainEvent) => void
 
 /** 本会话内已确认不支持图片输入的模型（`baseURL|model`）：后续任务直接走纯文本，避免每步都撞一次报错 */
 const visionUnsupported = new Set<string>()
+
+/** 测试模式内部执行上下文（仅 startTestRun 期间存在；loop 的所有测试分支以它为门卫） */
+interface TestExecCtx {
+  tc: TestCase
+  /** 当前测试步骤（0-based） */
+  stepIdx: number
+  failFast: boolean
+  /** 生产保护环境：提交类点击需人工确认（透传给 executor） */
+  protectedSubmit: boolean
+  envName?: string
+  /** 当前测试步骤已消耗的模型步数（预算保护用） */
+  perStepModelSteps: number
+}
+
+/** 断言 → expect 动作（提示词里展示给模型的确切 JSON） */
+function assertionToAction(asrt: TestAssertion): AgentAction {
+  return {
+    name: 'expect',
+    kind: asrt.kind === 'ai' ? 'text_visible' : asrt.kind,
+    value: asrt.value,
+    selector: asrt.selector,
+    negate: asrt.negate
+  }
+}
 
 /** 宽松解析模型输出的 JSON（容忍 markdown 围栏、前后杂文） */
 function parseModelJson(text: string): { thought: string; actions: AgentAction[] } | null {
@@ -48,6 +77,12 @@ function parseModelJson(text: string): { thought: string; actions: AgentAction[]
         direction: a.direction,
         amount: typeof a.amount === 'number' ? a.amount : undefined,
         seconds: typeof a.seconds === 'number' ? a.seconds : undefined,
+        // 测试模式动作字段（普通任务提示词不引导输出这些，缺省为 undefined，零影响）
+        kind: typeof a.kind === 'string' ? a.kind : undefined,
+        selector: a.selector != null ? String(a.selector) : undefined,
+        negate: a.negate === true ? true : undefined,
+        data: a.data && typeof a.data === 'object' && !Array.isArray(a.data) ? a.data : undefined,
+        onlyRequired: a.onlyRequired === true ? true : undefined,
         result: a.result != null ? String(a.result) : undefined
       }))
     return { thought, actions }
@@ -83,6 +118,10 @@ export class AgentRunner {
   private pauseRequested = false
   private resumeWaiters: (() => void)[] = []
   private loginHintedHosts = new Set<string>()
+  /** 测试模式上下文（普通任务恒为 null——loop 内所有测试分支以它为门卫，普通路径不变） */
+  private testCtx: TestExecCtx | null = null
+  /** 最近一次测试运行的状态（结束后保留供 UI 查询，直到下次运行） */
+  private testRun: TestRunStatus | null = null
 
   constructor(tabManager: TabManager, executor: Executor, broadcast: Broadcast) {
     this.tabManager = tabManager
@@ -170,6 +209,263 @@ export class AgentRunner {
       this.setState({ state: 'error', statusText: `任务异常: ${e?.message || e}` })
       this.broadcast({ channel: 'toast', message: `任务异常: ${e?.message || e}`, kind: 'error' })
     })
+  }
+
+  // ———————————————— 测试模式（feature/browser-test）————————————————
+
+  getTestRunStatus(): TestRunStatus | null {
+    return this.testRun ? (JSON.parse(JSON.stringify(this.testRun)) as TestRunStatus) : null
+  }
+
+  private broadcastTestRun(): void {
+    if (this.testRun) this.broadcast({ channel: 'test-run', run: this.getTestRunStatus()! })
+  }
+
+  /**
+   * 启动测试运行：解析用例 MD → 独立测试页签（独立登录分区）→ 复用主循环执行
+   * （loop 内所有测试行为以 testCtx 为门卫；finishTest 统一收尾）。
+   */
+  async startTestRun(
+    md: string,
+    opts: { failFast: boolean; env?: { name: string; baseUrl: string; protected: boolean } }
+  ): Promise<void> {
+    if (this.state.state === 'running' || this.state.state === 'paused') {
+      throw new Error('已有任务在运行，请先停止')
+    }
+    const settings = getSettings()
+    if (!settings.apiKey) throw new Error('请先在「设置」中配置 AI 接口（baseURL / API Key / 模型）')
+    const provider = createProvider(settings)
+    const parsed = parseTestCase(md)
+    if (!parsed.ok || !parsed.tc) throw new Error(`测试用例解析失败: ${parsed.error}`)
+
+    // 独立测试页签（登录态与日常浏览互不污染）；页签满时让用户先关页签
+    const tab = this.tabManager.ensureTestTab()
+    tab.cdp.setDialogPolicy('accept') // JS 原生弹窗自动应答（仅测试期间启用，结束即关闭）
+
+    this.testCtx = {
+      tc: parsed.tc,
+      stepIdx: 0,
+      failFast: opts.failFast,
+      protectedSubmit: !!opts.env?.protected,
+      envName: opts.env?.name,
+      perStepModelSteps: 0
+    }
+    this.testRun = {
+      state: 'running',
+      caseName: parsed.tc.name,
+      envName: opts.env?.name,
+      totalSteps: parsed.tc.steps.length,
+      currentStep: 0,
+      steps: parsed.tc.steps.map((s, i) => ({
+        index: i + 1,
+        title: s.title,
+        status: 'pending',
+        assertions: [],
+        modelSteps: 0
+      })),
+      passed: 0,
+      failed: 0,
+      startedAt: Date.now(),
+      tokens: { input: 0, output: 0 }
+    }
+    this.broadcastTestRun()
+
+    const task = `🧪 测试: ${parsed.tc.name}`
+    this.steps = []
+    this.lastResults = []
+    this.pendingGuidance = []
+    this.lastExecutedActions = []
+    this.loginHintedHosts.clear()
+    this.abortCtrl = new AbortController()
+    this.pauseRequested = false
+    this.setState({
+      state: 'running',
+      task,
+      stepCount: 0,
+      statusText: `测试启动: ${parsed.tc.name}`,
+      usage: { inputTokens: 0, outputTokens: 0, steps: 0 },
+      // 测试数据变量 + 环境 base_url 注入记忆（{{变量}} 替换全链路生效）
+      memory: { ...parsed.tc.vars, ...(opts.env?.baseUrl ? { base_url: opts.env.baseUrl } : {}) },
+      result: undefined
+    })
+    this.loop(task, provider, settings)
+      .catch((e) => {
+        this.setState({ state: 'error', statusText: `测试异常: ${e?.message || e}` })
+        this.broadcast({ channel: 'toast', message: `测试异常: ${e?.message || e}`, kind: 'error' })
+      })
+      .finally(() => {
+        if (this.testCtx) this.finishTest()
+      })
+  }
+
+  /**
+   * 测试收尾（幂等）：未执行步骤标 skipped、算通过率、失败步骤截图落盘、写报告、
+   * 关闭弹窗自动应答、清 testCtx。由 loop 结束路径（done/异常/停止/fail-fast）统一触发。
+   */
+  private finishTest(): void {
+    const tctx = this.testCtx
+    const run = this.testRun
+    if (!tctx || !run || run.state !== 'running') return
+    try {
+      this.tabManager.getTestTab()?.cdp.setDialogPolicy(null)
+    } catch {}
+    for (const s of run.steps) {
+      if (s.status === 'pending' || s.status === 'running') {
+        s.status = 'skipped'
+        if (!s.error) s.error = '未执行（测试提前结束）'
+      }
+    }
+    run.passed = run.steps.filter((s) => s.status === 'passed').length
+    run.failed = run.steps.filter((s) => s.status === 'failed' || s.status === 'skipped').length
+    const agentState = this.state.state
+    let state: TestRunStatus['state']
+    if (agentState === 'stopped') state = 'stopped'
+    else if (agentState === 'error') state = 'error'
+    else state = run.failed === 0 ? 'passed' : 'failed'
+    run.state = state
+    run.endedAt = Date.now()
+    run.tokens = { input: this.state.usage.inputTokens, output: this.state.usage.outputTokens }
+    // 失败步骤的最终截图落盘（从时间线里倒查该测试步骤的最后一张截图）
+    const shots = new Map<number, string>()
+    if (this.steps.length) {
+      for (const s of run.steps) {
+        if (s.status !== 'failed') continue
+        for (let i = this.steps.length - 1; i >= 0; i--) {
+          const rec = this.steps[i]
+          if (rec.testStep === s.index && rec.screenshot) {
+            shots.set(s.index, rec.screenshot)
+            break
+          }
+        }
+      }
+    }
+    try {
+      run.reportPath = writeTestReport(run, tctx.tc, shots)
+    } catch (e) {
+      console.error('[easybow] 测试报告写入失败:', e)
+    }
+    this.testCtx = null
+    this.broadcastTestRun()
+    const verdict =
+      state === 'passed' ? '✅ 全部通过' : state === 'failed' ? `❌ 失败 ${run.failed}/${run.totalSteps} 步` : `⚠️ 测试${state}`
+    this.broadcast({ channel: 'toast', message: `测试结束: ${verdict}`, kind: state === 'passed' ? 'success' : 'error' })
+    this.setState({
+      state: state === 'stopped' ? 'stopped' : state === 'error' ? 'error' : 'done',
+      statusText: `测试结束: ${verdict}`,
+      result: `${verdict}（通过 ${run.passed}/${run.totalSteps}）${run.reportPath ? `\n报告: ${run.reportPath}` : ''}`,
+      stepCount: this.steps.length
+    })
+  }
+
+  /** 测试脚本区块（注入每步 user 消息；含当前步骤每条预期应输出的确切 expect JSON） */
+  private buildTestScriptContext(): TestScriptContext {
+    const tctx = this.testCtx!
+    const run = this.testRun!
+    const scriptStep = tctx.tc.steps[tctx.stepIdx]
+    const cur = run.steps[tctx.stepIdx]
+    if (cur && cur.status === 'pending') {
+      cur.status = 'running'
+      run.currentStep = tctx.stepIdx + 1
+      // 该步骤的弹窗应答策略（缺省=确认）
+      try {
+        this.tabManager.getTestTab()?.cdp.setDialogPolicy(scriptStep.dialog || 'accept')
+      } catch {}
+      this.broadcastTestRun()
+    }
+    const mem = this.state.memory
+    const dataLines = Object.entries(mem)
+      .slice(0, 20)
+      .map(([k, v]) => `${k}=${v.length > 60 ? v.slice(0, 60) + '…(用{{' + k + '}}引用)' : v}`)
+      .join('\n')
+    const progressLines = run.steps
+      .slice(0, tctx.stepIdx)
+      .map((s) => `${s.status === 'passed' ? '✅' : s.status === 'failed' ? '❌' : '⏭️'} 步骤${s.index}: ${s.title}`)
+      .join('\n')
+    const lines: string[] = []
+    lines.push(`### ${scriptStep.title}`)
+    lines.push(`- 操作: ${scriptStep.action}`)
+    for (const asrt of scriptStep.assertions) {
+      if (asrt.kind === 'ai') {
+        lines.push(`- 预期: ${asrt.raw} → 把这条自然语言预期翻译成合适的 expect 动作输出`)
+      } else {
+        lines.push(`- 预期: ${asrt.raw} → 输出 ${JSON.stringify(assertionToAction(asrt))}`)
+      }
+    }
+    if (scriptStep.dialog) lines.push(`- 弹窗: ${scriptStep.dialog === 'accept' ? '确认' : '取消'}（系统自动应答）`)
+    return { dataLines, progressLines, stepNo: tctx.stepIdx + 1, totalSteps: tctx.tc.steps.length, currentBlock: lines.join('\n') }
+  }
+
+  /**
+   * 测试模式批后处理：收集断言结果、按 test_step_done 推进步骤指针、fail-fast 终止。
+   * 返回 false = 结束测试循环（收尾统一走 finishTest）。
+   */
+  private async handleTestPostBatch(executed: AgentAction[], stepDoneSignal: boolean): Promise<boolean> {
+    const tctx = this.testCtx
+    const run = this.testRun
+    if (!tctx || !run) return false
+    const cur = run.steps[tctx.stepIdx]
+    if (!cur) return false
+    tctx.perStepModelSteps++
+    cur.modelSteps = tctx.perStepModelSteps
+
+    // 收集本批 expect 断言结果
+    for (const e of executed) {
+      if (e.name !== 'expect') continue
+      cur.assertions.push({
+        raw: `[${e.kind}${e.negate ? '/不' : ''}] ${e.value || e.selector || ''}`,
+        kind: String(e.kind),
+        passed: !e.error,
+        actual: e.error ? e.error.replace(/^断言失败:.*实际=/, '').slice(0, 150) : undefined
+      })
+    }
+    // 弹窗应答记录反馈给模型
+    const dlg = this.tabManager.getTestTab()?.cdp.consumeDialogs()
+    if (dlg) this.lastResults.push(`系统提示: 页面原生弹窗已按脚本自动应答: ${dlg}`)
+
+    const hardFail = executed.some((a) => a.error && a.name !== 'expect')
+    const assertFail = cur.assertions.some((x) => !x.passed)
+
+    if (stepDoneSignal && !hardFail) {
+      const scriptStep = tctx.tc.steps[tctx.stepIdx]
+      const missing = (scriptStep?.assertions.length || 0) - cur.assertions.length
+      if (assertFail || missing > 0) {
+        cur.status = 'failed'
+        if (!cur.error) cur.error = assertFail ? '断言失败' : `有 ${missing} 条预期未输出断言`
+      } else {
+        cur.status = 'passed'
+      }
+      if (cur.status === 'failed' && tctx.failFast) {
+        this.broadcastTestRun()
+        return false // fail-fast：直接结束循环，finishTest 收尾
+      }
+      // 推进到下一步骤
+      tctx.stepIdx++
+      tctx.perStepModelSteps = 0
+      run.passed = run.steps.filter((s) => s.status === 'passed').length
+      run.failed = run.steps.filter((s) => s.status === 'failed' || s.status === 'skipped').length
+      if (tctx.stepIdx >= tctx.tc.steps.length) {
+        this.broadcastTestRun()
+        return false // 全部步骤走完，收尾交给 finishTest（→ passed）
+      }
+      run.currentStep = tctx.stepIdx + 1
+      this.broadcastTestRun()
+      return true
+    }
+
+    // 未收到 test_step_done：单步骤决策预算保护（防模型在一步内打转耗尽 token）
+    if (tctx.perStepModelSteps >= 8) {
+      cur.status = 'failed'
+      cur.error = `步骤卡住：超出单步骤 8 次决策预算`
+      if (tctx.failFast) {
+        this.broadcastTestRun()
+        return false
+      }
+      tctx.stepIdx++
+      tctx.perStepModelSteps = 0
+      run.currentStep = Math.min(tctx.stepIdx + 1, run.totalSteps)
+      this.broadcastTestRun()
+    }
+    return true
   }
 
   pauseTask(): void {
@@ -285,13 +581,16 @@ export class AgentRunner {
       if (!(await this.checkpoint())) return
       const signal = this.abortCtrl!.signal
 
-      // 模型步数（人工指导不算步数预算）
+      // 模型步数（人工指导不算步数预算）；测试模式放宽（一个测试步骤可能消耗多个模型步）
       const stepN = this.steps.filter((s) => !s.userGuidance).length + 1
-      if (stepN > settings.maxSteps) {
+      const maxSteps = this.testCtx
+        ? Math.max(settings.maxSteps, this.testCtx.tc.steps.length * 8 + 6)
+        : settings.maxSteps
+      if (stepN > maxSteps) {
         this.setState({
           state: 'done',
-          statusText: `已达到最大步数 ${settings.maxSteps}，任务结束`,
-          result: `已达最大步数 ${settings.maxSteps}。如需继续，可重新发起任务。`
+          statusText: `已达到最大步数 ${maxSteps}，任务结束`,
+          result: `已达最大步数 ${maxSteps}。如需继续，可重新发起任务。`
         })
         return
       }
@@ -375,6 +674,7 @@ export class AgentRunner {
       let localParsed: { thought: string; actions: AgentAction[] } | null = null
       if (
         settings.aiMode === 'hybrid' &&
+        !this.testCtx && // 测试模式：脚本保真与断言要求高，一律云端决策
         !localDisabled &&
         localCooldown === 0 &&
         !visionActive && // 视觉信息本地小模型看不到
@@ -447,7 +747,8 @@ export class AgentRunner {
           lastResults: this.lastResults,
           guidance,
           vision: useVision,
-          kbTips
+          kbTips,
+          test: this.testCtx ? this.buildTestScriptContext() : undefined
         })
         this.lastResults = []
         this.setState({
@@ -468,7 +769,9 @@ export class AgentRunner {
                 ...guidanceImages
               ]
             : userMsg
-        const systemPrompt = useVision ? SYSTEM_PROMPT + VISION_ADDON : SYSTEM_PROMPT
+        // 测试模式追加测试规则段（普通任务追加空串，提示词逐字节不变）
+        const systemPrompt =
+          (useVision ? SYSTEM_PROMPT + VISION_ADDON : SYSTEM_PROMPT) + (this.testCtx ? TEST_MODE_ADDON : '')
 
         try {
           llmOut = await provider.chat(systemPrompt, [{ role: 'user', content }], signal)
@@ -558,19 +861,24 @@ export class AgentRunner {
         continue
       }
 
-      // 5. 执行动作批
+      // 5. 执行动作批（测试模式：test_step_done 是控制信号，进执行器前剥离；protectedSubmit 透传生产保护）
       this.setState({ statusText: `第 ${stepN} 步：执行 ${parsed.actions.length} 个动作…`, usage })
-      const executed = await this.executor.executeBatch(parsed.actions, {
-        memory: this.state.memory,
-        signal,
-        settings: getSettings(),
-        prevActions: this.lastExecutedActions
-      })
+      const stepDoneSignal = !!this.testCtx && parsed.actions.some((x) => x.name === 'test_step_done')
+      const executed = await this.executor.executeBatch(
+        this.testCtx ? parsed.actions.filter((x) => x.name !== 'test_step_done') : parsed.actions,
+        {
+          memory: this.state.memory,
+          signal,
+          settings: getSettings(),
+          prevActions: this.lastExecutedActions,
+          protectedSubmit: this.testCtx?.protectedSubmit
+        }
+      )
       // 只认实际执行成功的 done（暂停/出错打断批次时不应误判完成）
       const doneAction = executed.find((a) => a.name === 'done' && !a.error)
-      // 供 repeat 重放：剥离大文本字段，只留动作骨架
+      // 供 repeat 重放：剥离大文本字段，只留动作骨架（测试动作 expect/test_step_done 无重放意义，一并排除）
       this.lastExecutedActions = executed
-        .filter((a) => a.name !== 'done')
+        .filter((a) => a.name !== 'done' && a.name !== 'expect' && a.name !== 'test_step_done')
         .map(({ result: _r, error: _e, ...rest }) => rest)
 
       // 收集动作结果供下一步（read_content / extract_images 等大文本）
@@ -595,7 +903,11 @@ export class AgentRunner {
       }, screenshot || undefined)
       if (useVision && !visionRetryUsed) step.vision = true
       if (localUsed) step.local = true
+      if (this.testCtx) step.testStep = this.testCtx.stepIdx + 1
       this.broadcast({ channel: 'step', step })
+
+      // 测试模式：断言收集 / 步骤推进 / fail-fast（返回 false 结束循环，收尾统一走 finishTest）
+      if (this.testCtx && !(await this.handleTestPostBatch(executed, stepDoneSignal))) return
 
       if (doneAction) {
         this.setState({

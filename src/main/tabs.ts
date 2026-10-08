@@ -14,7 +14,12 @@ export interface Tab {
   title: string
   url: string
   loading: boolean
+  /** 会话分区（普通页签缺省=共享持久分区；测试页签用独立分区隔离登录态） */
+  partition?: string
 }
+
+/** 测试页签专用会话分区：与日常浏览的登录态/Cookie 互不污染 */
+export const TEST_PARTITION = 'persist:easybow-test'
 
 let nextTabId = 1
 
@@ -117,14 +122,16 @@ export class TabManager {
     this.layout()
   }
 
-  newTab(url?: string): { tabs: TabInfo[]; activeTabId: number } {
+  newTab(url?: string, opts?: { partition?: string }): { tabs: TabInfo[]; activeTabId: number } {
     if (this.tabs.length >= MAX_TABS) {
       this.broadcast('toast', { message: `最多 ${MAX_TABS} 个页签，请先关闭其他页签`, kind: 'error' })
       return this.snapshot()
     }
+    // 指定 partition 的页签用独立会话（测试页签隔离登录态）；普通页签行为与历史版本一致
+    const ses = opts?.partition ? session.fromPartition(opts.partition) : this.ses
     const view = new WebContentsView({
       webPreferences: {
-        session: this.ses
+        session: ses
       }
     })
     const wc = view.webContents
@@ -134,7 +141,8 @@ export class TabManager {
       cdp: new Cdp(wc),
       title: '新页签',
       url: url || '',
-      loading: false
+      loading: false,
+      partition: opts?.partition
     }
 
     wc.setWindowOpenHandler(({ url: openUrl }) => {
@@ -248,6 +256,30 @@ export class TabManager {
 
   all(): Tab[] {
     return this.tabs
+  }
+
+  /** 测试页签（独立登录分区；无则 undefined） */
+  getTestTab(): Tab | undefined {
+    return this.tabs.find((x) => x.partition === TEST_PARTITION)
+  }
+
+  /**
+   * 取测试页签：已存在则切到它；没有则新建（独立分区、about:blank 起步）并激活。
+   * 页签满时抛错（调用方提示用户先关页签），不静默降级到普通页签。
+   */
+  ensureTestTab(): Tab {
+    const existing = this.getTestTab()
+    if (existing) {
+      this.switchTab(existing.id)
+      return existing
+    }
+    if (this.tabs.length >= MAX_TABS) {
+      throw new Error(`页签已达 ${MAX_TABS} 个上限，请先关闭其他页签再运行测试`)
+    }
+    this.newTab('about:blank', { partition: TEST_PARTITION })
+    const t = this.getTestTab()
+    if (!t) throw new Error('测试页签创建失败')
+    return t
   }
 
   async navigate(url: string): Promise<void> {

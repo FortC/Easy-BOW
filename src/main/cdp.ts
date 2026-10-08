@@ -9,6 +9,12 @@ export class Cdp {
   private wc: WebContents
   private attached = false
   private destroyed = false
+  /** JS 原生弹窗自动应答策略（null=不接管；仅测试运行期间由 runner 开启） */
+  private dialogPolicy: 'accept' | 'dismiss' | null = null
+  private dialogPageEnabled = false
+  private dialogHandler: ((_e: unknown, method: string, params: any) => void) | null = null
+  /** 已自动应答的弹窗记录（consumeDialogs 取走） */
+  private dialogLog: string[] = []
 
   constructor(wc: WebContents) {
     this.wc = wc
@@ -148,5 +154,51 @@ export class Cdp {
 
   isAttached(): boolean {
     return this.attached
+  }
+
+  /**
+   * JS 原生弹窗（alert/confirm/prompt/beforeunload）自动应答。
+   * 仅测试模式启用（policy 非 null）：弹窗会阻塞页面 JS 与 CDP evaluate，测试流程遇
+   * confirm 必挂；普通任务保持 null 完全不接管（行为与历史版本一致）。
+   * beforeunload 一律 dismiss（防误导航离开页面），其余按 policy 应答。
+   */
+  setDialogPolicy(policy: 'accept' | 'dismiss' | null): void {
+    this.dialogPolicy = policy
+    if (!policy) {
+      this.dialogLog = []
+      return
+    }
+    if (!this.dialogHandler) {
+      this.dialogHandler = (_e, method, params) => {
+        if (method !== 'Page.javascriptDialogOpening' || !this.dialogPolicy) return
+        // 注：CDP 派发输入触发的 confirm/prompt，浏览器侧上报的 messageType 可能降级为
+        // 'alert'（与真实用户手势触发的上报不同），故应答逻辑不区分 alert/confirm
+        const type = String(params?.messageType || 'alert')
+        const msg = String(params?.message || '').slice(0, 80)
+        const isBeforeUnload = type === 'beforeunload'
+        const accept = isBeforeUnload ? false : this.dialogPolicy === 'accept'
+        this.dialogLog.push(`[${type}${isBeforeUnload ? '/阻止离开' : accept ? '/已确认' : '/已取消'}] ${msg}`)
+        this.send('Page.handleJavaScriptDialog', {
+          accept,
+          ...(type === 'prompt' && accept ? { promptText: String(params?.defaultPrompt || '') } : {})
+        }).catch(() => {})
+      }
+      try {
+        this.wc.debugger.on('message', this.dialogHandler)
+      } catch {}
+    }
+    if (!this.dialogPageEnabled) {
+      this.dialogPageEnabled = true
+      // javascriptDialogOpening 事件需要 Page 域开启才会推送
+      this.send('Page.enable').catch(() => {})
+    }
+  }
+
+  /** 取走并清空已自动应答的弹窗记录（runner 批后反馈给模型/报告） */
+  consumeDialogs(): string | null {
+    if (!this.dialogLog.length) return null
+    const out = this.dialogLog.join('; ')
+    this.dialogLog = []
+    return out
   }
 }

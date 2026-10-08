@@ -51,6 +51,22 @@ export const VISION_ADDON = `
 4. 元素列表仍是操作依据：截图里可见但列表中没有的元素不可直接操作；thought 保持简短，不要描述截图内容`
 
 /**
+ * 测试模式追加段（仅测试运行时拼在 SYSTEM_PROMPT 后；普通任务永不出现，非测试提示词逐字节不变）。
+ * 测试动作（expect / test_step_done / fill_form）只在这里说明，不进通用 SYSTEM_PROMPT。
+ */
+export const TEST_MODE_ADDON = `
+
+## 测试模式（当前任务 = 浏览器自动化测试，本节规则优先级最高）
+1. 你正在执行测试脚本中的「当前步骤」：只做该步骤描述的操作，禁止即兴发挥、跳步、提前做后续步骤、做脚本外的多余操作
+2. 该步骤的每一条「预期」都必须输出对应的 expect 断言动作（脚本会给出每条预期应输出的确切 JSON，原样输出参数即可）；预期未全部断言前不得结束本步骤
+3. expect 断言失败不要尝试补救或重复操作——如实输出即可，由系统决定终止（fail-fast）还是继续
+4. 步骤的全部操作与断言完成后，最后输出 {"name":"test_step_done"} 收尾，系统会推进到下一步骤
+5. 一个测试步骤允许分多轮完成（例如先 scroll 找到元素、下拉展开后再选）；但每轮只服务于当前步骤
+6. 步骤要求「智能填充表单」时输出 {"name":"fill_form"}（可带 "onlyRequired":true），系统会自动识别字段并整表填充，你不要逐字段 type
+7. 页面弹出原生确认框（confirm/alert）时系统会按脚本自动应答，你无需处理
+8. 遇到登录/验证码按通用规则等待人工；全部步骤完成后输出 {"name":"done","result":"测试执行完毕"}`
+
+/**
  * 混合模式：本地快速决策（小模型）专用提示。
  * 只放行"显而易见的下一步"；done/页签/跳转/粘贴类一律禁止（由云端大模型决策），
  * 不确定就输出空 actions 交回云端。
@@ -102,6 +118,31 @@ export interface StepContext {
   vision?: boolean
   /** 问题经验库：用户积累的站点处理经验（当前页匹配项），优先级高于模型直觉 */
   kbTips: { domain: string; problem: string; solution: string }[]
+  /** 测试模式：测试脚本上下文（仅测试运行时存在；缺省时提示词与普通任务逐字节一致） */
+  test?: TestScriptContext
+}
+
+/** 测试模式注入的脚本上下文（runner 构造；含当前步骤与其断言的确切 expect 动作） */
+export interface TestScriptContext {
+  /** 测试数据变量行（username=test01 形式） */
+  dataLines: string
+  /** 已完成步骤的进度摘要（每步一行：✅/❌ + 标题） */
+  progressLines: string
+  /** 当前步骤（1-based）与总步骤数 */
+  stepNo: number
+  totalSteps: number
+  /** 当前步骤的完整文本（标题/操作/每条预期对应的确切 expect JSON/弹窗策略） */
+  currentBlock: string
+}
+
+/** 渲染测试脚本区块（buildStepMessage 仅在 ctx.test 存在时拼入；普通任务不受影响） */
+function renderTestBlock(t: TestScriptContext): string {
+  const parts: string[] = []
+  parts.push(`# 测试脚本（自动化测试模式：严格按脚本执行，禁止即兴发挥）`)
+  if (t.dataLines) parts.push(`## 测试数据\n${t.dataLines}`)
+  if (t.progressLines) parts.push(`## 执行进度\n${t.progressLines}`)
+  parts.push(`## 当前步骤（第 ${t.stepNo}/${t.totalSteps} 步，只执行这一步；完成全部操作与断言后输出 {"name":"test_step_done"}）\n${t.currentBlock}`)
+  return parts.join('\n\n')
 }
 
 function summarizeActions(actions: AgentAction[]): string {
@@ -142,6 +183,9 @@ export function buildStepMessage(ctx: StepContext): string {
   const parts: string[] = []
 
   parts.push(`# 任务\n${ctx.task}`)
+
+  // 测试模式：任务下方紧跟测试脚本区块（普通任务 ctx.test 缺省，本区块不拼入，输出逐字节不变）
+  if (ctx.test) parts.push(renderTestBlock(ctx.test))
 
   const activeIdx = ctx.tabs.findIndex((t) => t.id === ctx.activeTabId)
   const tabLines = ctx.tabs

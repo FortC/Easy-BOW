@@ -88,6 +88,58 @@
     <span id="dyn-flag" style="margin-left: 10px;"></span>
   </div>
 
+  <!-- ———— 浏览器仿真测试功能区（feature/browser-test 自测 fixture） ———— -->
+  <div class="box" id="reg-form-box">
+    <p>注册表单（智能填充/断言测试）：含带 label 字段、无 label 仅有 placeholder 的字段、下拉、勾选、必填</p>
+    <form id="reg-form" onsubmit="return false;">
+      <p><label for="reg-user">用户名：</label><input id="reg-user" name="username" required></p>
+      <p><label for="reg-mail">邮箱：</label><input id="reg-mail" name="email" type="email" required></p>
+      <p><input id="reg-phone" name="phone" placeholder="请输入11位手机号" maxlength="11"></p>
+      <p><label for="reg-city">城市：</label>
+        <select id="reg-city" name="city">
+          <option value="">请选择</option>
+          <option value="hz">杭州</option>
+          <option value="sh">上海</option>
+          <option value="bj">北京</option>
+        </select>
+      </p>
+      <p><label><input type="checkbox" id="reg-agree" name="agree"> 我已阅读并同意协议</label></p>
+      <p><label for="reg-note">备注：</label><textarea id="reg-note" name="note" rows="2"></textarea></p>
+      <button id="reg-submit" type="button">注册提交</button>
+      <p class="error-msg" id="reg-error" style="color: #d9393a; display: none;"></p>
+      <p id="reg-result" style="color: #2e9e44;"></p>
+    </form>
+    <script>
+      (function () {
+        document.getElementById('reg-submit').addEventListener('click', function () {
+          var u = document.getElementById('reg-user').value
+          var m = document.getElementById('reg-mail').value
+          var err = document.getElementById('reg-error')
+          var ok = document.getElementById('reg-result')
+          if (!u) { err.textContent = '用户名不能为空'; err.style.display = 'block'; ok.textContent = ''; return }
+          if (!m || m.indexOf('@') < 0) { err.textContent = '邮箱格式不正确'; err.style.display = 'block'; ok.textContent = ''; return }
+          err.style.display = 'none'
+          ok.textContent = '注册成功：' + u
+        })
+      })()
+    </script>
+  </div>
+
+  <div class="box">
+    <p>原生弹窗（confirm 自动应答测试）：</p>
+    <button id="confirm-btn">删除记录（弹确认框）</button>
+    <span id="confirm-result">（未操作）</span>
+    <script>
+      document.getElementById('confirm-btn').addEventListener('click', function () {
+        if (confirm('确定要删除这条记录吗？')) {
+          document.getElementById('confirm-result').textContent = '已删除'
+        } else {
+          document.getElementById('confirm-result').textContent = '已取消'
+        }
+      })
+    </script>
+  </div>
+
   <div class="spacer">（占位高度，用于滚动测试）</div>
   <p id="bottom-marker">已到页面底部</p>
 

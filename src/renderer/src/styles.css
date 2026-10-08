@@ -542,3 +542,55 @@ img.hist-fav { object-fit: contain; }
 .fb-task { font-size: 12px; color: var(--text2); background: #f7f8fa; border-radius: 8px; padding: 6px 10px; margin-bottom: 10px; max-height: 66px; overflow: hidden; }
 .fb-q { font-size: 12.5px; margin-bottom: 12px; }
 .fb-ops { display: flex; gap: 8px; justify-content: center; }
+
+/* —————— 浏览器仿真测试面板 —————— */
+.test-modal { width: 760px; max-width: 94vw; max-height: 90vh; overflow-y: auto; }
+.test-tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+.test-tab {
+  flex: 1; padding: 8px 0; border: 1px solid #e5e6eb; background: #f7f8fa; border-radius: 8px;
+  font-size: 13px; cursor: pointer; color: var(--text2); transition: all .15s ease;
+}
+.test-tab.active { background: var(--brand, #3370ff); border-color: var(--brand, #3370ff); color: #fff; font-weight: 600; }
+.test-md-input { font-family: Consolas, 'Courier New', monospace; font-size: 12px; line-height: 1.55; }
+.test-convert-btn { justify-content: flex-end; display: flex; align-items: flex-end; }
+.test-run-btns { display: flex; gap: 8px; align-items: flex-end; }
+.test-parse-err { color: #d9393a !important; }
+.test-warn { color: #b26a00 !important; background: #fff7e8; border-radius: 6px; padding: 6px 10px; }
+.test-envs { margin-top: 14px; border-top: 1px dashed #e5e6eb; padding-top: 10px; }
+.test-envs-head { display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: var(--text2); margin-bottom: 6px; }
+.test-env-edit { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.test-env-edit input[type="text"], .test-env-edit input:not([type]) { flex: 1; min-width: 120px; }
+.test-env-prot { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text2); white-space: nowrap; }
+.test-env-list { display: flex; flex-direction: column; gap: 4px; }
+.test-env-item {
+  display: flex; align-items: center; gap: 10px; font-size: 12.5px; padding: 6px 10px;
+  background: #f7f8fa; border-radius: 8px; cursor: default;
+}
+.test-env-item .btn { cursor: pointer; }
+.test-env-url { color: var(--text2); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.test-env-badge { font-size: 11px; color: #b26a00; background: #fff7e8; padding: 1px 6px; border-radius: 4px; }
+.test-run { margin-top: 14px; border-top: 1px dashed #e5e6eb; padding-top: 10px; }
+.test-run-banner {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12.5px;
+  padding: 8px 12px; border-radius: 8px; margin-bottom: 8px; background: #f7f8fa;
+}
+.test-run-banner b { font-size: 13.5px; }
+.test-run-banner.run-passed { background: #e8f7ec; }
+.test-run-banner.run-failed { background: #fdeeee; }
+.test-run-banner.run-running { background: #eef4ff; }
+.test-run-ops { margin-left: auto; }
+.test-steps { display: flex; flex-direction: column; gap: 4px; max-height: 300px; overflow-y: auto; }
+.test-step { border: 1px solid #eceef1; border-radius: 8px; padding: 6px 10px; font-size: 12.5px; }
+.test-step.failed { border-color: #f2c1c1; background: #fffafa; }
+.test-step.passed { border-color: #cdebd4; }
+.test-step-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.test-step-meta { color: var(--text2); font-size: 11.5px; }
+.test-asserts { margin-top: 4px; display: flex; flex-direction: column; gap: 2px; padding-left: 22px; }
+.test-assert { font-size: 11.5px; display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+.test-assert code { font-family: Consolas, monospace; background: #f4f5f7; padding: 0 4px; border-radius: 3px; }
+.test-assert.bad code { background: #fdeeee; }
+.test-assert em { color: #d9393a; font-style: normal; }
+.test-reports { display: flex; flex-direction: column; gap: 6px; }
+.test-reports .test-env-item { cursor: pointer; }
+.test-report-view { margin-top: 8px; max-height: 380px; overflow: auto; background: #f7f8fa; border-radius: 8px; padding: 10px; }
+.test-report-view pre { font-size: 11.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; margin: 0; font-family: Consolas, monospace; }

@@ -799,6 +799,284 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
     } catch (e: any) {
       check('页签关闭清理快照', false, String(e?.message || e))
     }
+
+    // 10. 浏览器仿真测试（feature/browser-test）
+    try {
+      const sampleMd = [
+        '# TESTCASE: 示例用例',
+        '',
+        '## 测试数据',
+        '| 变量 | 值 |',
+        '|---|---|',
+        '| username | test01 |',
+        '| password | Test@123 |',
+        '',
+        '## 步骤',
+        '',
+        '### 步骤 1: 打开登录页',
+        '- 操作: 访问 {{base_url}}/login',
+        '',
+        '### 步骤 2: 登录',
+        '- 操作: 在用户名输入 {{username}}，点击「登录」',
+        '- 预期: [文字] 页面出现「欢迎回来」',
+        '- 预期: [URL] 不包含 /login',
+        '- 预期: [选择器 .error-msg] 不存在',
+        '- 弹窗: 取消',
+        '',
+        '## 清理',
+        '### 步骤 1: 退出',
+        '- 操作: 点击头像菜单里的退出'
+      ].join('\n')
+
+      // 10.1 用例解析：变量/步骤/断言类型/取反/弹窗/清理区块
+      const { parseTestCase } = await import('./testcase/parser')
+      const pr = parseTestCase(sampleMd)
+      const tcOk = !!pr.tc && pr.tc.vars.username === 'test01' && pr.tc.steps.length === 3
+      const a2 = pr.tc?.steps[1].assertions
+      const asrtOk =
+        !!a2 &&
+        a2.length === 3 &&
+        a2[0].kind === 'text_visible' &&
+        a2[1].kind === 'url_contains' &&
+        !!a2[1].negate &&
+        a2[2].kind === 'selector_exists' &&
+        !!a2[2].negate &&
+        a2[2].selector === '.error-msg'
+      const dlgOk = pr.tc?.steps[1].dialog === 'dismiss'
+      const cleanOk = !!pr.tc?.steps[2].title.startsWith('清理:')
+      check(
+        '测试用例解析(parser)',
+        tcOk && asrtOk && dlgOk && cleanOk,
+        `vars/steps=${tcOk} 断言=${asrtOk} 弹窗=${dlgOk} 清理=${cleanOk}`
+      )
+      const bad = parseTestCase('# TESTCASE: 空用例\n\n## 测试数据\n| a | b |\n|---|---|\n| k | v |')
+      check('测试用例解析-拒绝无效用例', !bad.ok && !!bad.error, bad.error || '（意外通过）')
+
+      // 10.2 提示词逐字节回归：普通模式 buildStepMessage 与基线完全一致（防意外改动破坏普通任务）；
+      // 测试区块/追加段只在测试模式出现
+      const { buildStepMessage, SYSTEM_PROMPT, TEST_MODE_ADDON } = await import('./agent/prompts')
+      const fixedCtx: any = {
+        task: '测试任务',
+        tabs: [{ id: 1, title: '页签一', url: 'https://example.com', loading: false, canGoBack: false, canGoForward: false }],
+        activeTabId: 1,
+        extract: {
+          title: '示例页',
+          url: 'https://example.com/page',
+          scrollY: 0,
+          scrollHeight: 600,
+          viewportW: 1000,
+          viewportH: 600,
+          candidates: [],
+          totalFound: 0,
+          imgCount: 0
+        },
+        elementLines: '[1] <button> "确定"',
+        maxElements: 80,
+        memory: {},
+        steps: [],
+        lastResults: [],
+        kbTips: []
+      }
+      const baseline = [
+        '# 任务\n测试任务',
+        '# 页签（当前第 1/1 个）\n[1] 页签一 ←当前',
+        '# 当前页面\n标题: 示例页\nURL: https://example.com/page ', // URL 后有一个空格（scrollInfo 为空时的模板产物，属既有行为）
+        '# 可交互元素（编号仅对当前页签有效）\n[1] <button> "确定"',
+        '# 下一步\n输出 JSON（thought + 最多5个动作）：'
+      ].join('\n\n')
+      const msgNormal = buildStepMessage(fixedCtx)
+      const byteOk = msgNormal === baseline
+      check(
+        '提示词逐字节回归(非测试模式)',
+        byteOk,
+        byteOk ? `${msgNormal.length} 字节一致` : `长度 ${msgNormal.length} vs 基线 ${baseline.length}`
+      )
+      const msgTest = buildStepMessage({
+        ...fixedCtx,
+        test: {
+          dataLines: 'username=test01',
+          progressLines: '',
+          stepNo: 1,
+          totalSteps: 2,
+          currentBlock: '### 步骤 1: 打开\n- 操作: 访问 {{base_url}}/login'
+        }
+      })
+      check(
+        '提示词测试区块仅测试模式注入',
+        msgTest.includes('# 测试脚本') && !msgNormal.includes('# 测试脚本') && TEST_MODE_ADDON.includes('test_step_done') && !SYSTEM_PROMPT.includes('测试模式'),
+        `普通模式含测试区块=${msgNormal.includes('# 测试脚本')} 测试模式含=${msgTest.includes('# 测试脚本')}`
+      )
+
+      // 回到自测 fixture 页（此前 9.9 开关过页签）
+      await tm.navigate(fixture)
+      await sleep(900)
+
+      // 10.3 表单字段深提取：label 关联 / 无 label 仅 placeholder / select 选项 / required / checkbox
+      const { FORM_FIELDS_FN } = await import('./testcase/fields')
+      const ftab = tm.active()
+      if (!ftab) throw new Error('fixture 页签不可用')
+      const fields = await ftab.cdp.evaluate<any[]>(FORM_FIELDS_FN, [])
+      const fu = fields.find((f) => f.id === 'reg-user')
+      const fp = fields.find((f) => f.id === 'reg-phone')
+      const fc = fields.find((f) => f.id === 'reg-city')
+      const fa = fields.find((f) => f.id === 'reg-agree')
+      check(
+        '表单字段深提取',
+        !!fu && fu.label.includes('用户名') && fu.required === true && !!fp && fp.placeholder.includes('11位手机号') && !!fc && Array.isArray(fc.options) && fc.options.some((o: any) => o.value === 'hz') && !!fa && fa.inputType === 'checkbox',
+        `字段数=${fields.length} 用户名label=${fu?.label || '无'} phone占位=${fp?.placeholder || '无'} 城市选项=${fc?.options?.length}`
+      )
+
+      // 10.4 expect 断言：通过路径（文字/选择器/URL/取值）+ 失败路径不中断批次
+      await ftab.cdp.evaluate(String(function setVal() { (document.getElementById('reg-user') as HTMLInputElement).value = 'tester01' }), [])
+      const passCtx = { memory: {}, signal: new AbortController().signal, settings: { speed: 'normal' } as any }
+      const b1 = await ex.executeBatch(
+        [
+          { name: 'expect', kind: 'text_visible', value: '注册表单' },
+          { name: 'expect', kind: 'selector_exists', selector: '#reg-phone' },
+          { name: 'expect', kind: 'url_contains', value: 'testpage.html' },
+          { name: 'expect', kind: 'selector_value', selector: '#reg-user', value: 'tester01' }
+        ] as any,
+        passCtx
+      )
+      const passOk = b1.length === 4 && b1.every((a: any) => a.name === 'expect' && !a.error)
+      check('expect断言-通过路径', passOk, b1.map((a: any) => a.error || 'ok').join(' | '))
+      const b2 = await ex.executeBatch(
+        [
+          { name: 'expect', kind: 'text_visible', value: '根本不存在的文字xyzq' },
+          { name: 'expect', kind: 'selector_exists', selector: '.no-such-cls-xyz', negate: true },
+          { name: 'expect', kind: 'text_visible', value: '注册表单' }
+        ] as any,
+        passCtx
+      )
+      const failOk = b2.length === 3 && !!b2[0].error && !b2[1].error && !b2[2].error
+      check('expect断言-失败不中断批次', failOk, `首条失败=${!!b2[0].error} 取反通过=${!b2[1].error} 后续继续=${!b2[2].error}`)
+
+      // 10.5 智能填充规划：本地契约校验（越界 index 过滤、值保留）
+      const { planFormFill } = await import('./testcase/fields')
+      const stubPlanner: any = {
+        chat: async () => ({
+          text: '[{"index":0,"value":"13800138000","reason":"手机号按占位符"},{"index":99,"value":"x"}]',
+          usage: { inputTokens: 1, outputTokens: 1 }
+        })
+      }
+      const plan = await planFormFill(
+        stubPlanner,
+        [
+          {
+            tag: 'INPUT', inputType: 'tel', name: 'phone', id: '', placeholder: '请输入11位手机号', label: '', aria: '',
+            autoComplete: '', required: true, pattern: '', min: '', max: '', maxLength: 11, value: '', checked: false,
+            adjacent: '', options: [], hint: 'placeholder=请输入11位手机号 name=phone 必填'
+          }
+        ] as any,
+        { vars: {}, constraints: '', onlyRequired: false }
+      )
+      check('智能填充规划(契约校验)', plan.length === 1 && plan[0].value === '13800138000', JSON.stringify(plan))
+
+      // 10.6 fill_form 端到端：stub 规划器 + 真实填充管线（文本键入回读 / 下拉 / 勾选）
+      const fieldsForIdx = await ftab.cdp.evaluate<any[]>(FORM_FIELDS_FN, [])
+      const idxUser = fieldsForIdx.findIndex((f) => f.id === 'reg-user')
+      const idxPhone = fieldsForIdx.findIndex((f) => f.id === 'reg-phone')
+      const idxCity = fieldsForIdx.findIndex((f) => f.id === 'reg-city')
+      const idxAgree = fieldsForIdx.findIndex((f) => f.id === 'reg-agree')
+      const savedPlanner = ex.formFillPlanner
+      ex.formFillPlanner = async () => [
+        { index: idxUser, value: 'tester02', reason: '自测' },
+        { index: idxPhone, value: '13800138000', reason: '自测' },
+        { index: idxCity, value: 'hz', reason: '自测' },
+        { index: idxAgree, value: '', check: true, reason: '自测' }
+      ]
+      let ff: any[] = []
+      try {
+        ff = await ex.executeBatch([{ name: 'fill_form' }] as any, passCtx)
+      } finally {
+        ex.formFillPlanner = savedPlanner
+      }
+      const regState = await ftab.cdp.evaluate<any>(
+        String(function readReg() {
+          return {
+            u: (document.getElementById('reg-user') as HTMLInputElement).value,
+            p: (document.getElementById('reg-phone') as HTMLInputElement).value,
+            c: (document.getElementById('reg-city') as HTMLSelectElement).value,
+            a: (document.getElementById('reg-agree') as HTMLInputElement).checked
+          }
+        }),
+        []
+      )
+      check(
+        'fill_form智能填充(端到端)',
+        !ff[0]?.error && regState.u === 'tester02' && regState.p === '13800138000' && regState.c === 'hz' && regState.a === true,
+        `error=${ff[0]?.error || '无'} 实际=${JSON.stringify(regState)}`
+      )
+
+      // 10.7 JS 原生弹窗自动应答（仅启用 policy 时接管；应答后 evaluate 不再被阻塞）
+      ftab.cdp.setDialogPolicy('accept')
+      await sleep(300) // 等 Page.enable 生效
+      const snapDlg = await ex.extract(ftab)
+      const dlgIdx = snapDlg.candidates.findIndex((c) => c.text.includes('删除记录'))
+      const dlgBatch = await ex.executeBatch([{ name: 'click', index: dlgIdx }] as any, passCtx)
+      await sleep(500)
+      const dlgLog = ftab.cdp.consumeDialogs()
+      const dlgResult = await ftab.cdp.evaluate<string>(
+        String(function readDlg() { return document.getElementById('confirm-result')!.textContent || '' }),
+        []
+      )
+      check(
+        'JS弹窗自动应答',
+        !!dlgLog && dlgLog.includes('确定要删除') && dlgLog.includes('已确认') && dlgResult === '已删除' && !dlgBatch[0]?.error,
+        `记录=${dlgLog || '无'} 页面结果=${dlgResult}（注：CDP 派发输入触发的 confirm 上报类型可能是 alert，以文案与应答结果判定为准）`
+      )
+      ftab.cdp.setDialogPolicy(null)
+
+      // 10.8 测试页签独立分区：ensureTestTab 幂等复用同一页签
+      const t1 = tm.ensureTestTab()
+      await sleep(500)
+      const t2 = tm.ensureTestTab()
+      const partOk = t1.id === t2.id && t1.partition === 'persist:easybow-test'
+      tm.closeTab(t1.id)
+      await sleep(200)
+      check('测试页签独立分区复用', partOk, `id=${t1.id}/${t2.id} partition=${t1.partition}`)
+
+      // 10.9 用例转换器：坏输出自动带错误重试一次后成功
+      const { convertRequirement } = await import('./testcase/converter')
+      let chatCall = 0
+      const stubConv: any = {
+        chat: async () => {
+          chatCall++
+          return {
+            text: chatCall === 1 ? '这不是用例 markdown' : sampleMd,
+            usage: { inputTokens: 1, outputTokens: 1 }
+          }
+        }
+      }
+      const cv = await convertRequirement(stubConv, '打开后台，登录，新建客户', 'rough')
+      check('用例转换器(重试与校验)', cv.ok && cv.steps === 3 && cv.attempts === 2, `ok=${cv.ok} steps=${cv.steps} attempts=${cv.attempts} err=${cv.error || '无'}`)
+
+      // 10.10 测试报告生成：判定/步骤表/断言明细/失败截图落盘
+      const { writeTestReport } = await import('./testcase/report')
+      const { readFileSync, existsSync } = await import('fs')
+      const { dirname, join: joinP } = await import('path')
+      const fakeRun: any = {
+        state: 'failed', caseName: '自测报告用例', envName: '测试环境', totalSteps: 2, currentStep: 2,
+        steps: [
+          { index: 1, title: '步骤一', status: 'passed', assertions: [{ raw: '[文字] x', kind: 'text_visible', passed: true }], modelSteps: 1 },
+          { index: 2, title: '步骤二', status: 'failed', assertions: [{ raw: '[URL] y', kind: 'url_contains', passed: false, actual: '/z' }], modelSteps: 2, error: '断言失败' }
+        ],
+        passed: 1, failed: 1, startedAt: Date.now() - 5000, endedAt: Date.now(), tokens: { input: 100, output: 50 }
+      }
+      const reportPath = writeTestReport(
+        fakeRun,
+        { name: '自测报告用例', vars: { a: '1' }, steps: [{ title: '步骤一', action: 'op1', assertions: [] }, { title: '步骤二', action: 'op2', assertions: [] }] } as any,
+        new Map([[2, 'data:image/jpeg;base64,' + Buffer.from('fake-jpeg').toString('base64')]])
+      )
+      const rc = readFileSync(reportPath, 'utf-8')
+      check(
+        '测试报告生成',
+        reportPath.endsWith('report.md') && rc.includes('❌ 失败') && rc.includes('步骤二') && rc.includes('实际: /z') && existsSync(joinP(dirname(reportPath), 'shots', 'step-2.jpg')),
+        reportPath
+      )
+    } catch (e: any) {
+      check('仿真测试功能', false, String(e?.stack || e))
+    }
   } catch (e: any) {
     check('自测流程', false, String(e?.stack || e))
   }

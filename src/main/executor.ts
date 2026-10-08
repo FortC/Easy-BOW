@@ -1,6 +1,6 @@
 import type { TabManager, Tab } from './tabs'
 import type { Overlay } from './overlay'
-import { clipboard, nativeImage, ClipboardItem } from 'electron'
+import { clipboard, nativeImage, ClipboardItem, dialog } from 'electron'
 import type { WebContents } from 'electron'
 import {
   EXTRACT_FN,
@@ -11,6 +11,8 @@ import {
   formatCandidates
 } from './extractor'
 import { mdToHtml, mdToPlain } from './markdown'
+import { EXPECT_TEXT_FN, EXPECT_SEL_FN } from './testcase/assertions'
+import { FORM_FIELDS_FN, FORM_SET_FN, type FormField } from './testcase/fields'
 import type { AgentAction, Settings } from '@shared/types'
 
 export interface ExecContext {
@@ -19,6 +21,8 @@ export interface ExecContext {
   settings: Settings
   /** 上一步执行成功的动作骨架（repeat 重放用；可缺省） */
   prevActions?: AgentAction[]
+  /** 测试模式：生产保护环境下为 true，提交类点击前需人工确认（普通任务恒缺省） */
+  protectedSubmit?: boolean
 }
 
 interface Resolved {
@@ -123,6 +127,11 @@ export class Executor {
   overlay: Overlay | null = null
   /** 可选：read_content 文本过少时的整页 OCR 兜底 */
   ocrPageFallback?: () => Promise<string | null>
+  /** 可选：fill_form 智能填充规划器（LLM 字段映射；index.ts 注入 provider，自测可替换为桩） */
+  formFillPlanner?: (
+    fields: FormField[],
+    ctx: { vars: Record<string, string>; constraints: string; onlyRequired: boolean }
+  ) => Promise<import('./testcase/fields').FormFillItem[]>
 
   constructor(tabManager: TabManager) {
     this.tabManager = tabManager
@@ -272,6 +281,27 @@ export class Executor {
         const r = await this.resolveIndex(t, a.index)
         if (!r.found) throw new Error(`元素[${a.index}]已失效（页面可能已变化）`)
         if (r.w === 0 || r.h === 0) throw new Error(`元素[${a.index}]不可见`)
+        // 测试模式生产保护：提交/删除类点击需人工确认（普通任务 protectedSubmit 恒缺省，零影响）
+        if (ctx.protectedSubmit) {
+          const snap = this.snapshots.get(t.id)
+          const cand = snap?.candidates[a.index]
+          const label = `${cand?.text || ''} ${cand?.extra || ''}`.trim()
+          if (/提交|确定|保存|下单|支付|发布|删除|结算/.test(label)) {
+            const choice = await dialog.showMessageBox({
+              type: 'warning',
+              buttons: ['允许本次', '拦截'],
+              defaultId: 1,
+              cancelId: 1,
+              message: `生产环境保护：测试即将点击「${label.slice(0, 30)}」`,
+              detail: '当前环境被标记为生产保护，请人工确认本次提交可以执行。'
+            })
+            if (choice.response !== 0) {
+              a.result = `已拦截提交类点击「${label.slice(0, 30)}」（生产环境保护）`
+              a.error = a.result
+              return false
+            }
+          }
+        }
         await this.sleep(160, ctx.signal)
         if (this.overlay) {
           try {
@@ -609,6 +639,131 @@ export class Executor {
         a.result = `关闭页签${idx}(${closing.title.slice(0, 20)})`
         return true
       }
+      case 'expect': {
+        // 测试断言：失败不抛错（写入 a.error），同批后续动作照常执行；
+        // 3s 内每 500ms 轮询重试（SPA 异步渲染容错）
+        const t = tm.active()
+        if (!t) throw new Error('没有可用页签')
+        if (!a.kind) throw new Error('expect 需要 kind')
+        const expectVal = String(a.value ?? a.text ?? '').replace(
+          /\{\{([^}]+)\}\}/g,
+          (_m, k) => ctx.memory[String(k).trim()] ?? _m
+        )
+        const deadline = Date.now() + 3000
+        let passed = false
+        let actual = ''
+        while (true) {
+          try {
+            if (a.kind === 'url_contains') {
+              actual = t.view.webContents.getURL()
+              passed = actual.includes(expectVal)
+            } else if (a.kind === 'title_contains') {
+              actual = t.view.webContents.getTitle()
+              passed = actual.includes(expectVal)
+            } else if (a.kind === 'text_visible') {
+              const r = await t.cdp.evaluate<{ found: boolean; snippet: string }>(EXPECT_TEXT_FN, [expectVal])
+              passed = !!r?.found
+              actual = r?.snippet || (passed ? '已命中' : '页面文本中未找到')
+            } else if (a.kind === 'selector_exists') {
+              const r = await t.cdp.evaluate<{ ok: boolean; count?: number; err?: string }>(EXPECT_SEL_FN, [
+                a.selector || '',
+                'exists'
+              ])
+              if (!r?.ok) {
+                actual = r?.err || '选择器无效'
+                passed = false
+              } else {
+                actual = `匹配 ${r.count || 0} 个元素`
+                passed = (r.count || 0) > 0
+              }
+            } else if (a.kind === 'selector_value' || a.kind === 'selector_text') {
+              const r = await t.cdp.evaluate<{ ok: boolean; count?: number; v?: string; err?: string }>(EXPECT_SEL_FN, [
+                a.selector || '',
+                a.kind === 'selector_value' ? 'value' : 'text'
+              ])
+              if (!r?.ok) {
+                actual = r?.err || '选择器无效'
+                passed = false
+              } else if (!r.count) {
+                actual = '选择器未匹配到元素'
+                passed = false
+              } else {
+                actual = r.v || '(空)'
+                passed = actual.trim() === expectVal.trim()
+              }
+            } else {
+              throw new Error(`未知断言类型 ${a.kind}`)
+            }
+          } catch (e: any) {
+            actual = String(e?.message || e)
+            passed = false
+          }
+          if (a.negate) passed = !passed
+          if (passed || Date.now() >= deadline || ctx.signal.aborted) break
+          await this.sleep(500, ctx.signal)
+        }
+        const desc = `${a.negate ? '不' : ''}${expectVal || a.selector}`
+        if (passed) {
+          a.result = `断言通过: [${a.kind}] ${desc}`
+        } else {
+          a.error = `断言失败: [${a.kind}] 期望=${desc} 实际=${actual.slice(0, 120)}`
+          a.result = a.error
+        }
+        return false
+      }
+      case 'fill_form': {
+        // 智能表单填充：字段深提取（含无 label 字段的语义线索）→ LLM 规划「字段→值」映射
+        // → 逐字段确定性填充（真实键入+回读验证 / select、checkbox 专用设置）
+        const t = tm.active()
+        if (!t) throw new Error('没有可用页签')
+        const fields = await t.cdp.evaluate<FormField[]>(FORM_FIELDS_FN, [])
+        if (!fields || !fields.length) throw new Error('页面上没有找到表单字段')
+        let plan: import('./testcase/fields').FormFillItem[]
+        if (a.data && Object.keys(a.data).length) {
+          // 显式映射：按「字段描述」在语义线索里匹配
+          plan = []
+          const unmatched: string[] = []
+          for (const [desc, val] of Object.entries(a.data)) {
+            const d = desc.trim()
+            const idx = fields.findIndex(
+              (f) => [f.label, f.name, f.id, f.placeholder, f.aria].some((x) => x && (x === d || x.includes(d))) || f.hint.includes(d)
+            )
+            if (idx >= 0) plan.push({ index: idx, value: String(val), reason: '显式指定' })
+            else unmatched.push(desc)
+          }
+          if (unmatched.length) throw new Error(`显式映射未命中的字段: ${unmatched.join('、').slice(0, 100)}`)
+        } else {
+          if (!this.formFillPlanner) throw new Error('智能填充规划器未配置（请先在设置中配置 AI 接口）')
+          plan = await this.formFillPlanner(fields, {
+            vars: ctx.memory,
+            constraints: (a.text || '').slice(0, 300),
+            onlyRequired: !!a.onlyRequired
+          })
+        }
+        const lines: string[] = []
+        let fails = 0
+        for (const item of plan) {
+          if (ctx.signal.aborted) break
+          const f = fields[item.index]
+          if (!f) continue
+          try {
+            lines.push(await this.fillField(t, f, item.value, item.check, ctx, item.reason))
+          } catch (e: any) {
+            fails++
+            lines.push(`✗ ${e?.message || e}`)
+          }
+          await this.humanDelay(ctx.settings, ctx.signal)
+        }
+        a.result = `智能填充 ${plan.length - fails}/${plan.length} 个字段:\n` + lines.slice(0, 20).join('\n')
+        if (fails) a.error = `${fails} 个字段填充未通过回读验证`
+        return false
+      }
+      case 'test_step_done': {
+        // 测试步骤完成标记（runner 通常在执行前拦截推进指针；这里兜底为无害 no-op，
+        // 防 repeat 重放等边缘路径把未知动作抛错）
+        a.result = a.result || '测试步骤完成'
+        return false
+      }
       case 'done': {
         a.result = a.result || a.value || '任务完成'
         return false
@@ -674,5 +829,67 @@ export class Executor {
     if (!snap || index < 0 || index >= snap.candidates.length) throw new Error(`元素[${index}]不存在`)
     const c = snap.candidates[index]
     return [c.framePaths, c.path]
+  }
+
+  /**
+   * fill_form 单字段填充（与 type 动作同质量的管线，但按 paths 直达字段）：
+   * select/checkbox 走 FORM_SET_FN；文本类走 真实点击聚焦→Ctrl+A→输入法通道→回读验证→原生 setter 兜底。
+   * 返回一行人类可读结果；失败抛错（含字段语义标签，便于时间线/报告审计）。
+   */
+  private async fillField(
+    t: Tab,
+    f: FormField,
+    value: string,
+    check: boolean | undefined,
+    ctx: ExecContext,
+    reason?: string
+  ): Promise<string> {
+    const label = (f.label || f.placeholder || f.name || f.id || f.adjacent || `字段@${f.path.slice(-2).join('.')}`).slice(0, 24)
+    const why = reason ? `(${reason})` : ''
+    if (f.tag === 'SELECT') {
+      const r = await t.cdp.evaluate<{ ok: boolean; set?: string; err?: string }>(FORM_SET_FN, [
+        f.framePaths,
+        f.path,
+        'select',
+        value,
+        false
+      ])
+      if (!r?.ok) throw new Error(`下拉「${label}」选项未命中(${r?.err || '失败'})${why}`)
+      return `✓ 下拉 ${label} → ${r.set}${why}`
+    }
+    if (f.inputType === 'checkbox' || f.inputType === 'radio') {
+      const want = check ?? true
+      const r = await t.cdp.evaluate<{ ok: boolean; set?: string }>(FORM_SET_FN, [
+        f.framePaths,
+        f.path,
+        'check',
+        '',
+        want
+      ])
+      if (!r?.ok) throw new Error(`勾选「${label}」设置失败${why}`)
+      return `✓ ${f.inputType === 'radio' ? '单选' : '勾选'} ${label} → ${r.set}${why}`
+    }
+    const r = await t.cdp.evaluate<Resolved>(RESOLVE_FN, [f.framePaths, f.path, f.tag])
+    if (!r.found || r.x == null || r.y == null) throw new Error(`字段「${label}」已失效${why}`)
+    await this.sleep(140, ctx.signal)
+    await t.cdp.mouseClick(r.x + rand(-2, 2), r.y + rand(-2, 2))
+    await this.sleep(200, ctx.signal)
+    await t.cdp.keySelectAll()
+    await this.sleep(60, ctx.signal)
+    await t.cdp.insertText(value)
+    await this.sleep(160, ctx.signal)
+    const vr = await t.cdp
+      .evaluate<{ ok: boolean; value?: string }>(READ_VALUE_FN, [f.framePaths, f.path])
+      .catch(() => ({ ok: false }) as { ok: boolean; value?: string })
+    if (vr?.ok && vr.value === value) return `✓ ${label} = "${value.slice(0, 24)}"(真实键入)${why}`
+    // 兜底：原生 setter + input/change 事件（React 受控组件可感知）
+    await t.cdp.evaluate(SET_VALUE_FN, [f.framePaths, f.path, value]).catch(() => {})
+    await this.sleep(160, ctx.signal)
+    const vr2 = await t.cdp
+      .evaluate<{ ok: boolean; value?: string }>(READ_VALUE_FN, [f.framePaths, f.path])
+      .catch(() => ({ ok: false }) as { ok: boolean; value?: string })
+    if (vr2?.ok && vr2.value === value) return `✓ ${label} = "${value.slice(0, 24)}"(原生赋值)${why}`
+    const got = vr2?.ok ? `"${(vr2.value || '').slice(0, 20)}"` : '无法回读'
+    throw new Error(`「${label}」填充未生效，实际=${got}${why}`)
   }
 }

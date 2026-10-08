@@ -30,7 +30,7 @@
 ```bash
 npm install          # 首次安装依赖（.npmrc 已配置国内镜像；postinstall 自动打 WASM 推理补丁）
 npm run dev          # 开发模式（热更新）
-npm run selftest:prod # 自测：39 项检查（CDP/元素提取/iframe/视觉构造/文档粘贴/遮罩硬解除/定时任务/OCR/UI）
+npm run selftest:prod # 自测：52 项检查（CDP/元素提取/iframe/视觉构造/文档粘贴/遮罩硬解除/定时任务/OCR/UI）
 npm run fetch:model  # （可选）预拉取本地快速决策模型到 resources/fastmodel
 ```
 
@@ -70,6 +70,7 @@ npm run dist         # 自动拉取模型 + 构建 + 打包：安装包 + 便携
 | 登录态保持 | 独立持久分区，登录一次长期有效 |
 | 界面故障自愈 | UI 渲染器卡死/崩溃时主进程心跳看门狗自动重建界面（页签与页面状态在主进程，不丢失）；浏览器视图用可见性切换而非反复拆装，杜绝高频弹窗/缩放下的合成器卡顿 |
 | 文件下载 | 自动保存到系统下载目录并提示 |
+| 🧪 浏览器仿真测试 | 工具栏 🧪 打开测试面板：需求 MD/粗略步骤 → AI 生成步骤化测试用例 MD（人审可改）→ 独立测试页签执行 → Markdown 报告（失败截图落盘）。断言（文字/URL/CSS 选择器/取值，支持取反与 3s 轮询）、智能表单填充（无 label 字段按 placeholder/name/邻接文本推断，按语义造格式合法数据，逐字段理由可审计）、confirm/alert 自动应答、多环境档案（{{base_url}} 注入 + 生产保护确认门禁）、fail-fast/跑完全程可选 |
 
 ## 复杂站点说明（淘宝 / 小红书 / 聚水潭）
 
@@ -88,9 +89,10 @@ src/
 │   ├── extractor.ts      # 元素提取器（同源 iframe 穿透 + 视口优先排序）+ 验证码检测
 │   ├── executor.ts       # 动作执行器（真实事件、拟人化、{{记忆}}替换）
 │   ├── agent/
-│   │   ├── runner.ts     # Agent 循环（暂停/停止/验证码暂停/用量统计）
-│   │   ├── prompts.ts    # 提示词与历史压缩
+│   │   ├── runner.ts     # Agent 循环（暂停/停止/验证码暂停/用量统计）+ 测试模式
+│   │   ├── prompts.ts    # 提示词与历史压缩（+ 测试脚本区块/TEST_MODE_ADDON）
 │   │   └── llm.ts        # OpenAI / Anthropic 双协议 Provider
+│   ├── testcase/         # 浏览器仿真测试：用例MD解析/需求转换/断言/智能填充/报告
 │   ├── ocr/              # 本地 OCR（隐藏窗口 WASM 推理宿主）
 │   ├── settings.ts       # 设置持久化（%APPDATA%/easybow/settings.json）
 │   └── selftest.ts       # 自测模式
