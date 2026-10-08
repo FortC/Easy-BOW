@@ -30,7 +30,7 @@
 ```bash
 npm install          # 首次安装依赖（.npmrc 已配置国内镜像；postinstall 自动打 WASM 推理补丁）
 npm run dev          # 开发模式（热更新）
-npm run selftest:prod # 自测：56 项检查（CDP/元素提取/iframe/视觉构造/文档粘贴/遮罩硬解除/定时任务/OCR/UI）
+npm run selftest:prod # 自测：59 项检查（CDP/元素提取/iframe/视觉构造/文档粘贴/遮罩硬解除/定时任务/OCR/UI）
 npm run fetch:model  # （可选）预拉取本地快速决策模型到 resources/fastmodel
 ```
 

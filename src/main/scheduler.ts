@@ -10,7 +10,8 @@ import { readFileSync, writeFileSync } from 'fs'
 import type { MainEvent, Schedule } from '@shared/types'
 
 type Broadcast = (ev: MainEvent) => void
-type RunTask = (task: string) => Promise<void>
+/** 到点执行：P2 起接收完整 schedule（支持绑定测试用例做定时回归），实现侧自行分流 */
+type RunTask = (schedule: Schedule) => Promise<void>
 type IsIdle = () => boolean
 
 /** 计算下一次触发时间戳（纯函数，自测覆盖） */
@@ -118,6 +119,7 @@ export class Scheduler {
         id: this.nextId++,
         name: patch.name || patch.task.slice(0, 20) || '未命名任务',
         task: patch.task,
+        testCaseId: patch.testCaseId,
         enabled: patch.enabled,
         type: patch.type,
         at: patch.at,
@@ -180,7 +182,7 @@ export class Scheduler {
           continue
         }
         this.broadcast({ channel: 'toast', message: `⏰ 定时任务开始：${s.name}`, kind: 'success' })
-        this.runTask(s.task).catch((e) => {
+        this.runTask(s).catch((e) => {
           this.broadcast({ channel: 'toast', message: `定时任务「${s.name}」启动失败: ${e?.message || e}`, kind: 'error' })
         })
       }

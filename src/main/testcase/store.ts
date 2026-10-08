@@ -4,7 +4,7 @@
 import { app } from 'electron'
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs'
 import { join } from 'path'
-import type { TestEnv } from '@shared/types'
+import type { TestCaseEntry, TestEnv } from '@shared/types'
 import { reportsRoot } from './report'
 
 const envsPath = () => join(app.getPath('userData'), 'test-envs.json')
@@ -86,4 +86,72 @@ export function readReport(dirName: string): string {
   } catch {
     throw new Error('报告不存在或已删除')
   }
+}
+
+// —————— 用例库（应用内保存的测试用例） ——————
+
+const casesPath = () => join(app.getPath('userData'), 'test-cases.json')
+
+function loadCases(): TestCaseEntry[] {
+  try {
+    if (existsSync(casesPath())) {
+      const raw = JSON.parse(readFileSync(casesPath(), 'utf-8'))
+      if (Array.isArray(raw)) {
+        return raw.filter((c: any) => c && typeof c.id === 'number' && typeof c.md === 'string')
+      }
+    }
+  } catch {}
+  return []
+}
+
+function persistCases(list: TestCaseEntry[]): void {
+  try {
+    writeFileSync(casesPath(), JSON.stringify(list, null, 2), 'utf-8')
+  } catch (e) {
+    console.error('[easybow] 用例库保存失败:', e)
+  }
+}
+
+export function listTestCases(): TestCaseEntry[] {
+  return loadCases()
+}
+
+export function getTestCase(id: number): TestCaseEntry | undefined {
+  return loadCases().find((c) => c.id === id)
+}
+
+/** 新建（无 id）或更新（带 id，按 name/md/tags 覆盖）；返回全量列表 */
+export function saveTestCase(input: { name: string; md: string; tags?: string[]; id?: number }): TestCaseEntry[] {
+  const list = loadCases()
+  const name = (input.name || '未命名用例').slice(0, 60)
+  const md = String(input.md || '')
+  const tags = Array.isArray(input.tags) ? input.tags.map((t) => String(t).slice(0, 20)).slice(0, 8) : []
+  if (input.id != null) {
+    const s = list.find((c) => c.id === input.id)
+    if (!s) throw new Error(`用例 ${input.id} 不存在`)
+    s.name = name
+    s.md = md
+    s.tags = tags
+  } else {
+    const id = Math.max(0, ...list.map((c) => c.id)) + 1
+    list.unshift({ id, name, md, tags, createdAt: Date.now() })
+  }
+  persistCases(list)
+  return list
+}
+
+export function deleteTestCase(id: number): TestCaseEntry[] {
+  const list = loadCases().filter((c) => c.id !== id)
+  persistCases(list)
+  return list
+}
+
+/** 运行结束回写统计（最近一次运行时间与结论，供用例库列表展示） */
+export function updateCaseRunStat(id: number, verdict: string): void {
+  const list = loadCases()
+  const s = list.find((c) => c.id === id)
+  if (!s) return
+  s.lastRunAt = Date.now()
+  s.lastVerdict = verdict.slice(0, 40)
+  persistCases(list)
 }

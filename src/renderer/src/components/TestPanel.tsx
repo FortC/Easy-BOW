@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react'
-import type { MainEvent, TestEnv, TestRunStatus } from '@shared/types'
+import { useEffect, useRef, useState } from 'react'
+import type { MainEvent, TestCaseEntry, TestEnv, TestRunStatus } from '@shared/types'
 
-type PanelTab = 'convert' | 'run' | 'reports'
+type PanelTab = 'convert' | 'run' | 'reports' | 'lib'
 
 const STEP_ICON: Record<string, string> = {
   pending: '⏳',
@@ -19,10 +19,12 @@ const RUN_VERDICT: Record<string, { text: string; cls: string }> = {
   stopped: { text: '⏹️ 已停止', cls: 'run-stopped' }
 }
 
-/** 浏览器仿真测试面板：需求 MD → 测试用例 MD → 运行 → 报告 */
+/** 浏览器仿真测试面板：需求 MD → 测试用例 MD → 运行 → 报告（+用例库/失败重跑/定时回归入口） */
 export default function TestPanel(props: {
   onClose: () => void
   onToast: (msg: string, kind?: 'info' | 'success' | 'error') => void
+  /** 用例库条目 → 打开定时任务弹窗绑定（定时回归） */
+  onScheduleCase?: (entry: { id: number; name: string }) => void
 }) {
   const [tab, setTab] = useState<PanelTab>('convert')
   // ① 需求 → 用例
@@ -43,6 +45,12 @@ export default function TestPanel(props: {
   // ③ 报告
   const [reports, setReports] = useState<Array<{ file: string; ts: number; verdict: string }>>([])
   const [reportContent, setReportContent] = useState<string | null>(null)
+  // ④ 用例库
+  const [cases, setCases] = useState<TestCaseEntry[]>([])
+  const [libTags, setLibTags] = useState('')
+  const [libSaving, setLibSaving] = useState(false)
+  /** 本次运行用的用例 MD（失败重跑取子集用） */
+  const lastRunMd = useRef('')
 
   useEffect(() => {
     window.easybow.testRunStatus().then(setRun).catch(() => {})
@@ -54,6 +62,12 @@ export default function TestPanel(props: {
   }, [])
 
   const refreshReports = () => window.easybow.testListReports().then(setReports).catch(() => {})
+  const refreshCases = () => window.easybow.getTestCases().then(setCases).catch(() => {})
+
+  // 运行结束后刷新用例库（最近运行结论回写展示）
+  useEffect(() => {
+    if (run && run.state !== 'running') refreshCases()
+  }, [run?.state])
 
   const doConvert = async () => {
     if (!reqMd.trim()) {
@@ -103,6 +117,7 @@ export default function TestPanel(props: {
         return
       }
       await window.easybow.testStart(caseMd, { envName: envName || undefined, failFast, fillPreview })
+      lastRunMd.current = caseMd
       props.onToast(`测试已启动（独立测试页签${envName ? ` · ${envName}` : ''}）`, 'success')
       setReportContent(null)
     } catch (e: any) {
@@ -118,6 +133,67 @@ export default function TestPanel(props: {
       props.onToast('测试环境已保存', 'success')
     } catch (e: any) {
       props.onToast(e?.message || '保存失败', 'error')
+    }
+  }
+
+  /** 失败重跑：把失败步骤抽成子用例放进编辑器（人工确认后运行） */
+  const rerunFailed = async () => {
+    if (!run || !lastRunMd.current) return
+    const failedIdx = run.steps.filter((s) => s.status === 'failed' || s.status === 'skipped').map((s) => s.index)
+    if (!failedIdx.length) return
+    try {
+      const r = await window.easybow.testSubcase(lastRunMd.current, failedIdx)
+      if (r.ok && r.md) {
+        setCaseMd(r.md)
+        setParsed(null)
+        setTab('run')
+        props.onToast(`已生成失败重跑用例（${failedIdx.length} 步），确认后点「运行测试」`, 'success')
+      } else {
+        props.onToast(r.error || '生成失败', 'error')
+      }
+    } catch (e: any) {
+      props.onToast(e?.message || '生成失败', 'error')
+    }
+  }
+
+  /** 保存当前编辑器用例到用例库 */
+  const saveToLib = async () => {
+    if (!caseMd.trim()) {
+      props.onToast('编辑器里没有用例可保存', 'error')
+      return
+    }
+    setLibSaving(true)
+    try {
+      const v = await window.easybow.testParse(caseMd)
+      if (!v.ok) {
+        props.onToast(`用例校验未通过: ${v.error}`, 'error')
+        return
+      }
+      const updated = await window.easybow.saveTestCase({
+        name: v.name || '未命名用例',
+        md: caseMd,
+        tags: libTags.split(/[,，\s]+/).filter(Boolean)
+      })
+      setCases(updated)
+      setLibTags('')
+      props.onToast(`已保存「${v.name}」到用例库`, 'success')
+    } catch (e: any) {
+      props.onToast(e?.message || '保存失败', 'error')
+    } finally {
+      setLibSaving(false)
+    }
+  }
+
+  const runFromLib = async (entry: TestCaseEntry) => {
+    setCaseMd(entry.md)
+    setParsed(null)
+    setTab('run')
+    try {
+      await window.easybow.testStart(entry.md, { envName: envName || undefined, failFast })
+      lastRunMd.current = entry.md
+      props.onToast(`已从用例库运行「${entry.name}」`, 'success')
+    } catch (e: any) {
+      props.onToast(e?.message || '启动失败', 'error')
     }
   }
 
@@ -158,6 +234,15 @@ export default function TestPanel(props: {
             }}
           >
             ③ 报告
+          </button>
+          <button
+            className={`test-tab${tab === 'lib' ? ' active' : ''}`}
+            onClick={() => {
+              setTab('lib')
+              refreshCases()
+            }}
+          >
+            ④ 用例库
           </button>
         </div>
 
@@ -321,6 +406,11 @@ export default function TestPanel(props: {
                   </span>
                   {run.state !== 'running' && (
                     <span className="test-run-ops">
+                      {run.failed > 0 && (
+                        <button className="btn mini warn" onClick={rerunFailed} title="把失败/跳过步骤抽成子用例，人工确认后重跑">
+                          ↻ 重跑失败步骤
+                        </button>
+                      )}
                       <button className="btn mini" onClick={() => window.easybow.testOpenReports().catch(() => {})}>
                         打开报告目录
                       </button>
@@ -381,6 +471,75 @@ export default function TestPanel(props: {
                   <pre>{reportContent}</pre>
                 </div>
               )}
+            </div>
+          </>
+        )}
+
+        {tab === 'lib' && (
+          <>
+            <div className="test-envs">
+              <div className="test-envs-head">
+                <span>保存当前「②用例与运行」编辑器里的用例到用例库（可定时回归 / 失败重跑）</span>
+              </div>
+              <div className="test-env-edit">
+                <input
+                  placeholder="标签（可选，逗号分隔，如：冒烟, 登录）"
+                  value={libTags}
+                  onChange={(e) => setLibTags(e.target.value)}
+                />
+                <button className="btn mini primary" onClick={saveToLib} disabled={libSaving}>
+                  {libSaving ? '保存中…' : '保存当前用例'}
+                </button>
+              </div>
+            </div>
+            <div className="test-env-list">
+              {cases.length === 0 && (
+                <div className="field-hint">
+                  用例库为空——在「②用例与运行」编辑好用例后回到这里保存；保存后每条可一键运行、绑定定时回归（⏰）、删除
+                </div>
+              )}
+              {cases.map((c) => (
+                <div key={c.id} className="test-env-item">
+                  <b>{c.name}</b>
+                  {c.tags.map((t) => (
+                    <span key={t} className="test-env-badge">
+                      {t}
+                    </span>
+                  ))}
+                  <span className="test-env-url">
+                    {c.lastVerdict ? `${c.lastVerdict}${c.lastRunAt ? ' · ' + new Date(c.lastRunAt).toLocaleString('zh-CN', { hour12: false }) : ''}` : '（未运行过）'}
+                  </span>
+                  <button className="btn mini primary" onClick={() => runFromLib(c)} disabled={running}>
+                    运行
+                  </button>
+                  <button
+                    className="btn mini"
+                    onClick={() => {
+                      setCaseMd(c.md)
+                      setParsed(null)
+                      setTab('run')
+                    }}
+                  >
+                    编辑
+                  </button>
+                  <button className="btn mini" title="绑定到定时任务（到点自动回归）" onClick={() => props.onScheduleCase?.({ id: c.id, name: c.name })}>
+                    ⏰
+                  </button>
+                  <button
+                    className="btn mini danger"
+                    onClick={async () => {
+                      try {
+                        setCases(await window.easybow.deleteTestCase(c.id))
+                        props.onToast(`已删除「${c.name}」`, 'info')
+                      } catch (e: any) {
+                        props.onToast(e?.message || '删除失败', 'error')
+                      }
+                    }}
+                  >
+                    删
+                  </button>
+                </div>
+              ))}
             </div>
           </>
         )}

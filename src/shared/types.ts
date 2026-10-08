@@ -128,6 +128,8 @@ export type ExpectKind =
   | 'selector_exists'
   | 'selector_value'
   | 'selector_text'
+  | 'api_status'
+  | 'api_body'
 
 export interface AgentAction {
   name: ActionName
@@ -145,6 +147,8 @@ export interface AgentAction {
   kind?: ExpectKind
   /** expect：selector_* 类断言的 CSS 选择器 */
   selector?: string
+  /** expect：api_* 类断言的 URL 片段（匹配最近一次请求） */
+  urlPart?: string
   /** expect：断言取反（不包含/不存在） */
   negate?: boolean
   /** fill_form：显式字段映射（「字段描述→值」；缺省走 AI 智能填充） */
@@ -199,6 +203,18 @@ export interface TestEnv {
   protected: boolean
 }
 
+/** 用例库条目（应用内保存的测试用例，可运行/定时回归/失败重跑） */
+export interface TestCaseEntry {
+  id: number
+  name: string
+  /** 用例 MD 原文 */
+  md: string
+  tags: string[]
+  createdAt: number
+  lastRunAt?: number
+  lastVerdict?: string
+}
+
 /** 测试用例中的一条断言（由用例 MD 的「预期」行解析而来） */
 export interface TestAssertion {
   /** MD 原文（报告回显） */
@@ -207,6 +223,8 @@ export interface TestAssertion {
   kind: ExpectKind | 'ai'
   value?: string
   selector?: string
+  /** api_* 类断言的 URL 片段 */
+  urlPart?: string
   negate?: boolean
 }
 
@@ -318,6 +336,8 @@ export interface Schedule {
   name: string
   /** 任务描述（到点交给 AI 执行的完整指令） */
   task: string
+  /** 绑定测试用例库条目：到点跑该用例（定时回归）而非自由任务 */
+  testCaseId?: number
   enabled: boolean
   /** once=执行一次(at 为绝对时间戳)；daily=每天 dailyMinute(0-1439)；interval=每 intervalMin 分钟 */
   type: 'once' | 'daily' | 'interval'
@@ -430,6 +450,12 @@ export interface EasybowApi {
   /** 测试环境档案 */
   getTestEnvs(): Promise<TestEnv[]>
   setTestEnvs(envs: TestEnv[]): Promise<TestEnv[]>
+  /** 用例库：列表/保存（带 id 为更新）/删除/单取 */
+  getTestCases(): Promise<TestCaseEntry[]>
+  saveTestCase(entry: { name: string; md: string; tags?: string[]; id?: number }): Promise<TestCaseEntry[]>
+  deleteTestCase(id: number): Promise<TestCaseEntry[]>
+  /** 失败重跑：按步骤序号取子集，生成新的用例 MD（返回到编辑器人工确认后运行） */
+  testSubcase(md: string, keepStepIdx: number[], suffix?: string): Promise<{ ok: boolean; md?: string; error?: string }>
   // 调试
   debugExtract(): Promise<ExtractDebugResult>
   // 布局：浏览器区域（窗口内容坐标，DIP）

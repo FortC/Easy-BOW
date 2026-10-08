@@ -551,7 +551,21 @@ img.hist-fav { object-fit: contain; }
   font-size: 13px; cursor: pointer; color: var(--text2); transition: all .15s ease;
 }
 .test-tab.active { background: var(--brand, #3370ff); border-color: var(--brand, #3370ff); color: #fff; font-weight: 600; }
-.test-md-input { font-family: Consolas, 'Courier New', monospace; font-size: 12px; line-height: 1.55; }
+.test-md-input {
+  width: 100%; box-sizing: border-box; resize: vertical;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 8px 10px; font-size: 12.5px; font-family: Consolas, 'Courier New', monospace;
+  line-height: 1.6; background: #fff; color: var(--text); outline: none;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+.test-md-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(51, 112, 255, .1); }
+/* 测试面板内非 form-row 上下文的输入框（环境档案/标签输入）与全局输入控件统一 */
+.test-env-edit input {
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 10px;
+  font-size: 13px; font-family: inherit; outline: none; background: #fff; color: var(--text);
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+.test-env-edit input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(51, 112, 255, .1); }
 .test-convert-btn { justify-content: flex-end; display: flex; align-items: flex-end; }
 .test-run-btns { display: flex; gap: 8px; align-items: flex-end; }
 .test-parse-err { color: #d9393a !important; }

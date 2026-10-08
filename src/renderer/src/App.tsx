@@ -38,6 +38,8 @@ export default function App() {
   const [kbOpen, setKbOpen] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [scheduleOpen, setScheduleOpen] = useState(false)
+  /** 定时任务弹窗预绑定的测试用例（用例库 ⏰ 按钮进来） */
+  const [scheduleTestCase, setScheduleTestCase] = useState<{ id: number; name: string } | null>(null)
   const [testOpen, setTestOpen] = useState(false)
   const [task, setTask] = useState('')
   const [settings, setSettings] = useState<Settings | null>(null)
@@ -252,9 +254,27 @@ export default function App() {
       )}
       {kbOpen && <KnowledgeModal onClose={() => setKbOpen(false)} />}
       {scheduleOpen && (
-        <ScheduleModal initialTask={task} onClose={() => setScheduleOpen(false)} onToast={pushToast} />
+        <ScheduleModal
+          initialTask={task}
+          initialTestCase={scheduleTestCase || undefined}
+          onClose={() => {
+            setScheduleOpen(false)
+            setScheduleTestCase(null)
+          }}
+          onToast={pushToast}
+        />
       )}
-      {testOpen && <TestPanel onClose={() => setTestOpen(false)} onToast={pushToast} />}
+      {testOpen && (
+        <TestPanel
+          onClose={() => setTestOpen(false)}
+          onToast={pushToast}
+          onScheduleCase={(entry) => {
+            setScheduleTestCase(entry)
+            setTestOpen(false)
+            setScheduleOpen(true)
+          }}
+        />
+      )}
       {settingsOpen && (
         <SettingsModal
           initial={settings}

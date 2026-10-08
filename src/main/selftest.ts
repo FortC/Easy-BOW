@@ -396,11 +396,20 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
         true
       )
       await sleep(600)
-      const hidden2 = tm.isBrowserHidden()
+      // 关闭→React effect→IPC→主进程有耗时（冷启动下可能超 600ms）：轮询至 3s
+      let hidden2 = tm.isBrowserHidden()
+      for (let k = 0; k < 6 && hidden2; k++) {
+        await sleep(400)
+        hidden2 = tm.isBrowserHidden()
+      }
+      const modalAfter = await ui.executeJavaScript(
+        `Array.from(document.querySelectorAll('.modal h3')).map(h => (h.textContent || '').trim().slice(0, 10)).join('|')`,
+        true
+      )
       check(
         '设置弹窗(浏览器视图隐藏/恢复)',
         hidden1 === true && modalVisible === true && closed === 'ok' && hidden2 === false,
-        `点击⚙后隐藏=${hidden1} 弹窗可见=${modalVisible} 关闭=${closed} 关闭后隐藏=${hidden2}`
+        `点击⚙后隐藏=${hidden1} 弹窗可见=${modalVisible} 关闭=${closed} 关闭后隐藏=${hidden2} 残留弹窗=[${modalAfter}]`
       )
     } catch (e: any) {
       check('设置弹窗(浏览器视图隐藏/恢复)', false, String(e?.message || e))
@@ -1153,6 +1162,96 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
         const single = parseTestCase(sampleMd)
         const sOk = single.tc?.groups === undefined && single.tc?.vars.username === 'test01'
         check('多组数据解析(数据驱动)', gOk && sOk, `双组=${gOk} 单组兼容=${sOk}`)
+      }
+
+      // 10.15 网络级断言：本地起 HTTP 服务，页面点按钮发 XHR → api_status/api_body 断言
+      {
+        const http = await import('http')
+        const srv = http.createServer((reqMsg, resMsg) => {
+          if (reqMsg.url && reqMsg.url.indexOf('/api/echo') === 0) {
+            resMsg.writeHead(200, { 'Content-Type': 'application/json' })
+            resMsg.end('{"ok":true,"msg":"pong-net-selftest"}')
+          } else {
+            resMsg.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+            resMsg.end(
+              '<button id="net-btn" onclick="fetch(\'api/echo\').then(r=>r.json()).then(j=>document.getElementById(\'net-out\').textContent=JSON.stringify(j))">发请求</button><span id="net-out"></span>'
+            )
+          }
+        })
+        await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()))
+        const addr = srv.address() as { port: number }
+        try {
+          tm.newTab(`http://127.0.0.1:${addr.port}/`)
+          await sleep(1200)
+          const netTab = tm.active()
+          if (!netTab) throw new Error('网络测试页签不可用')
+          netTab.cdp.setNetworkCapture(true)
+          const snapNet = await ex.extract(netTab)
+          const nbIdx = snapNet.candidates.findIndex((c) => c.text === '发请求')
+          const clickNet = nbIdx >= 0 ? await ex.executeBatch([{ name: 'click', index: nbIdx }] as any, passCtx) : []
+          // 等 fetch 回显就绪（首次冷加载 localhost 页可能稍慢；最多 4s）
+          let netOutRaw = ''
+          for (let k = 0; k < 10 && !netOutRaw; k++) {
+            await sleep(400)
+            netOutRaw = await netTab.cdp
+              .evaluate<string>(String(function readNet() { return document.getElementById('net-out')!.textContent || '' }), [])
+              .catch(() => '')
+          }
+          const netOut = netOutRaw || '(无回显)'
+          const netLogLen = netTab.cdp.getNetworkLog().length
+          const netBatch = await ex.executeBatch(
+            [
+              { name: 'expect', kind: 'api_status', urlPart: '/api/echo', value: '200' },
+              { name: 'expect', kind: 'api_body', urlPart: '/api/echo', value: 'pong-net-selftest' },
+              { name: 'expect', kind: 'api_status', urlPart: '/api/no-such', value: '200' }
+            ] as any,
+            passCtx
+          )
+          const netOk = !netBatch[0]?.error && !netBatch[1]?.error && !!netBatch[2]?.error
+          check(
+            '网络级断言(api_status/api_body)',
+            netOk,
+            `nbIdx=${nbIdx} click=${clickNet[0]?.error || 'ok'} 页面回显=${netOut.slice(0, 30)} 捕获条目=${netLogLen} status=${netBatch[0]?.error || 'ok'} body=${netBatch[1]?.error || 'ok'}`
+          )
+          netTab.cdp.setNetworkCapture(false)
+          tm.closeTab(netTab.id)
+          await sleep(300)
+        } finally {
+          srv.close()
+        }
+      }
+
+      // 10.16 用例库 CRUD + 运行统计回写 + 失败重跑子集
+      {
+        const store = await import('./testcase/store')
+        const before = store.listTestCases().length
+        const saved = store.saveTestCase({ name: '自测用例', md: sampleMd, tags: ['冒烟', '自测'] })
+        const entry = saved.find((c) => c.name === '自测用例')
+        store.updateCaseRunStat(entry!.id, '❌ 失败 1/3 步')
+        const statOk = store.listTestCases().find((c) => c.id === entry!.id)?.lastVerdict?.includes('失败') === true
+        const afterDel = store.deleteTestCase(entry!.id)
+        // 失败重跑：取步骤 2（登录）生成子用例 → 重新解析校验
+        const { renderCaseMd } = await import('./testcase/report')
+        const base = parseTestCase(sampleMd)
+        const subMd2 = renderCaseMd({ name: base.tc!.name + '-失败重跑', vars: base.tc!.vars, steps: [base.tc!.steps[1]] })
+        const re = parseTestCase(subMd2)
+        const subOk = re.ok && re.tc!.steps.length === 1 && re.tc!.steps[0].title.includes('登录') && Object.keys(re.tc!.vars).length === 2
+        check(
+          '用例库CRUD+失败重跑子集',
+          !!entry && entry.tags.length === 2 && statOk && afterDel.length === before && subOk,
+          `保存=${!!entry} 统计回写=${statOk} 删除还原=${afterDel.length === before} 子集=${subOk}`
+        )
+      }
+
+      // 10.17 JUnit XML 导出（CI 集成）
+      {
+        const junitPath = joinP(dirname(reportPath), 'junit.xml')
+        const jx = readFileSync(junitPath, 'utf-8')
+        check(
+          'JUnit XML 导出(CI)',
+          jx.includes('<testsuite') && jx.includes('tests="2"') && jx.includes('failures="1"') && jx.includes('<failure') && jx.includes('<skipped') === false,
+          `${junitPath}（${jx.length} 字节）`
+        )
       }
     } catch (e: any) {
       check('仿真测试功能', false, String(e?.stack || e))

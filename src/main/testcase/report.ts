@@ -90,7 +90,42 @@ export function writeTestReport(run: TestRunStatus, tc: TestCase, shots: Map<num
   } catch {
     /* HTML 写失败不影响 MD 报告 */
   }
+  // JUnit XML（CI 集成：Jenkins/GitLab CI 解析测试结果与失败明细）
+  try {
+    writeFileSync(join(dir, 'junit.xml'), renderJUnit(run), 'utf-8')
+  } catch {
+    /* XML 写失败不影响 MD 报告 */
+  }
   return reportPath
+}
+
+/** JUnit XML 格式（steps → testcase；failed → failure；skipped → skipped） */
+function renderJUnit(run: TestRunStatus): string {
+  const esc = (s: unknown): string =>
+    String(s ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+  const dur = run.endedAt && run.startedAt ? (run.endedAt - run.startedAt) / 1000 : 0
+  const failures = run.steps.filter((s) => s.status === 'failed').length
+  const skipped = run.steps.filter((s) => s.status === 'skipped').length
+  const cases = run.steps
+    .map((s) => {
+      const inner =
+        s.status === 'failed'
+          ? `\n      <failure message="${esc(s.error || '断言失败')}">${esc(s.assertions.filter((a) => !a.passed).map((a) => `${a.raw} → 实际: ${a.actual || ''}`).join(' | '))}</failure>`
+          : s.status === 'skipped'
+            ? '\n      <skipped/>'
+            : ''
+      return `    <testcase name="${esc(s.index + '. ' + s.title)}" classname="${esc(run.caseName)}">${inner}\n    </testcase>`
+    })
+    .join('\n')
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="${esc(run.caseName)}" tests="${run.steps.length}" failures="${failures}" skipped="${skipped}" time="${dur.toFixed(2)}">
+${cases}
+</testsuite>
+`
 }
 
 /** HTML 版报告（独立文件、内联样式，截图相对路径引用同目录 shots/） */

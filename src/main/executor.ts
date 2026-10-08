@@ -762,6 +762,29 @@ export class Executor {
                 actual = r.v || '(空)'
                 passed = actual.trim() === expectVal.trim()
               }
+            } else if (a.kind === 'api_status' || a.kind === 'api_body') {
+              // 网络级断言：按 URL 片段匹配最近一次请求（外层 3s 轮询容错「请求还在飞」）
+              const urlPart = String(a.urlPart || '').replace(
+                /\{\{([^}]+)\}\}/g,
+                (_m, k) => ctx.memory[String(k).trim()] ?? _m
+              )
+              if (!urlPart) {
+                actual = '缺少 URL 片段'
+                passed = false
+              } else {
+                const r = await t.cdp.findResponseBody(urlPart)
+                if (!r) {
+                  passed = false
+                  actual = `未捕获到 URL 含 "${urlPart}" 的接口请求`
+                } else if (a.kind === 'api_status') {
+                  actual = `HTTP ${r.status} (${r.url.slice(0, 60)})`
+                  passed = String(r.status) === String(expectVal)
+                } else {
+                  const body = r.body || ''
+                  passed = body.includes(expectVal)
+                  actual = body ? body.slice(0, 100) : '(无响应体/缓冲已回收)'
+                }
+              }
             } else {
               throw new Error(`未知断言类型 ${a.kind}`)
             }

@@ -18,9 +18,19 @@ import { Scheduler } from './scheduler'
 import { convertRequirement } from './testcase/converter'
 import { parseTestCase, summarize } from './testcase/parser'
 import { planFormFill } from './testcase/fields'
-import { reportsRoot } from './testcase/report'
-import { getTestEnvs, saveTestEnvs, findTestEnv, listReports, readReport } from './testcase/store'
-import type { KBEntry, MainEvent, Schedule, Settings, TestEnv } from '@shared/types'
+import { reportsRoot, renderCaseMd } from './testcase/report'
+import {
+  getTestEnvs,
+  saveTestEnvs,
+  findTestEnv,
+  listReports,
+  readReport,
+  listTestCases,
+  saveTestCase,
+  deleteTestCase,
+  getTestCase
+} from './testcase/store'
+import type { KBEntry, MainEvent, Schedule, Settings, TestCase, TestEnv } from '@shared/types'
 
 // 禁用站点 webview 的默认菜单干扰
 process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true'
@@ -188,10 +198,18 @@ function createWindow(): void {
   // 本地快速决策模型（混合模式）：ready 前不参与决策，任务零影响
   fastllm = new FastLlm(sendEvent)
   runner.fastllm = fastllm
-  // 定时任务：到点自动执行（AI 空闲时）；倒计时/取消经事件推送
+  // 定时任务：到点自动执行（AI 空闲时）；倒计时/取消经事件推送。
+  // 绑定测试用例的条目到点跑定时回归（独立测试页签+报告），普通条目仍走自由任务
   scheduler = new Scheduler(
     sendEvent,
-    (task) => runner.startTask(task),
+    (s) => {
+      if (s.testCaseId != null) {
+        const entry = getTestCase(s.testCaseId)
+        if (!entry) return Promise.reject(new Error(`定时回归用例 ${s.testCaseId} 已被删除，请编辑该定时任务`))
+        return runner.startTestRun(entry.md, { failFast: true, caseId: entry.id })
+      }
+      return runner.startTask(s.task)
+    },
     () => {
       const st = runner.getStatus().state
       return st === 'idle' || st === 'done' || st === 'error' || st === 'stopped'
@@ -348,6 +366,29 @@ function registerIpc(): void {
   )
   ipcMain.handle('test:stop', () => runner.stopTask())
   ipcMain.handle('test:status', () => runner.getTestRunStatus())
+  // 用例库：列表/保存（带 id 更新）/删除
+  ipcMain.handle('cases:get', () => listTestCases())
+  ipcMain.handle(
+    'cases:save',
+    ok((entry: { name: string; md: string; tags?: string[]; id?: number }) =>
+      saveTestCase({ name: String(entry?.name || ''), md: String(entry?.md || ''), tags: entry?.tags, id: entry?.id })
+    )
+  )
+  ipcMain.handle('cases:delete', ok((id: number) => deleteTestCase(Number(id))))
+  // 失败重跑：按步骤序号（1-based）生成只含失败步骤的子用例 MD（返回编辑器人工确认）
+  ipcMain.handle('test:subcase', (_e, md: string, keepIdx: number[], suffix?: string) => {
+    const r = parseTestCase(String(md || ''))
+    if (!r.ok || !r.tc) return { ok: false, error: r.error }
+    const total = r.tc.steps.length
+    const keep = (Array.isArray(keepIdx) ? keepIdx : []).filter((n: any) => Number.isInteger(n) && n >= 1 && n <= total).sort((a: number, b: number) => a - b)
+    if (!keep.length) return { ok: false, error: '没有可保留的步骤序号' }
+    const sub: TestCase = {
+      name: `${r.tc.name}${suffix || '-失败重跑'}`,
+      vars: r.tc.vars,
+      steps: keep.map((n: number) => r.tc!.steps[n - 1])
+    }
+    return { ok: true, md: renderCaseMd(sub) }
+  })
   ipcMain.handle('test:reports', () => listReports())
   ipcMain.handle('test:report-read', ok((file: string) => readReport(file)))
   ipcMain.handle('test:reports-open', async () => {

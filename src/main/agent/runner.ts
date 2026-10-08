@@ -1,5 +1,6 @@
 import { Executor } from '../executor'
 import { DETECT_FRICTION_FN, type ExtractResult } from '../extractor'
+import { Cdp } from '../cdp'
 import type { TabManager } from '../tabs'
 import { getSettings } from '../settings'
 import { matchKB } from '../knowledge'
@@ -9,6 +10,7 @@ import { validateLocalActions, type FastLlm } from '../fastllm'
 import { ocrPageText } from '../ocr'
 import { parseTestCase } from '../testcase/parser'
 import { writeTestReport } from '../testcase/report'
+import { updateCaseRunStat } from '../testcase/store'
 import type {
   AgentAction,
   AgentStatus,
@@ -39,6 +41,8 @@ interface TestExecCtx {
   /** 智能填充前弹人工预览确认 */
   fillPreview: boolean
   envName?: string
+  /** 来源用例库条目（结束回写运行统计；直接运行/重跑无） */
+  caseId?: number
   /** 当前测试步骤已消耗的模型步数（预算保护用） */
   perStepModelSteps: number
 }
@@ -50,6 +54,7 @@ function assertionToAction(asrt: TestAssertion): AgentAction {
     kind: asrt.kind === 'ai' ? 'text_visible' : asrt.kind,
     value: asrt.value,
     selector: asrt.selector,
+    urlPart: asrt.urlPart,
     negate: asrt.negate
   }
 }
@@ -84,6 +89,7 @@ function parseModelJson(text: string): { thought: string; actions: AgentAction[]
         // 测试模式动作字段（普通任务提示词不引导输出这些，缺省为 undefined，零影响）
         kind: typeof a.kind === 'string' ? a.kind : undefined,
         selector: a.selector != null ? String(a.selector) : undefined,
+        urlPart: a.urlPart != null ? String(a.urlPart) : undefined,
         negate: a.negate === true ? true : undefined,
         data: a.data && typeof a.data === 'object' && !Array.isArray(a.data) ? a.data : undefined,
         onlyRequired: a.onlyRequired === true ? true : undefined,
@@ -217,10 +223,26 @@ export class AgentRunner {
       result: undefined
     })
     // 异步跑循环，startTask 立即返回
-    this.loop(task, provider, settings).catch((e) => {
-      this.setState({ state: 'error', statusText: `任务异常: ${e?.message || e}` })
-      this.broadcast({ channel: 'toast', message: `任务异常: ${e?.message || e}`, kind: 'error' })
-    })
+    // 原生弹窗（confirm/alert）自动应答：弹窗会阻塞页面 JS 与 CDP evaluate（任务挂死），
+    // 应答文案进「上一步结果」让模型知情可纠正；beforeunload 一律阻止离开
+    Cdp.defaultDialogPolicy = 'accept'
+    for (const t of this.tabManager.all()) t.cdp.setDialogPolicy('accept')
+    this.loop(task, provider, settings)
+      .catch((e) => {
+        this.setState({ state: 'error', statusText: `任务异常: ${e?.message || e}` })
+        this.broadcast({ channel: 'toast', message: `任务异常: ${e?.message || e}`, kind: 'error' })
+      })
+      .finally(() => {
+        // 任务结束解除接管（测试运行有自己的脚本级策略，不经此路径）
+        if (!this.testCtx) {
+          Cdp.defaultDialogPolicy = null
+          for (const t of this.tabManager.all()) {
+            try {
+              t.cdp.setDialogPolicy(null)
+            } catch {}
+          }
+        }
+      })
   }
 
   // ———————————————— 测试模式（feature/browser-test）————————————————
@@ -239,7 +261,12 @@ export class AgentRunner {
    */
   async startTestRun(
     md: string,
-    opts: { failFast: boolean; fillPreview?: boolean; env?: { name: string; baseUrl: string; protected: boolean } }
+    opts: {
+      failFast: boolean
+      fillPreview?: boolean
+      caseId?: number
+      env?: { name: string; baseUrl: string; protected: boolean }
+    }
   ): Promise<void> {
     if (this.state.state === 'running' || this.state.state === 'paused') {
       throw new Error('已有任务在运行，请先停止')
@@ -263,7 +290,7 @@ export class AgentRunner {
     tc: TestCase,
     groups: TestGroup[],
     settings: Settings,
-    opts: { failFast: boolean; fillPreview?: boolean; env?: { name: string; baseUrl: string; protected: boolean } }
+    opts: { failFast: boolean; fillPreview?: boolean; caseId?: number; env?: { name: string; baseUrl: string; protected: boolean } }
   ): Promise<void> {
     const multi = groups.length > 1
     if (multi) this.testGroupResults = []
@@ -345,13 +372,15 @@ export class AgentRunner {
     tc: TestCase,
     group: TestGroup,
     settings: Settings,
-    opts: { failFast: boolean; fillPreview?: boolean; env?: { name: string; baseUrl: string; protected: boolean } }
+    opts: { failFast: boolean; fillPreview?: boolean; caseId?: number; env?: { name: string; baseUrl: string; protected: boolean } }
   ): Promise<TestRunStatus> {
     return new Promise<TestRunStatus>((resolve) => {
       const provider = createProvider(settings)
       // 独立测试页签（登录态与日常浏览互不污染）；页签满时让用户先关页签
       const tab = this.tabManager.ensureTestTab()
       tab.cdp.setDialogPolicy('accept') // JS 原生弹窗自动应答（仅测试期间启用，结束即关闭）
+      tab.cdp.setNetworkCapture(true) // 网络级断言（api_status/api_body）捕获，结束即关闭
+      Cdp.defaultDialogPolicy = 'accept' // 测试中新开的页签（如 window.open）同样接管弹窗
 
       this.testSoftErrors = []
       this.testCtx = {
@@ -361,6 +390,7 @@ export class AgentRunner {
         protectedSubmit: !!opts.env?.protected,
         fillPreview: !!opts.fillPreview,
         envName: opts.env?.name,
+        caseId: opts.caseId,
         perStepModelSteps: 0
       }
       this.testRun = {
@@ -430,6 +460,8 @@ export class AgentRunner {
     if (!tctx || !run || run.state !== 'running') return
     try {
       this.tabManager.getTestTab()?.cdp.setDialogPolicy(null)
+      this.tabManager.getTestTab()?.cdp.setNetworkCapture(false)
+      Cdp.defaultDialogPolicy = null
     } catch {}
     for (const s of run.steps) {
       if (s.status === 'pending' || s.status === 'running') {
@@ -475,6 +507,12 @@ export class AgentRunner {
     this.broadcastTestRun()
     const verdict =
       state === 'passed' ? '✅ 全部通过' : state === 'failed' ? `❌ 失败 ${run.failed}/${run.totalSteps} 步` : `⚠️ 测试${state}`
+    // 来源用例库：回写最近运行结论（多组时最后一组的 caseId 相同，多次回写幂等）
+    if (tctx.caseId != null) {
+      try {
+        updateCaseRunStat(tctx.caseId, verdict)
+      } catch {}
+    }
     this.broadcast({ channel: 'toast', message: `测试结束: ${verdict}`, kind: state === 'passed' ? 'success' : 'error' })
     this.setState({
       state: state === 'stopped' ? 'stopped' : state === 'error' ? 'error' : 'done',
@@ -556,9 +594,6 @@ export class AgentRunner {
         cur.assertions.push({ raw, kind: 'soft', passed: false, actual: msg })
       }
     }
-    // 弹窗应答记录反馈给模型
-    const dlg = this.tabManager.getTestTab()?.cdp.consumeDialogs()
-    if (dlg) this.lastResults.push(`系统提示: 页面原生弹窗已按脚本自动应答: ${dlg}`)
 
     const hardFail = executed.some((a) => a.error && a.name !== 'expect')
     const assertFail = cur.assertions.some((x) => !x.passed)
@@ -1036,6 +1071,20 @@ export class AgentRunner {
             a.name === 'paste_rich')
         )
           this.lastResults.push(`[${a.name}] ${a.result}`)
+      }
+
+      // 原生弹窗自动应答反馈（普通/测试任务统一）：文案告知模型，下一步可判断是否补救
+      const dlgNow = (() => {
+        try {
+          return tab.cdp.consumeDialogs()
+        } catch {
+          return null
+        }
+      })()
+      if (dlgNow) {
+        this.lastResults.push(
+          `系统提示: 页面弹出了原生确认框，系统已自动应答: ${dlgNow}。若该确认不是本任务期望的操作，请说明并纠正；页面内的 DOM 弹窗/遮罩是普通元素，直接按编号操作即可`
+        )
       }
 
       // 6. 记录步骤（含视口截图；视觉模式标记模型确实收到了截图）

@@ -37,9 +37,26 @@ export interface ParseResult {
   tc?: TestCase
 }
 
+/** 剥掉断言值外层的中文/英文引号（「」『』"" ''——页面实际文案不含这些括引号） */
+function stripQuotes(s: string): string {
+  return s.trim().replace(/^[「『"'](.*)[」』"']$/, '$1').trim()
+}
+
 /** 解析「预期」行为结构化断言 */
 export function parseAssertionLine(raw: string): TestAssertion {
   const line = raw.trim()
+  // [接口 X] 状态 = 200 / 响应包含 Y（网络级断言：按 URL 片段匹配最近一次请求）
+  const apiM = line.match(/^\[接口\s+([^\]]+)\]\s*(.*)$/)
+  if (apiM) {
+    const urlPart = apiM[1].trim()
+    const rest = apiM[2].trim()
+    const stM = rest.match(/^状态\s*(?:=|为)\s*(\d{3})$/)
+    if (stM) return { raw: line, kind: 'api_status', urlPart, value: stM[1] }
+    const bodyM = rest.match(/^响应包含\s*(.+)$/)
+    if (bodyM) return { raw: line, kind: 'api_body', urlPart, value: stripQuotes(bodyM[1]) }
+    // 只给了接口没给判断 → 默认 200
+    return { raw: line, kind: 'api_status', urlPart, value: '200' }
+  }
   // [选择器 X] 存在 / 不存在 / 值 = Y / 文本 = Y
   const selM = line.match(/^\[选择器\s+([^\]]+)\]\s*(.*)$/)
   if (selM) {
@@ -60,7 +77,7 @@ export function parseAssertionLine(raw: string): TestAssertion {
     const tag = tagM[1]
     const rest = tagM[2].trim()
     const neg = /^(不包含|不出现|不含)/.test(rest)
-    const value = rest.replace(/^(不包含|不出现|不含|包含|出现|含有)/, '').trim()
+    const value = stripQuotes(rest.replace(/^(不包含|不出现|不含|包含|出现|含有)/, '').trim())
     const kind: ExpectKind = tag === 'URL' || tag.toLowerCase() === 'url包含' ? 'url_contains' : tag === '标题' || tag === '标题包含' ? 'title_contains' : 'text_visible'
     return { raw: line, kind, value, negate: neg || undefined }
   }

@@ -6,10 +6,12 @@ import type { WebContents } from 'electron'
  * 自动在 1 秒后重连。
  */
 export class Cdp {
+  /** 全局默认弹窗策略（任务/测试运行期间由 runner 设定，新建页签自动继承；null=不接管） */
+  static defaultDialogPolicy: 'accept' | 'dismiss' | null = null
   private wc: WebContents
   private attached = false
   private destroyed = false
-  /** JS 原生弹窗自动应答策略（null=不接管；仅测试运行期间由 runner 开启） */
+  /** JS 原生弹窗自动应答策略（null=不接管） */
   private dialogPolicy: 'accept' | 'dismiss' | null = null
   private dialogPageEnabled = false
   private dialogHandler: ((_e: unknown, method: string, params: any) => void) | null = null
@@ -26,6 +28,8 @@ export class Cdp {
       }
     })
     this.attach()
+    // 运行中的任务/测试新开页签时继承全局弹窗策略
+    if (Cdp.defaultDialogPolicy) this.setDialogPolicy(Cdp.defaultDialogPolicy)
   }
 
   attach(): void {
@@ -220,5 +224,65 @@ export class Cdp {
     const out = this.dialogLog.join('; ')
     this.dialogLog = []
     return out
+  }
+
+  // —————— 网络捕获（测试模式网络级断言用） ——————
+
+  private netCapture = false
+  private netHandler: ((_e: unknown, method: string, params: any) => void) | null = null
+  private netLog: Array<{ requestId: string; url: string; status: number; type: string; ts: number }> = []
+
+  /**
+   * 网络捕获开关（仅测试模式开启）：收集 XHR/Fetch/Document 响应（URL+状态码），
+   * 响应体按需经 Network.getResponseBody 拉取（缓冲被浏览器回收后会失败，断言如实报错）。
+   */
+  setNetworkCapture(on: boolean): void {
+    if (on === this.netCapture) return
+    this.netCapture = on
+    if (on) {
+      this.netLog = []
+      if (!this.netHandler) {
+        this.netHandler = (_e, method, params) => {
+          if (method !== 'Network.responseReceived' || !this.netCapture) return
+          const r = params?.response
+          if (!r) return
+          const t = String(params?.type || r.type || '')
+          // 只记接口/文档请求，静态资源噪声不入列
+          if (t && !['XHR', 'Fetch', 'Document'].includes(t)) return
+          this.netLog.push({
+            requestId: String(params.requestId),
+            url: String(r.url || ''),
+            status: Number(r.status || 0),
+            type: t,
+            ts: Date.now()
+          })
+        }
+        try {
+          this.wc.debugger.on('message', this.netHandler)
+        } catch {}
+      }
+      this.send('Network.enable', {}).catch(() => {})
+    } else {
+      this.send('Network.disable', {}).catch(() => {})
+      // 日志保留供断言读取；下次开启时清空
+    }
+  }
+
+  getNetworkLog(): Array<{ requestId: string; url: string; status: number; type: string; ts: number }> {
+    return this.netLog.slice(-200)
+  }
+
+  /** 按 URL 片段找最近一次匹配的响应（状态 + 尽力拉取响应体） */
+  async findResponseBody(urlPart: string): Promise<{ status: number; url: string; body?: string } | null> {
+    const hit = [...this.netLog].reverse().find((e) => e.url.includes(urlPart))
+    if (!hit) return null
+    let body: string | undefined
+    try {
+      const r = await this.send<{ body?: string }>('Network.getResponseBody', { requestId: hit.requestId })
+      body = r?.body
+    } catch {
+      /* 响应缓冲已被回收（加载了较多后续请求）——状态码断言仍可用 */
+    }
+    return { status: hit.status, url: hit.url, body }
   }
 }

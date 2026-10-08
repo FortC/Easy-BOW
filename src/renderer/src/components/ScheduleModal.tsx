@@ -14,16 +14,19 @@ function describe(s: Schedule): string {
   return `每天 ${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`
 }
 
-/** 定时任务：把任务描述交给 AI 定时执行（与 AI 对话新增 / 维护列表 / 改策略） */
+/** 定时任务：把任务描述交给 AI 定时执行（与 AI 对话新增 / 维护列表 / 改策略；可绑定测试用例做定时回归） */
 export default function ScheduleModal(props: {
   initialTask: string
+  /** 预绑定测试用例（来自测试面板用例库的 ⏰ 按钮）：到点跑该用例而非自由任务 */
+  initialTestCase?: { id: number; name: string }
   onClose: () => void
   onToast: (msg: string, kind?: 'info' | 'success' | 'error') => void
 }) {
   const [list, setList] = useState<Schedule[]>([])
   const [editing, setEditing] = useState<Schedule | null>(null)
-  const [task, setTask] = useState(props.initialTask || '')
-  const [name, setName] = useState('')
+  const [task, setTask] = useState(props.initialTask || props.initialTestCase?.name || '')
+  const [name, setName] = useState(props.initialTestCase ? `回归: ${props.initialTestCase.name}` : '')
+  const [boundCaseId, setBoundCaseId] = useState<number | undefined>(props.initialTestCase?.id)
   const [policy, setPolicy] = useState<Policy>('daily')
   const [atLocal, setAtLocal] = useState(() => {
     const d = new Date(Date.now() + 3600_000)
@@ -43,6 +46,7 @@ export default function ScheduleModal(props: {
     setEditing(s)
     setTask(s.task)
     setName(s.name)
+    setBoundCaseId(s.testCaseId)
     setPolicy(s.type)
     if (s.type === 'once' && s.at) {
       const d = new Date(s.at)
@@ -56,8 +60,9 @@ export default function ScheduleModal(props: {
 
   const resetForm = () => {
     setEditing(null)
-    setTask(props.initialTask || '')
-    setName('')
+    setTask(props.initialTask || props.initialTestCase?.name || '')
+    setName(props.initialTestCase ? `回归: ${props.initialTestCase.name}` : '')
+    setBoundCaseId(props.initialTestCase?.id)
   }
 
   const save = async () => {
@@ -71,6 +76,7 @@ export default function ScheduleModal(props: {
       const base = {
         name: name.trim() || t.slice(0, 20),
         task: t,
+        ...(boundCaseId != null ? { testCaseId: boundCaseId } : {}),
         enabled: true,
         type: policy,
         ...(policy === 'once' ? { at: new Date(atLocal).getTime() } : {}),
@@ -129,6 +135,14 @@ export default function ScheduleModal(props: {
             rows={3}
           />
         </div>
+        {boundCaseId != null && (
+          <div className="field-hint test-warn">
+            🧪 已绑定测试用例（定时回归）：到点自动在独立测试页签执行该用例并生成报告，不执行上面的任务描述
+            <button className="btn mini" style={{ marginLeft: 8 }} onClick={() => setBoundCaseId(undefined)}>
+              解绑（改为普通任务）
+            </button>
+          </div>
+        )}
         <div className="form-row">
           <label>任务名（可选，默认取描述前 20 字）</label>
           <input value={name} placeholder="例：每日发货清单" onChange={(e) => setName(e.target.value)} />
@@ -189,7 +203,8 @@ export default function ScheduleModal(props: {
                 <div key={s.id} className={`sch-item ${s.enabled ? '' : 'off'}`}>
                   <div className="sch-item-main">
                     <div className="sch-item-name">
-                      {s.enabled ? '⏰' : '⏸'} {s.name}
+                      {s.enabled ? '⏰' : '⏸'}
+                      {s.testCaseId != null ? '🧪' : ''} {s.name}
                       <span className="sch-item-policy">{describe(s)}</span>
                     </div>
                     <div className="sch-item-meta">
