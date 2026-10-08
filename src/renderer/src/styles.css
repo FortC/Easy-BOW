@@ -544,7 +544,7 @@ img.hist-fav { object-fit: contain; }
 .fb-ops { display: flex; gap: 8px; justify-content: center; }
 
 /* —————— 浏览器仿真测试面板 —————— */
-.test-modal { width: 760px; max-width: 94vw; max-height: 90vh; overflow-y: auto; }
+.test-modal { width: 860px; max-width: 94vw; max-height: 90vh; overflow-y: auto; }
 .test-tabs { display: flex; gap: 6px; margin-bottom: 14px; }
 .test-tab {
   flex: 1; padding: 8px 0; border: 1px solid #e5e6eb; background: #f7f8fa; border-radius: 8px;
@@ -567,7 +567,9 @@ img.hist-fav { object-fit: contain; }
 }
 .test-env-edit input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(51, 112, 255, .1); }
 .test-convert-btn { justify-content: flex-end; display: flex; align-items: flex-end; }
-.test-run-btns { display: flex; gap: 8px; align-items: flex-end; }
+.form-inline .form-row.no-flex { flex: none; }
+.test-convert-btn { justify-content: flex-end; }
+.test-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 .test-parse-err { color: #d9393a !important; }
 .test-warn { color: #b26a00 !important; background: #fff7e8; border-radius: 6px; padding: 6px 10px; }
 .test-envs { margin-top: 14px; border-top: 1px dashed #e5e6eb; padding-top: 10px; }

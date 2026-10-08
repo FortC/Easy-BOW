@@ -267,9 +267,9 @@ export default function TestPanel(props: {
                   <option value="prd">PRD 全文 → 提炼拆用例</option>
                 </select>
               </div>
-              <div className="form-row test-convert-btn">
+              <div className="form-row test-convert-btn no-flex">
                 <button className="btn primary" onClick={doConvert} disabled={converting}>
-                  {converting ? '生成中…（一次模型调用）' : '生成测试用例'}
+                  {converting ? '生成中…' : '生成测试用例'}
                 </button>
               </div>
             </div>
@@ -318,23 +318,23 @@ export default function TestPanel(props: {
               <div className="form-row">
                 <label>填充预览</label>
                 <select value={fillPreview ? '1' : '0'} onChange={(e) => setFillPreview(e.target.value === '1')}>
-                  <option value="0">关闭（智能填充直接执行）</option>
-                  <option value="1">开启（AI 填充值先人工确认，首次跑陌生站点建议开）</option>
+                  <option value="0">关闭（直接执行）</option>
+                  <option value="1">开启（AI 填充值先人工确认）</option>
                 </select>
               </div>
-              <div className="form-row test-run-btns">
-                <button className="btn" onClick={doParse} disabled={!caseMd.trim()}>
-                  校验
+            </div>
+            <div className="test-actions">
+              <button className="btn" onClick={doParse} disabled={!caseMd.trim()}>
+                校验
+              </button>
+              <button className="btn primary" onClick={doStart} disabled={running || !caseMd.trim()}>
+                ▶ 运行测试
+              </button>
+              {running && (
+                <button className="btn danger" onClick={() => window.easybow.testStop().catch(() => {})}>
+                  停止
                 </button>
-                <button className="btn primary" onClick={doStart} disabled={running || !caseMd.trim()}>
-                  ▶ 运行测试
-                </button>
-                {running && (
-                  <button className="btn danger" onClick={() => window.easybow.testStop().catch(() => {})}>
-                    停止
-                  </button>
-                )}
-              </div>
+              )}
             </div>
             {parsed && (
               <div className={`field-hint ${parsed.ok ? '' : 'test-parse-err'}`}>

@@ -14,3 +14,7 @@ resources/fastmodel/
 
 .easy-publish.json
 /hero-screen.png
+
+# 自测产生的临时文件
+/selftest-upload-tmp.txt
+/selftest-*-tmp.*

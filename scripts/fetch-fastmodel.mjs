@@ -15,10 +15,11 @@ const MIRROR = process.env.EASYBOW_HF_MIRROR || 'https://hf-mirror.com'
 const REPO = 'onnx-community/Qwen2.5-0.5B-Instruct'
 
 // int8 动态量化（q8 → model_quantized.onnx）。q4 在 onnxruntime-node 1.30+ Windows 会段错误，禁用。
+// 大小为「上次校验时」的上游快照（hf-mirror 上游文件可能更新；416 有整包重下兜底）
 const FILES = [
   ['config.json', 678],
   ['generation_config.json', 242],
-  ['tokenizer_config.json', 7306],
+  ['tokenizer_config.json', 7849],
   ['tokenizer.json', 7031673],
   ['onnx/model_quantized.onnx', 512096557]
 ]
@@ -34,8 +35,12 @@ async function fetchFile(rel, expectedSize) {
   let startAt = existsSync(dest) ? statSync(dest).size : 0
   for (let attempt = 1; attempt <= 6; attempt++) {
     try {
-      const headers = startAt > 0 ? { Range: `bytes=${startAt}-` } : {}
-      const res = await fetch(url, { headers, redirect: 'follow' })
+      let res = await fetch(url, startAt > 0 ? { headers: { Range: `bytes=${startAt}-` } } : {})
+      if (res.status === 416 && startAt > 0) {
+        // 本地起点已越过远端文件尾（上游文件被更新/回滚过）：放弃续传，整包重下
+        startAt = 0
+        res = await fetch(url, {})
+      }
       if (!res.ok && res.status !== 206) throw new Error(`HTTP ${res.status}`)
       const viaRange = res.status === 206
       if (!viaRange) startAt = 0 // 服务器不支持续传，从头来
