@@ -894,7 +894,6 @@ img.hdrop-fav { object-fit: contain; }
 }
 .test-env-edit input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(51, 112, 255, 0.1); }
 .test-env-edit input[type="checkbox"] { width: auto; height: auto; padding: 0; }
-.test-convert-btn { display: flex; align-items: flex-end; }
 .test-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 .test-parse-err { color: var(--danger) !important; }
 .test-warn { color: #b26a00 !important; background: #fff7e8; border-radius: var(--radius-sm); padding: 6px 10px; }

@@ -411,6 +411,101 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
         hidden1 === true && modalVisible === true && closed === 'ok' && hidden2 === false,
         `点击⚙后隐藏=${hidden1} 弹窗可见=${modalVisible} 关闭=${closed} 关闭后隐藏=${hidden2} 残留弹窗=[${modalAfter}]`
       )
+
+      // 8.6.1 测试面板：打开 → 布局结构（按钮独立成行/下拉同排底边对齐）→ 关闭恢复
+      try {
+        const clickTest = await ui.executeJavaScript(
+          `(() => { const b = Array.from(document.querySelectorAll('button')).find(x => (x.title || '').includes('浏览器仿真测试') || x.textContent.includes('🧪')); if (!b) return '未找到测试按钮'; b.click(); return 'ok' })()`,
+          true
+        )
+        if (clickTest !== 'ok') throw new Error(clickTest)
+        await sleep(700)
+        const hiddenT1 = tm.isBrowserHidden()
+        const layout = await ui.executeJavaScript(
+          `(() => {
+            const modal = document.querySelector('.test-modal')
+            if (!modal) return null
+            return {
+              tabs: document.querySelectorAll('.test-modal .test-tab').length,
+              mdInput: !!document.querySelector('.test-modal .test-md-input'),
+              // 主按钮必须在独立 .test-actions 行内（不得与下拉同排被拉伸）
+              actionsBtn: (() => { const a = document.querySelector('.test-modal .test-actions'); return !!a && !!a.querySelector('.btn.primary') })(),
+              strayBtnCol: document.querySelectorAll('.test-modal .form-inline .no-flex').length
+            }
+          })()`,
+          true
+        )
+        // 切到 ② 用例与运行：三个下拉同排，底边必须对齐（此前两次对齐回归的根因）
+        await ui.executeJavaScript(
+          `(() => { const b = Array.from(document.querySelectorAll('.test-modal .test-tab')).find(x => (x.textContent || '').includes('用例与运行')); b && b.click(); return !!b })()`,
+          true
+        )
+        await sleep(500)
+        const align = await ui.executeJavaScript(
+          `(() => {
+            const sels = Array.from(document.querySelectorAll('.test-modal .form-inline select'))
+            if (sels.length < 2) return { n: sels.length, bottomDiff: -1, topDiff: -1, wDiff: -1, tabWDiff: -1, labelDiff: -1, actionsDiff: -1 }
+            const b = sels.map(s => s.getBoundingClientRect().bottom)
+            const t = sels.map(s => s.getBoundingClientRect().top)
+            const w = sels.map(s => s.getBoundingClientRect().width)
+            // 页签按钮等宽 / 每列 label 与该列下拉左对齐 / 按钮行与表单行右对齐
+            const tabs = Array.from(document.querySelectorAll('.test-modal .test-tab')).map(x => x.getBoundingClientRect().width)
+            const tabWDiff = tabs.length ? Math.max(...tabs) - Math.min(...tabs) : -1
+            const row = sels[0].closest('.form-inline')
+            const labelSelDiffs = row
+              ? Array.from(row.querySelectorAll('.form-row'))
+                  .filter((fr) => fr.querySelector('label') && fr.querySelector('select'))
+                  .map((fr) => {
+                    const l = fr.querySelector('label').getBoundingClientRect().left
+                    const s = fr.querySelector('select').getBoundingClientRect().left
+                    return Math.abs(l - s)
+                  })
+              : []
+            const labelSelDiff = labelSelDiffs.length ? Math.max(...labelSelDiffs) : -1
+            const act = document.querySelector('.test-modal .test-actions')
+            const actRight = act ? act.getBoundingClientRect().right : -1
+            const rowRight = row ? row.getBoundingClientRect().right : -1
+            const actionsDiff = actRight > 0 && rowRight > 0 ? Math.abs(actRight - rowRight) : -1
+            return {
+              n: sels.length,
+              bottomDiff: Math.max(...b) - Math.min(...b),
+              topDiff: Math.max(...t) - Math.min(...t),
+              wDiff: Math.max(...w) - Math.min(...w),
+              tabWDiff,
+              labelSelDiff,
+              actionsDiff,
+              tabWs: tabs.map(x => Math.round(x)).join(','),
+              selWs: w.map(x => Math.round(x)).join(',')
+            }
+          })()`,
+          true
+        )
+        const runBtnRow = await ui.executeJavaScript(
+          `(() => { const a = document.querySelector('.test-modal .test-actions'); return !!a && !!Array.from(a.querySelectorAll('button')).find(b => b.textContent.includes('运行测试')) })()`,
+          true
+        )
+        await ui.executeJavaScript(`document.querySelector('.test-modal .close-x')?.click()`, true)
+        let testModalGone = false
+        for (let k = 0; k < 6 && !testModalGone; k++) {
+          await sleep(350)
+          testModalGone = await ui.executeJavaScript(`!document.querySelector('.test-modal')`, true)
+        }
+        let hiddenT2 = tm.isBrowserHidden()
+        for (let k = 0; k < 6 && hiddenT2; k++) {
+          await sleep(400)
+          hiddenT2 = tm.isBrowserHidden()
+        }
+        check(
+          '测试面板(布局对齐/开关恢复)',
+          !!layout && layout.tabs === 4 && layout.mdInput && layout.actionsBtn && layout.strayBtnCol === 0 &&
+            align.n >= 2 && align.bottomDiff >= 0 && align.bottomDiff < 1.5 &&
+            align.wDiff >= 0 && align.wDiff < 2 && align.tabWDiff >= 0 && align.tabWDiff < 2 &&
+            align.labelSelDiff >= 0 && align.labelSelDiff < 1.5 && runBtnRow && testModalGone && hiddenT1 === true && hiddenT2 === false,
+          `页签=${layout?.tabs}[宽:${align?.tabWs}] 主按钮独立行=${layout?.actionsBtn} 残留按钮列=${layout?.strayBtnCol} 下拉数=${align?.n}[宽:${align?.selWs}] 底边差=${align?.bottomDiff?.toFixed(1)}px 列宽差=${align?.wDiff?.toFixed(1)}px 页签宽差=${align?.tabWDiff?.toFixed(1)}px label与下拉左差=${align?.labelSelDiff?.toFixed(1)}px 按钮行右差=${align?.actionsDiff?.toFixed(1)}px 关闭=${testModalGone} 隐藏恢复=${hiddenT1}→${hiddenT2}`
+        )
+      } catch (e: any) {
+        check('测试面板(布局对齐/开关恢复)', false, String(e?.message || e))
+      }
     } catch (e: any) {
       check('设置弹窗(浏览器视图隐藏/恢复)', false, String(e?.message || e))
     }
@@ -1186,10 +1281,33 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
           const netTab = tm.active()
           if (!netTab) throw new Error('网络测试页签不可用')
           netTab.cdp.setNetworkCapture(true)
-          const snapNet = await ex.extract(netTab)
-          const nbIdx = snapNet.candidates.findIndex((c) => c.text === '发请求')
-          const clickNet = nbIdx >= 0 ? await ex.executeBatch([{ name: 'click', index: nbIdx }] as any, passCtx) : []
-          // 等 fetch 回显就绪（首次冷加载 localhost 页可能稍慢；最多 4s）
+          // 页面就绪再点（readyState + 按钮存在；此前冷加载下点击落空导致 fetch 未发出）
+          let netReady = false
+          for (let k = 0; k < 12 && !netReady; k++) {
+            await sleep(400)
+            netReady = await netTab.cdp
+              .evaluate<boolean>(
+                String(function netReady() { return document.readyState === 'complete' && !!document.getElementById('net-btn') }),
+                []
+              )
+              .catch(() => false)
+          }
+          // 触发 fetch 不走元素点击链路（新页签首帧 innerText 偶发为空导致提取不到按钮，
+          // 与本检查目标无关）：直接 evaluate 发起 fetch，网络路径与真实点击完全一致
+          await netTab.cdp
+            .evaluate(
+              String(function fireNet() {
+                fetch('api/echo')
+                  .then((r) => r.json())
+                  .then((j) => {
+                    document.getElementById('net-out')!.textContent = JSON.stringify(j)
+                  })
+                return true
+              }),
+              []
+            )
+            .catch(() => {})
+          // 等 fetch 回显就绪（最多 4s）
           let netOutRaw = ''
           for (let k = 0; k < 10 && !netOutRaw; k++) {
             await sleep(400)
@@ -1207,11 +1325,11 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
             ] as any,
             passCtx
           )
-          const netOk = !netBatch[0]?.error && !netBatch[1]?.error && !!netBatch[2]?.error
+          const netOk = netReady && !netBatch[0]?.error && !netBatch[1]?.error && !!netBatch[2]?.error
           check(
             '网络级断言(api_status/api_body)',
             netOk,
-            `nbIdx=${nbIdx} click=${clickNet[0]?.error || 'ok'} 页面回显=${netOut.slice(0, 30)} 捕获条目=${netLogLen} status=${netBatch[0]?.error || 'ok'} body=${netBatch[1]?.error || 'ok'}`
+            `就绪=${netReady} 页面回显=${netOut.slice(0, 30)} 捕获条目=${netLogLen} status=${netBatch[0]?.error || 'ok'} body=${netBatch[1]?.error || 'ok'}`
           )
           netTab.cdp.setNetworkCapture(false)
           tm.closeTab(netTab.id)

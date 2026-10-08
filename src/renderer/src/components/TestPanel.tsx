@@ -313,15 +313,15 @@ export default function TestPanel(props: {
               <div className="form-row">
                 <label>转换模式</label>
                 <select value={mode} onChange={(e) => setMode(e.target.value as 'prd' | 'rough')}>
-                  <option value="rough">粗略步骤 → 补全断言/数据（保留原步骤）</option>
-                  <option value="prd">PRD 全文 → 提炼拆用例</option>
+                  <option value="rough">粗略步骤 → 补全断言/数据（保留原步骤语义）</option>
+                  <option value="prd">PRD 全文 → 提炼可测点拆用例</option>
                 </select>
               </div>
-              <div className="form-row test-convert-btn no-flex">
-                <button className="btn primary" onClick={doConvert} disabled={converting}>
-                  {converting ? '生成中…' : '生成测试用例'}
-                </button>
-              </div>
+            </div>
+            <div className="test-actions">
+              <button className="btn primary" onClick={doConvert} disabled={converting}>
+                {converting ? '生成中…（一次模型调用）' : '生成测试用例'}
+              </button>
             </div>
             <div className="field-hint">
               生成后进入「② 用例与运行」人工审核/编辑——用例 MD 可保存到 git 仓库复用；「智能填充当前页表单」写进操作即可让 AI
