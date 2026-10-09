@@ -49,6 +49,12 @@ extraResources:
     to: ocr
   - from: resources/testpage.html
     to: testpage.html
+  # 自测 fixture 的网络嗅探用图（仅内联 JS 加载、DOM 无对应 img）
+  - from: resources/netprobe.png
+    to: netprobe.png
+  # 托盘图标（关闭窗口最小化到托盘时的入口）
+  - from: resources/tray.png
+    to: tray.png
   - from: resources/overlay.html
     to: overlay.html
   - from: resources/overlay-preload.js

@@ -2,7 +2,8 @@
  * 测试环境档案 + 报告索引（userData 持久化，与 Settings 完全分离，互不影响）。
  */
 import { app } from 'electron'
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'fs'
+import { writeJsonAtomic } from '../fsutil'
 import { join } from 'path'
 import type { TestCaseEntry, TestEnv } from '@shared/types'
 import { reportsRoot } from './report'
@@ -32,7 +33,7 @@ export function saveTestEnvs(envs: TestEnv[]): TestEnv[] {
     .filter((e) => e && e.name && e.name.trim())
     .map((e) => ({ name: e.name.trim().slice(0, 30), baseUrl: (e.baseUrl || '').trim().slice(0, 300), protected: !!e.protected }))
   try {
-    writeFileSync(envsPath(), JSON.stringify(clean, null, 2), 'utf-8')
+    writeJsonAtomic(envsPath(), clean)
   } catch (e) {
     console.error('[easybow] 测试环境保存失败:', e)
   }
@@ -106,7 +107,7 @@ function loadCases(): TestCaseEntry[] {
 
 function persistCases(list: TestCaseEntry[]): void {
   try {
-    writeFileSync(casesPath(), JSON.stringify(list, null, 2), 'utf-8')
+    writeJsonAtomic(casesPath(), list)
   } catch (e) {
     console.error('[easybow] 用例库保存失败:', e)
   }

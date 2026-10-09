@@ -7,12 +7,17 @@ import {
   RESOLVE_FN,
   READ_CONTENT_FN,
   EXTRACT_IMAGES_FN,
+  type Candidate,
   type ExtractResult,
-  formatCandidates
+  formatCandidates,
+  rerankByTask
 } from './extractor'
 import { mdToHtml, mdToPlain } from './markdown'
+import { decodeImageToPng } from './imgdec'
 import { EXPECT_TEXT_FN, EXPECT_SEL_FN, SOFT_ERR_FN } from './testcase/assertions'
 import { FORM_FIELDS_FN, FORM_SET_FN, type FormField } from './testcase/fields'
+import { scoreCandidate, verifyFieldMatch, extractKeywords } from './semantic'
+import { upsertExperience } from './experience'
 import { existsSync, statSync } from 'fs'
 import type { AgentAction, Settings } from '@shared/types'
 
@@ -20,6 +25,10 @@ export interface ExecContext {
   memory: Record<string, string>
   signal: AbortSignal
   settings: Settings
+  /** 任务描述（S1 填后语义校验 + 经验沉淀用；自测/单动作调用可缺省） */
+  task?: string
+  /** 当前页面 URL（经验沉淀按域名归档用） */
+  url?: string
   /** 上一步执行成功的动作骨架（repeat 重放用；可缺省） */
   prevActions?: AgentAction[]
   /** 测试模式：生产保护环境下为 true，提交类点击前需人工确认（普通任务恒缺省） */
@@ -41,6 +50,10 @@ interface Resolved {
   value?: string
   w?: number
   h?: number
+  /** 实际解析命中的候选（重定位后与原快照序号可能不同）：
+   *  路径定位/赋值回读/标签判定必须全部消费它——否则点击的是重定位元素、
+   *  赋值却落在旧快照序号上，重复文案/空文本控件场景直接「填错字段」（P0-1） */
+  cand?: Candidate
 }
 
 /** 安全设置 input/textarea 的值（走原生 setter，React 受控组件可感知） */
@@ -112,6 +125,82 @@ const READ_VALUE_FN = String(function readValue(framePaths: number[][], path: nu
   return { ok: false }
 })
 
+/**
+ * S1 填后语义校验用：读目标元素的语义文案（label / placeholder / name / aria / 邻近文本）。
+ * 回答「刚填的输入框到底是什么字段」——值填对了 ≠ 填对了字段。
+ */
+const READ_LABEL_FN = String(function readLabel(framePaths: number[][], path: number[]) {
+  function walk(doc: Document, p: number[]): Element | null {
+    let el: Element = doc.documentElement
+    for (const i of p) {
+      const next = el.children[i]
+      if (!next) return null
+      el = next
+    }
+    return el
+  }
+  let doc: Document = document
+  for (const fp of framePaths) {
+    const f = walk(doc, fp)
+    if (!f || f.tagName !== 'IFRAME') return { found: false }
+    try {
+      doc = (f as HTMLIFrameElement).contentDocument as Document
+    } catch {
+      return { found: false }
+    }
+    if (!doc) return { found: false }
+  }
+  const el = walk(doc, path)
+  if (!el) return { found: false }
+  const norm = function (s: any): string {
+    return String(s || '').replace(/\s+/g, ' ').trim()
+  }
+  let label = ''
+  const id = el.getAttribute('id')
+  if (id) {
+    let l: Element | null = null
+    try {
+      l = doc.querySelector(`label[for="${CSS.escape(id)}"]`)
+    } catch {
+      try {
+        l = doc.querySelector(`label[for="${id}"]`)
+      } catch {
+        l = null
+      }
+    }
+    if (l) label = norm((l as HTMLElement).innerText)
+  }
+  if (!label) {
+    const p = el.closest('label')
+    if (p) label = norm((p as HTMLElement).innerText)
+  }
+  let adjacent = ''
+  try {
+    const cell = el.closest('td,th')
+    if (cell) {
+      // 优先左侧单元格（label 通常在输入框左边，同行多字段时行文本会混淆语义）
+      const prevCell = cell.previousElementSibling
+      if (prevCell && !prevCell.querySelector('input,select,textarea')) {
+        const t = norm(prevCell.textContent)
+        if (t && t.length <= 12) adjacent = t.slice(0, 24)
+      }
+      if (!adjacent && cell.parentElement) adjacent = norm((cell.parentElement as HTMLElement).innerText).slice(0, 40)
+    }
+    if (!adjacent) {
+      const wrap = el.closest('.form-item,.form-group,.field,.ant-form-item,.el-form-item')
+      if (wrap) adjacent = norm((wrap as HTMLElement).innerText).slice(0, 40)
+    }
+  } catch {}
+  return {
+    found: true,
+    label: label.slice(0, 30),
+    placeholder: norm(el.getAttribute('placeholder')).slice(0, 30),
+    name: norm(el.getAttribute('name')).slice(0, 30),
+    aria: norm(el.getAttribute('aria-label')).slice(0, 30),
+    adjacent
+  }
+})
+
 const SCROLL_FN = String(function scrollTo(where: string) {
   if (where === 'top') window.scrollTo({ top: 0 })
   else if (where === 'bottom') window.scrollTo({ top: document.documentElement.scrollHeight })
@@ -173,6 +262,15 @@ function rand(min: number, max: number): number {
   return min + Math.random() * (max - min)
 }
 
+/** URL → 域名（经验沉淀按站点归档；解析失败返回空串=全局） */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host
+  } catch {
+    return ''
+  }
+}
+
 /** 视口尺寸（CSS 像素）：截图归一化坐标 → 实际点击坐标换算用 */
 const VIEWPORT_FN = String(function viewportSize() {
   return { w: window.innerWidth || 0, h: window.innerHeight || 0 }
@@ -201,15 +299,44 @@ export class Executor {
     this.tabManager = tabManager
   }
 
-  async extract(tab?: Tab): Promise<ExtractResult> {
+  /**
+   * 提取页面元素。opts.task（S1 语义重排）：提供时按任务关键词把语义相关元素提前——
+   * 重排在 snapshots.set 之前完成，编号即最终编号（快照与提示词一致）。
+   * opts.limit（S1 扩展提取）：提高快照上限重提取（默认按设置的上限）。
+   */
+  async extract(tab?: Tab, opts?: { task?: string; limit?: number }): Promise<ExtractResult> {
     const t = tab || this.tabManager.active()
     if (!t) throw new Error('没有可用页签')
-    const res = await t.cdp.evaluate<ExtractResult>(EXTRACT_FN, [this.snapshotLimit()])
+    const cap = opts?.limit ? Math.max(20, Math.min(200, opts.limit)) : this.snapshotLimit()
+    let res = await t.cdp.evaluate<ExtractResult>(EXTRACT_FN, [cap])
     if (!res || !Array.isArray(res.candidates)) {
       throw new Error('页面提取结果为空（页面可能还在加载或为特殊页面）')
     }
+    if (opts?.task) {
+      try {
+        res = rerankByTask(res, opts.task)
+      } catch {}
+    }
     this.snapshots.set(t.id, res)
     return res
+  }
+
+  /** S1 扩展提取：任务关键名词一个都没命中候选时，提高上限重提取一次 */
+  async extractBoosted(tab: Tab, task: string, limit = 160): Promise<ExtractResult> {
+    return this.extract(tab, { task, limit })
+  }
+
+  /** 任务关键词是否命中任一候选（语义分 ≥ 0.5）——扩展提取的触发判据 */
+  taskHitsCandidate(res: ExtractResult, task: string): boolean {
+    if (!task) return false
+    return res.candidates.some(
+      (c) => scoreCandidate({ text: c.text, extra: c.extra, role: c.role, tag: c.tag }, task).score >= 0.5
+    )
+  }
+
+  /** 任务关键词列表（runner 日志/扩展提取判据共用） */
+  taskKeywords(task: string): string[] {
+    return extractKeywords(task)
   }
 
   private maxElementsProvider: () => number = () => 80
@@ -232,9 +359,13 @@ export class Executor {
     this.snapshots.delete(tabId)
   }
 
-  formatForPrompt(res: ExtractResult, limit: number, withCoords = false): string {
+  /**
+   * 格式化元素列表给提示词。keepIdx（S6 本地初筛）：仅渲染这些原始编号的元素
+   * （编号保持与快照一致），缺省渲染前 limit 个（与历史行为一致）。
+   */
+  formatForPrompt(res: ExtractResult, limit: number, withCoords = false, keepIdx?: number[]): string {
     const sliced: ExtractResult = { ...res, candidates: res.candidates.slice(0, limit) }
-    return formatCandidates(sliced, withCoords)
+    return formatCandidates(sliced, withCoords, keepIdx)
   }
 
   private sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -256,23 +387,48 @@ export class Executor {
     return this.sleep(ms, signal)
   }
 
+  /** R2 拟人键入：humanLike 开启时短文本走逐字符通道（cdp.insertTextHuman），长文本整段 */
+  private typeHuman(t: Tab, text: string, ctx: ExecContext): Promise<void> {
+    if (ctx.settings?.humanLike === false) return t.cdp.insertText(text)
+    return t.cdp.insertTextHuman(text)
+  }
+
+  /** R2 拟人移动：humanLike 开启时贝塞尔轨迹滑向目标（关闭=直点，回归瞬时操作） */
+  private async moveHuman(t: Tab, x: number, y: number, ctx: ExecContext): Promise<void> {
+    if (ctx.settings?.humanLike === false) return
+    try {
+      await t.cdp.moveHumanTo(x, y)
+    } catch {}
+  }
+
   private async resolveIndex(t: Tab, index: number): Promise<Resolved> {
     const snap = this.snapshots.get(t.id)
     if (!snap || index < 0 || index >= snap.candidates.length) return { found: false }
     const cand = snap.candidates[index]
     const r = await t.cdp.evaluate<Resolved>(RESOLVE_FN, [cand.framePaths, cand.path, cand.tag])
-    if (!r.found) {
-      // DOM 变动（SPA 重渲染/虚拟滚动/懒加载占位）：重新提取一次，
-      // 优先按 标签+文本 重定位（重渲染后序号会漂移，直接复用 index 不可靠）
-      const fresh = await this.extract(t)
-      const c2 =
-        (cand.text
-          ? fresh.candidates.find((c) => c.tag === cand.tag && c.text === cand.text)
-          : undefined) ?? fresh.candidates[index]
-      if (!c2) return { found: false }
-      return t.cdp.evaluate<Resolved>(RESOLVE_FN, [c2.framePaths, c2.path, c2.tag])
+    if (r.found) return { ...r, cand }
+    // DOM 变动（SPA 重渲染/虚拟滚动/懒加载占位）：重新提取一次并重定位。
+    // 重定位仲裁（编号契约 C1）：重复文案（「确定/下一页」、列表同名项）按 tag+text
+    // 取首个会错位——在全等候选里选「中心点距原元素最近」的一个；全没有才回退同序号
+    const fresh = await this.extract(t)
+    let c2: Candidate | undefined
+    if (cand.text) {
+      const cx = cand.rect.x + cand.rect.w / 2
+      const cy = cand.rect.y + cand.rect.h / 2
+      let best = Infinity
+      for (const c of fresh.candidates) {
+        if (c.tag !== cand.tag || c.text !== cand.text) continue
+        const d = (c.rect.x + c.rect.w / 2 - cx) ** 2 + (c.rect.y + c.rect.h / 2 - cy) ** 2
+        if (d < best) {
+          best = d
+          c2 = c
+        }
+      }
     }
-    return r
+    c2 ??= fresh.candidates[index]
+    if (!c2) return { found: false }
+    const r2 = await t.cdp.evaluate<Resolved>(RESOLVE_FN, [c2.framePaths, c2.path, c2.tag])
+    return r2.found ? { ...r2, cand: c2 } : { found: false }
   }
 
   /** 等待页面加载 settle（导航后的稳定窗口） */
@@ -345,8 +501,8 @@ export class Executor {
         const r = await this.resolveIndex(t, a.index)
         if (!r.found) throw new Error(`元素[${a.index}]已失效（页面可能已变化）`)
         if (r.w === 0 || r.h === 0) throw new Error(`元素[${a.index}]不可见`)
-        const snap = this.snapshots.get(t.id)
-        const cand = snap?.candidates[a.index]
+        // submitish 判定用实际命中候选（重定位后文案可能已不同）
+        const cand = r.cand
         const label = `${cand?.text || ''} ${cand?.extra || ''}`.trim()
         const submitish = /提交|确定|保存|下单|支付|发布|删除|结算/.test(label)
         // 测试模式生产保护：提交/删除类点击需人工确认（普通任务 protectedSubmit 恒缺省，零影响）
@@ -371,6 +527,7 @@ export class Executor {
             await this.overlay.moveTo(r.x!, r.y!)
           } catch {}
         }
+        await this.moveHuman(t, r.x!, r.y!, ctx)
         await t.cdp.mouseClick(r.x! + rand(-2, 2), r.y! + rand(-2, 2))
         if (this.overlay) {
           try {
@@ -413,6 +570,7 @@ export class Executor {
           } catch {}
         }
         await this.sleep(160, ctx.signal)
+        await this.moveHuman(t, px, py, ctx)
         await t.cdp.mouseClick(px + rand(-2, 2), py + rand(-2, 2))
         if (this.overlay) {
           try {
@@ -429,13 +587,18 @@ export class Executor {
         let text = a.text
         // {{记忆键}} 引用替换
         text = text.replace(/\{\{([^}]+)\}\}/g, (_m, k) => ctx.memory[String(k).trim()] ?? '')
-        await this.focusTarget(t, a.index, ctx)
-        const [framePaths, path] = await this.pathsFor(t, a.index)
+        // 单次解析、全链同源：聚焦坐标 / framePaths+path 赋值回读 / 字段标签判定
+        // 全部消费同一份解析候选（重定位后旧快照序号不可再信——P0-1 分裂根因）
+        const r = await this.resolveIndex(t, a.index)
+        if (!r.found || !r.cand) throw new Error(`元素[${a.index}]已失效（页面可能已变化）`)
+        const { framePaths, path } = r.cand
+        await this.focusResolved(t, r, ctx)
 
         // 1) 真实键入：Ctrl+A 全选后走输入法通道替换（trusted 输入管线，框架渲染的站点最买账）
+        //    R2 拟人化：短文本逐字符输入（humanLike 可关），长文本自动整段
         await t.cdp.keySelectAll()
         await this.sleep(60, ctx.signal)
-        await t.cdp.insertText(text)
+        await this.typeHuman(t, text, ctx)
         await this.sleep(140, ctx.signal)
 
         // 2) 验证实际值
@@ -461,6 +624,39 @@ export class Executor {
 
         if (vr.ok && vr.value === text) {
           a.result = `已输入"${text.slice(0, 40)}${text.length > 40 ? '…' : ''}"(${how})`
+          // S1 填后语义校验：填对了值 ≠ 填对了字段（静默错误显式化——S1 中价值最高的一步）
+          // 校验失败不清空已填值、只报错供模型换候选重填（diagnose 归类为 semantic 自愈）
+          if (ctx.settings?.semanticVerify !== false && ctx.task) {
+            const lr = await t.cdp
+              .evaluate<{ found: boolean; label?: string; placeholder?: string; name?: string; aria?: string; adjacent?: string }>(
+                READ_LABEL_FN,
+                [framePaths, path]
+              )
+              .catch(() => null)
+            if (lr?.found) {
+              const parts = [lr.label, lr.placeholder, lr.name, lr.aria, lr.adjacent].filter(Boolean).map(String)
+              // 只有长邻近文本、无短标签时跳过校验（行文本混多个字段名，误报率高）
+              const short = parts.filter((p) => p.length <= 14)
+              if (parts.length && short.length) {
+                const v = verifyFieldMatch(short, ctx.task)
+                if (!v.ok && v.want) {
+                  a.error = `疑似填错字段：目标「${v.want}」但实际字段是「${short.join(' ').slice(0, 20)}」（相似度 ${Math.round(v.score * 100)}%），请改选更匹配的输入框`
+                } else {
+                  // S5 经验沉淀 A：语义校验通过 → 记一条站点字段映射（同域同意图幂等合并）
+                  if (ctx.settings?.autoExperience !== false && v.score >= 0.5 && v.want && short[0]) {
+                    try {
+                      upsertExperience({
+                        domain: hostOf(ctx.url || ''),
+                        kind: 'field_map',
+                        key: v.want,
+                        value: short[0].slice(0, 30)
+                      })
+                    } catch {}
+                  }
+                }
+              }
+            }
+          }
         } else if (vr.ok) {
           // 实际值与目标不一致：如实报告给模型，便于下一步自纠错
           const actual = (vr.value || '').slice(0, 30)
@@ -512,10 +708,21 @@ export class Executor {
             throw new Error(`图片地址无效: ${url.slice(0, 80)}`)
           }
         }
-        // 下载：http(s) 先走页签会话（带登录态 Cookie），失败或 data:/blob: 走全局 fetch
+        // 下载：http(s) 先走页签会话（带登录态 Cookie + Referer 防盗链），失败或 data:/blob: 走全局 fetch
         const buf = await this.downloadImage(url, wc, ctx)
-        const nat = nativeImage.createFromBuffer(buf)
-        if (nat.isEmpty()) throw new Error('图片解码失败（可能为 SVG 或不支持的格式），换一个图片链接试试')
+        let nat = nativeImage.createFromBuffer(buf)
+        if (nat.isEmpty()) {
+          // nativeImage 只解 PNG/JPEG：webp（淘宝主图常见 xxx.jpg_.webp）/gif/bmp 交给 Chromium 画布解码
+          try {
+            nat = nativeImage.createFromBuffer(await decodeImageToPng(buf))
+          } catch (e: any) {
+            throw new Error(
+              `图片解码失败: ${e?.message || e}。请在当前位置写「（图片获取失败）」占位并按顺序继续后续内容，全部完成后再统一重试失败项，不要回头改动已写内容`
+            )
+          }
+        }
+        if (nat.isEmpty())
+          throw new Error('图片解码失败。请在当前位置写「（图片获取失败）」占位并按顺序继续，不要回头改动已写内容')
         const size = nat.getSize()
         await Promise.race([
           clipboard.write([new ClipboardItem({ 'image/png': new Blob([new Uint8Array(nat.toPNG())], { type: 'image/png' }) })]),
@@ -533,15 +740,21 @@ export class Executor {
         const dir = a.direction || 'down'
         if (dir === 'top' || dir === 'bottom') {
           await t.cdp.evaluate(SCROLL_FN, [dir])
+          await this.sleep(rand(200, 500), ctx.signal) // R2 滚完停顿"看一眼"
         } else {
           const amount = Math.min(Math.max(a.amount || 3, 1), 10)
           const vh = 500
           const dy = (dir === 'down' ? 1 : -1) * amount * 350
-          // 分几次小滚轮，更像真人
-          for (let k = 0; k < amount; k++) {
-            if (ctx.signal.aborted) break
-            await t.cdp.mouseWheel(400, vh, 0, (dy / amount) | 0)
-            await this.sleep(120, ctx.signal)
+          // R2 拟人滚动：缓入缓出 + 随机抖动 + 末端轻微回弹（关闭 humanLike 时保持旧固定步长）
+          if (ctx.settings?.humanLike !== false) {
+            await t.cdp.scrollHuman(400, vh, dy)
+            await t.cdp.mouseWheel(400, vh, 0, -Math.round(rand(10, 30))) // 惯性回弹
+          } else {
+            for (let k = 0; k < amount; k++) {
+              if (ctx.signal.aborted) break
+              await t.cdp.mouseWheel(400, vh, 0, (dy / amount) | 0)
+              await this.sleep(120, ctx.signal)
+            }
           }
         }
         a.result = `滚动 ${dir}`
@@ -695,12 +908,16 @@ export class Executor {
           }
         }
         a.result = text.slice(0, 6200)
+        // R2 阅读停顿：真人读完才动——按内容长度追加 400-1500ms（humanLike 可关）
+        if (ctx.settings?.humanLike !== false) {
+          await this.sleep(Math.min(1500, 400 + a.result.length / 8), ctx.signal)
+        }
         return false
       }
       case 'extract_images': {
         const t = tm.active()
         if (!t) throw new Error('没有可用页签')
-        // 抓取页面图片资源链接（主图/详情图：img+srcset+懒加载属性+CSS背景图，按尺寸排序）
+        // 抓取页面图片资源链接（主图/详情图：DOM + 网络嗅探 Performance 资源合并，按尺寸排序）
         const r = await t.cdp.evaluate<string>(EXTRACT_IMAGES_FN, [40])
         a.result = (r || '').slice(0, 6200)
         return false
@@ -944,7 +1161,11 @@ export class Executor {
         const st = statSync(p)
         if (!st.isFile()) throw new Error(`不是文件: ${p}`)
         if (st.size > 50 * 1024 * 1024) throw new Error('文件超过 50MB 上限')
-        const [framePaths, path] = await this.pathsFor(t, a.index)
+        // 解析与路径同源（重定位后旧快照序号不可信，见 resolveIndex）
+        const rr = await this.resolveIndex(t, a.index)
+        if (!rr.found || !rr.cand) throw new Error(`元素[${a.index}]不存在`)
+        const framePaths = rr.cand.framePaths
+        const path = rr.cand.path
         const objectId = await t.cdp.evaluateRef(UPLOAD_FIND_FN, [framePaths, path])
         if (!objectId) throw new Error(`元素[${a.index}]未找到（应为 input[type=file]）`)
         // DOM 域命令需先 enable；requestNode 还要求 DOM agent 已拉取过文档（否则 nodeId=0）
@@ -969,6 +1190,12 @@ export class Executor {
         a.result = `已选择文件 ${p.split(/[\\/]/).pop()}（${Math.round(st.size / 1024)}KB）`
         return false
       }
+      case 'clarify': {
+        // S4 不确定时向人工提问：runner 在批前拦截（暂停任务+通知人工），这里只是
+        // 兜底 no-op（防 repeat 重放等边缘路径把未知动作抛错）
+        a.result = a.result || `已向人工提问: ${(a.query || '').slice(0, 60)}`
+        return false
+      }
       case 'test_step_done': {
         // 测试步骤完成标记（runner 通常在执行前拦截推进指针；这里兜底为无害 no-op，
         // 防 repeat 重放等边缘路径把未知动作抛错）
@@ -985,15 +1212,16 @@ export class Executor {
   }
 
   /** type / paste 系动作共用的「按编号解析元素 → trusted 点击聚焦」（带光标可视化） */
-  private async focusTarget(t: Tab, index: number, ctx: ExecContext): Promise<void> {
-    const r = await this.resolveIndex(t, index)
-    if (!r.found) throw new Error(`元素[${index}]已失效（页面可能已变化）`)
+  /** 聚焦已解析元素（trusted 点击聚焦）。调用方必须先 resolveIndex 并传入同一份
+   *  解析结果——再解析一次就多一次漂移机会，type 的赋值路径与聚焦点必须同源 */
+  private async focusResolved(t: Tab, r: Resolved, ctx: ExecContext): Promise<void> {
     await this.sleep(160, ctx.signal)
     if (this.overlay) {
       try {
         await this.overlay.moveTo(r.x!, r.y!)
       } catch {}
     }
+    await this.moveHuman(t, r.x!, r.y!, ctx)
     // 先点击聚焦（trusted mousedown 对站点脚本可见）
     await t.cdp.mouseClick(r.x! + rand(-2, 2), r.y! + rand(-2, 2))
     if (this.overlay) {
@@ -1002,6 +1230,12 @@ export class Executor {
       } catch {}
     }
     await this.sleep(220, ctx.signal)
+  }
+
+  private async focusTarget(t: Tab, index: number, ctx: ExecContext): Promise<void> {
+    const r = await this.resolveIndex(t, index)
+    if (!r.found) throw new Error(`元素[${index}]已失效（页面可能已变化）`)
+    await this.focusResolved(t, r, ctx)
   }
 
   /** 下载图片字节：http(s) 优先走页签会话（带站点登录态），失败或 data:/blob: 走全局 fetch；支持中断与 20s 超时 */
@@ -1016,16 +1250,25 @@ export class Executor {
       ctx.signal.removeEventListener('abort', onAbort)
     }
     try {
+      // Referer 用当前页面地址：alicdn 等图床有防盗链，缺 Referer 会 403
+      const referer = (() => {
+        try {
+          return wc.getURL()
+        } catch {
+          return ''
+        }
+      })()
+      const headers = referer ? { Referer: referer } : undefined
       if (/^https?:/i.test(url)) {
         try {
-          const r = await wc.session.fetch(url, { signal: ctl.signal } as any)
+          const r = await wc.session.fetch(url, { signal: ctl.signal, headers } as any)
           if (r.ok) {
             const buf = Buffer.from(await r.arrayBuffer())
             if (buf.length) return buf
           }
         } catch {}
       }
-      const r = await fetch(url, { signal: ctl.signal } as any)
+      const r = await fetch(url, { signal: ctl.signal, headers } as any)
       if (!r.ok) throw new Error(`下载失败 HTTP ${r.status}`)
       const buf = Buffer.from(await r.arrayBuffer())
       if (!buf.length) throw new Error('图片内容为空')
@@ -1036,11 +1279,6 @@ export class Executor {
   }
 
   /** type 动作用：按快照取元素的 framePaths/path */
-  private async pathsFor(t: Tab, index: number): Promise<[number[][], number[]]> {    const snap = this.snapshots.get(t.id)
-    if (!snap || index < 0 || index >= snap.candidates.length) throw new Error(`元素[${index}]不存在`)
-    const c = snap.candidates[index]
-    return [c.framePaths, c.path]
-  }
 
   /**
    * fill_form 单字段填充（与 type 动作同质量的管线，但按 paths 直达字段）：
@@ -1083,11 +1321,12 @@ export class Executor {
     const r = await t.cdp.evaluate<Resolved>(RESOLVE_FN, [f.framePaths, f.path, f.tag])
     if (!r.found || r.x == null || r.y == null) throw new Error(`字段「${label}」已失效${why}`)
     await this.sleep(140, ctx.signal)
+    await this.moveHuman(t, r.x, r.y, ctx)
     await t.cdp.mouseClick(r.x + rand(-2, 2), r.y + rand(-2, 2))
     await this.sleep(200, ctx.signal)
     await t.cdp.keySelectAll()
     await this.sleep(60, ctx.signal)
-    await t.cdp.insertText(value)
+    await this.typeHuman(t, value, ctx)
     await this.sleep(160, ctx.signal)
     const vr = await t.cdp
       .evaluate<{ ok: boolean; value?: string }>(READ_VALUE_FN, [f.framePaths, f.path])

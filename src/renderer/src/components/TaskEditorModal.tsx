@@ -1,40 +1,7 @@
-import { useEffect, useRef } from 'react'
+import { Check, PenLine, Sparkles, X } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import type { TaskTemplate } from '@shared/types'
 import { useModalFocus } from '../hooks/useDelayedUnmount'
-
-const TEMPLATES: { name: string; text: string }[] = [
-  {
-    name: '📋 跨页签搬运数据',
-    text: `在页签1：打开（网址或说明），读取以下数据：
-- 字段1：
-- 字段2：
-- 字段3：
-用 save 把每条数据存入任务记忆。
-
-然后 switch_tab 到页签2：在（目标页面说明）中，把记忆中的数据逐项填入对应输入框（长文本可用 {{记忆键}} 引用），填写完成后核对一遍再提交，并用 done 说明结果。`
-  },
-  {
-    name: '🔍 信息采集汇总',
-    text: `在当前页签浏览（列表/搜索结果说明），读取前 N 条的（字段1、字段2、字段3），整理成表格；
-内容不足时先 scroll 向下滚动再继续读取；
-完成后用 done 输出汇总表格。`
-  },
-  {
-    name: '📝 表单填写',
-    text: `在当前页面找到表单并逐项填写：
-字段A = 值
-字段B = 值
-字段C = {{记忆键}}
-填完先不要提交，用 done 说明每项的填写结果，等我确认。`
-  },
-  {
-    name: '🛒 下单/操作流程',
-    text: `在页签1完成以下流程：
-1. （第一步，如：搜索某商品并进入详情页）
-2. （第二步，如：选择规格数量加入购物车）
-3. （第三步）
-每一步完成后简述进展；遇到登录或验证码时说明并等待人工处理；最终用 done 报告结果。`
-  }
-]
 
 export default function TaskEditorModal(props: {
   /** 是否处于打开状态（用于焦点管理，退场由 App 的延迟卸载处理） */
@@ -46,17 +13,29 @@ export default function TaskEditorModal(props: {
   const ref = useRef<HTMLTextAreaElement>(null)
   const bodyRef = useRef<HTMLDivElement>(null)
   const { closing, requestClose, onBackdropClick } = useModalFocus(bodyRef, props.onClose, props.open)
+  // 任务模板库（与任务输入框共用一份；此处插入到文本末尾，{{字段:说明}} 留给用户自行填）
+  const [tplList, setTplList] = useState<TaskTemplate[]>([])
+  const [saveAs, setSaveAs] = useState<{ name: string; group: string } | null>(null)
+  const [enhancing, setEnhancing] = useState(false)
 
   useEffect(() => {
     ref.current?.focus()
     // 光标移到末尾
     const el = ref.current
     if (el) el.selectionStart = el.selectionEnd = el.value.length
+    window.easybow
+      .getTemplates()
+      .then(setTplList)
+      .catch(() => {})
   }, [])
 
-  const appendTemplate = (t: string) => {
+  const appendTemplate = async (t: TaskTemplate) => {
+    let text = t.text
+    try {
+      text = await window.easybow.resolveTemplateVars(t.text)
+    } catch {}
     const cur = props.task.trim()
-    props.setTask(cur ? cur + '\n\n' + t : t)
+    props.setTask(cur ? cur + '\n\n' + text : text)
     ref.current?.focus()
   }
 
@@ -74,22 +53,66 @@ export default function TaskEditorModal(props: {
         tabIndex={-1}
       >
         <div className="modal-head">
-          <h3>✏️ 任务描述（大编辑器）</h3>
+          <h3 className="with-ico"><PenLine size={16} strokeWidth={2} /> 任务描述（大编辑器）</h3>
           <button className="close-x" aria-label="关闭大编辑器" title="关闭（Esc）" onClick={requestClose}>
-            ✕
+            <X size={14} strokeWidth={2.5} />
           </button>
         </div>
 
         <div className="modal-body">
           <div className="form-row">
-            <label>任务模板（点击插入到末尾，按需修改）</label>
+            <label>
+              任务模板（点击插入到末尾，按需修改）
+              <span
+                className="ccimport-btn"
+                title="把当前文本存为任务模板（下次一键填充）"
+                onClick={() => setSaveAs({ name: props.task.trim().slice(0, 12) || '未命名模板', group: '' })}
+              >
+                ⭐ 存为模板
+              </span>
+            </label>
             <div className="presets">
-              {TEMPLATES.map((t) => (
-                <button key={t.name} className="preset" onClick={() => appendTemplate(t.text)}>
+              {tplList.map((t) => (
+                <button key={t.id} className="preset" title={t.text.slice(0, 200)} onClick={() => appendTemplate(t)}>
                   {t.name}
                 </button>
               ))}
+              {!tplList.length && <span className="field-hint no-top">暂无模板，可在下方写好任务后点「⭐ 存为模板」</span>}
             </div>
+            {saveAs && (
+              <div className="tpl-save-inline">
+                <input
+                  placeholder="模板名"
+                  value={saveAs.name}
+                  onChange={(e) => setSaveAs({ ...saveAs, name: e.target.value })}
+                />
+                <input
+                  placeholder="分组（可空）"
+                  value={saveAs.group}
+                  onChange={(e) => setSaveAs({ ...saveAs, group: e.target.value })}
+                />
+                <button
+                  className="btn mini primary"
+                  onClick={async () => {
+                    try {
+                      const list = await window.easybow.saveTemplate({
+                        name: saveAs.name || '未命名模板',
+                        group: saveAs.group,
+                        text: props.task,
+                        pinned: true
+                      })
+                      setTplList(list)
+                      setSaveAs(null)
+                    } catch {}
+                  }}
+                >
+                  保存
+                </button>
+                <button className="btn mini" onClick={() => setSaveAs(null)}>
+                  取消
+                </button>
+              </div>
+            )}
           </div>
 
           <textarea
@@ -116,11 +139,33 @@ export default function TaskEditorModal(props: {
           <span className="task-editor-count">
             {chars} 字 · {lines} 行
           </span>
+          <button
+            className="btn"
+            title="让 AI 把这段描述增强为清晰、结构化的任务指令（补步骤/字段/预期，保留原意）"
+            disabled={enhancing || !props.task.trim()}
+            onClick={async () => {
+              setEnhancing(true)
+              try {
+                props.setTask(await window.easybow.enhanceTask(props.task.trim()))
+              } catch {}
+              setEnhancing(false)
+            }}
+          >
+            {enhancing ? (
+              <>
+                <Sparkles size={12} strokeWidth={2} /> 增强中…
+              </>
+            ) : (
+              <>
+                <Sparkles size={12} strokeWidth={2} /> AI 增强
+              </>
+            )}
+          </button>
           <button className="btn" onClick={requestClose}>
             取消
           </button>
           <button className="btn primary" onClick={requestClose}>
-            ✓ 使用此任务（Ctrl+Enter）
+            <Check size={12} strokeWidth={2.5} /> 使用此任务（Ctrl+Enter）
           </button>
         </div>
       </div>

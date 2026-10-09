@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { CCSwitchProviderInfo, EasybowApi, KBEntry, MainEvent } from '@shared/types'
+import type { CCSwitchProviderInfo, EasybowApi, ExperienceEntry, KBEntry, MainEvent } from '@shared/types'
 
 const api: EasybowApi = {
   getSettings: () => ipcRenderer.invoke('settings:get'),
@@ -7,6 +7,13 @@ const api: EasybowApi = {
   listCCSwitchProviders: () => ipcRenderer.invoke('ccswitch:list'),
   getKB: () => ipcRenderer.invoke('kb:get'),
   setKB: (entries: KBEntry[]) => ipcRenderer.invoke('kb:set', entries),
+  getExperience: () => ipcRenderer.invoke('exp:get'),
+  setExperience: (entries: ExperienceEntry[]) => ipcRenderer.invoke('exp:set', entries),
+  // 任务模板（任务输入快速填充）
+  getTemplates: () => ipcRenderer.invoke('templates:get'),
+  saveTemplate: (t) => ipcRenderer.invoke('templates:save', t),
+  deleteTemplate: (id) => ipcRenderer.invoke('templates:delete', id),
+  resolveTemplateVars: (text) => ipcRenderer.invoke('templates:resolve', text),
   testConnection: () => ipcRenderer.invoke('llm:test'),
   newTab: (url) => ipcRenderer.invoke('tab:new', url),
   closeTab: (id) => ipcRenderer.invoke('tab:close', id),
@@ -19,6 +26,9 @@ const api: EasybowApi = {
   removeHistory: (url) => ipcRenderer.invoke('history:remove', url),
   clearHistory: () => ipcRenderer.invoke('history:clear'),
   startTask: (task) => ipcRenderer.invoke('agent:start', task),
+  enhanceTask: (task) => ipcRenderer.invoke('agent:enhanceTask', task),
+  approveNode: () => ipcRenderer.invoke('agent:approveNode'),
+  clearDisplay: () => ipcRenderer.invoke('agent:clearDisplay'),
   pauseTask: () => ipcRenderer.invoke('agent:pause'),
   resumeTask: () => ipcRenderer.invoke('agent:resume'),
   stopTask: () => ipcRenderer.invoke('agent:stop'),

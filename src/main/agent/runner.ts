@@ -4,6 +4,11 @@ import { Cdp } from '../cdp'
 import type { TabManager } from '../tabs'
 import { getSettings } from '../settings'
 import { matchKB } from '../knowledge'
+import { matchExperience, upsertExperience, feedbackExperience } from '../experience'
+import { Telemetry } from '../telemetry'
+import { diagnose, type Diagnosis } from '../diagnose'
+import { fetchAxTree, annotateWithAx } from '../axtree'
+import { scoreCandidate } from '../semantic'
 import {
   buildStepMessage,
   SYSTEM_PROMPT,
@@ -14,6 +19,8 @@ import {
   buildLocalPrompt,
   type TestScriptContext
 } from './prompts'
+import { PLAN_SYSTEM_PROMPT, parsePlan } from './plan'
+import { verifyNode, type Verdict } from './verify'
 import { createProvider, isVisionUnsupportedError, type ContentPart, type LlmProvider } from './llm'
 import { validateLocalActions, type FastLlm } from '../fastllm'
 import { ocrPageText } from '../ocr'
@@ -25,6 +32,8 @@ import type {
   AgentAction,
   AgentStatus,
   GuidanceMessage,
+  PlanNode,
+  PlanNodeState,
   Settings,
   StepRecord,
   MainEvent,
@@ -80,7 +89,7 @@ function assertionToAction(asrt: TestAssertion): AgentAction {
 }
 
 /** 宽松解析模型输出的 JSON（容忍 markdown 围栏、前后杂文） */
-function parseModelJson(text: string): { thought: string; actions: AgentAction[] } | null {
+function parseModelJson(text: string): { thought: string; actions: AgentAction[]; nodeDone?: boolean } | null {
   let t = text.trim()
   t = t.replace(/```(?:json)?/gi, '')
   const start = t.indexOf('{')
@@ -91,6 +100,8 @@ function parseModelJson(text: string): { thought: string; actions: AgentAction[]
     const obj = JSON.parse(slice)
     if (!obj || typeof obj !== 'object') return null
     const thought = String(obj.thought || '').slice(0, 300)
+    // 节点链模式：模型声明「当前节点的预期已达成」，触发系统复核
+    const nodeDone = obj.node_done === true || obj.nodeDone === true ? true : undefined
     let actions = Array.isArray(obj.actions) ? obj.actions : []
     actions = actions
       .filter((a: any) => a && typeof a.name === 'string')
@@ -117,9 +128,16 @@ function parseModelJson(text: string): { thought: string; actions: AgentAction[]
         result: a.result != null ? String(a.result) : undefined,
         // 视觉兜底：click_xy 的归一化坐标（0~1000）
         x: typeof a.x === 'number' ? a.x : undefined,
-        y: typeof a.y === 'number' ? a.y : undefined
+        y: typeof a.y === 'number' ? a.y : undefined,
+        // S4 多候选（系统语义裁决）+ 不确定度 + clarify 问题
+        candidates:
+          Array.isArray(a.candidates) && a.candidates.every((n: any) => typeof n === 'number')
+            ? a.candidates.slice(0, 5)
+            : undefined,
+        uncertain: typeof a.uncertain === 'number' ? a.uncertain : undefined,
+        query: a.query != null ? String(a.query).slice(0, 300) : undefined
       }))
-    return { thought, actions }
+    return { thought, actions, nodeDone }
   } catch {
     return null
   }
@@ -176,6 +194,37 @@ export class AgentRunner {
   private visionFallbackLeft = 0
   /** 连续定位失败次数（动作报「元素已失效/不可见」或页面无候选元素） */
   private locateFailStreak = 0
+  /** 节点链计划（复核模式；计划生成失败/复核关闭时为空 = 无节点链执行） */
+  private plan: PlanNode[] = []
+  /** 当前节点下标（0-based） */
+  private planIdx = 0
+  /** 每个节点的运行状态（UI 节点进度条） */
+  private nodeStatuses: PlanNodeState[] = []
+  /** 每个节点最近一次复核未通过的原因（UI 展示） */
+  private nodeReasons: (string | undefined)[] = []
+  /** 当前节点连续复核未通过次数（达阈值升级人工） */
+  private nodeFails = 0
+  /** 上一次复核未通过的原因（同样原因连续失败更快升级，避免盲目重试） */
+  private nodeLastFailReason = ''
+  /** done 被节点链拦下的次数（防死循环：拦 2 次后尊重模型判断收尾） */
+  private doneHeld = 0
+  /* —— v2.0 智能增强运行态 —— */
+  /** S0 任务级 trace 埋点 */
+  private telemetry = new Telemetry()
+  /** S2 上一步提取快照（URL 对比判定 page_changed） */
+  private prevExtract: ExtractResult | null = null
+  /** S2 同一动作名连续失败计数（loop 判定用） */
+  private failStreakName = ''
+  private failStreakCount = 0
+  /** S4 本任务 clarify 已用次数（上限 3，防滥用暂停） */
+  private clarifyCount = 0
+  /** S1 扩展提取已触发次数（每任务上限 3 次，防每步浪费） */
+  private boostTried = 0
+  /** R3 风控 warn 级连续次数（指数退避用） */
+  private frictionWarns = 0
+  /** S5 最近一次注入的人工指导（其后的批全成功 → 沉淀 lesson） */
+  private lastGuidanceText = ''
+  private lastFailureKind = ''
 
   constructor(tabManager: TabManager, executor: Executor, broadcast: Broadcast) {
     this.tabManager = tabManager
@@ -203,9 +252,26 @@ export class AgentRunner {
    */
   private async waitIfPaused(): Promise<boolean> {
     if (!this.pauseRequested) return true
+    // 暂停=人工接管：临时撤掉原生弹窗自动应答，让人工自己点出的 confirm/alert
+    // 正常弹出、由人工决定（否则人工点删除类操作的确认框会被系统瞬间吞掉）
+    const prevPolicy = Cdp.defaultDialogPolicy
+    Cdp.defaultDialogPolicy = null
+    for (const t of this.tabManager.all()) {
+      try {
+        t.cdp.setDialogPolicy(null)
+      } catch {}
+    }
     this.setState({ state: this.state.state === 'captcha' ? 'captcha' : 'paused', statusText: '已暂停，等待人工操作' })
     await new Promise<void>((resolve) => this.resumeWaiters.push(resolve))
     if (this.state.state === 'stopped') return false
+    // 恢复接管：先强应答人工可能遗留的未关弹窗（否则阻塞 evaluate 挂死任务），再恢复自动应答
+    Cdp.defaultDialogPolicy = prevPolicy
+    for (const t of this.tabManager.all()) {
+      try {
+        t.cdp.setDialogPolicy(prevPolicy)
+        if (prevPolicy) t.cdp.clearPendingDialog()
+      } catch {}
+    }
     // 用户可能已在暂停期间人工操作了页面（登录/验证/点进编辑态/直接代操作），
     // 唤醒后提示模型以最新页面状态为准，不要基于旧认知继续
     this.lastResults.push(
@@ -264,14 +330,34 @@ export class AgentRunner {
     if (!settings.apiKey) throw new Error('请先在「设置」中配置 AI 接口（baseURL / API Key / 模型）')
     const epoch = await this.beginRun()
 
+    // 新任务从干净界面开始：时间线/任务记忆等显示一并清空
+    this.broadcast({ channel: 'steps-clear' })
+
     const provider = createProvider(settings)
     this.steps = []
     this.lastResults = []
     this.pendingGuidance = []
     this.lastExecutedActions = []
     this.loginHintedHosts.clear()
+    this.plan = []
+    this.planIdx = 0
+    this.nodeStatuses = []
+    this.nodeReasons = []
+    this.nodeFails = 0
+    this.nodeLastFailReason = ''
+    this.doneHeld = 0
+    this.prevExtract = null
+    this.failStreakName = ''
+    this.failStreakCount = 0
+    this.clarifyCount = 0
+    this.boostTried = 0
+    this.frictionWarns = 0
+    this.lastGuidanceText = ''
+    this.lastFailureKind = ''
     this.abortCtrl = new AbortController()
     this.pauseRequested = false
+    // S0 trace 埋点（设置关闭时完全静默）
+    this.telemetry.start(task, settings.telemetry !== false)
     this.setState({
       state: 'running',
       task,
@@ -279,6 +365,7 @@ export class AgentRunner {
       statusText: '任务启动中',
       usage: { inputTokens: 0, outputTokens: 0, steps: 0 },
       memory: {},
+      plan: undefined,
       result: undefined
     })
     // 异步跑循环，startTask 立即返回
@@ -291,9 +378,14 @@ export class AgentRunner {
         if (epoch !== this.epoch) return // 已被新运行取代：异常归旧循环，不影响当前状态
         this.setState({ state: 'error', statusText: `任务异常: ${e?.message || e}` })
         this.broadcast({ channel: 'toast', message: `任务异常: ${e?.message || e}`, kind: 'error' })
+        // 经验负反馈（P1-12）：异常收尾也是「命中经验但没跑成」，相关经验降分才可被淘汰
+        try {
+          feedbackExperience(this.tabManager.active()?.url || '', task, false)
+        } catch {}
       })
       .finally(() => {
         if (this.loopActive === p) this.loopActive = null
+        this.telemetry.end({ state: this.state.state, steps: this.steps.length, tokens: this.state.usage })
         // 任务结束解除接管（测试运行有自己的脚本级策略，不经此路径）
         if (!this.testCtx) {
           Cdp.defaultDialogPolicy = null
@@ -305,6 +397,33 @@ export class AgentRunner {
         }
       })
     this.loopActive = p
+  }
+
+  /**
+   * 清空显示（任务终止/完成后手动触发）：时间线步骤、任务记忆、状态回到空闲。
+   * 仅空闲态可清（运行中拒绝）；不影响历史记录与经验库。
+   */
+  clearDisplay(): void {
+    if (this.state.state === 'running' || this.state.state === 'paused') {
+      throw new Error('任务进行中不能清空，请先停止任务')
+    }
+    this.steps = []
+    this.lastResults = []
+    this.plan = []
+    this.planIdx = 0
+    this.nodeStatuses = []
+    this.nodeReasons = []
+    this.setState({
+      state: 'idle',
+      task: '',
+      stepCount: 0,
+      statusText: '空闲',
+      usage: { inputTokens: 0, outputTokens: 0, steps: 0 },
+      memory: {},
+      plan: undefined,
+      result: undefined
+    })
+    this.broadcast({ channel: 'steps-clear' })
   }
 
   // ———————————————— 测试模式（feature/browser-test）————————————————
@@ -551,8 +670,17 @@ export class AgentRunner {
       this.loginHintedHosts.clear()
       this.visionFallbackLeft = 0
       this.locateFailStreak = 0
+      this.prevExtract = null
+      this.failStreakName = ''
+      this.failStreakCount = 0
+      this.clarifyCount = 0
+      this.boostTried = 0
+      this.frictionWarns = 0
+      this.lastGuidanceText = ''
+      this.lastFailureKind = ''
       this.abortCtrl = new AbortController()
       this.pauseRequested = false
+      this.telemetry.start(task, settings.telemetry !== false)
       this.setState({
         state: 'running',
         task,
@@ -586,6 +714,7 @@ export class AgentRunner {
           })
           .finally(() => {
             if (this.loopActive === p) this.loopActive = null
+            this.telemetry.end({ state: this.state.state, steps: this.steps.length, tokens: this.state.usage })
             if (this.testCtx && this.testCtx.epoch === epoch) this.finishTest(epoch)
             // 兜底：finishTest 未兑现（不应发生）也必须解锁序列
             const r = this.testDoneResolve
@@ -949,6 +1078,7 @@ export class AgentRunner {
     }
     const msg: GuidanceMessage = { ts: Date.now(), text: t, image: img }
     this.pendingGuidance.push(msg)
+    this.telemetry.log('human', this.steps.length + 1, { kind: 'guidance', text: t.slice(0, 100), withImage: !!img })
 
     // 时间线立即显示为用户气泡（指导也进 steps：历史压缩后模型仍能看到）
     const tab = this.tabManager.active()
@@ -992,13 +1122,269 @@ export class AgentRunner {
     }
   }
 
-  private async loop(
+  /** 节点链状态（UI 节点进度条渲染） */
+  private planStatus() {
+    return {
+      nodes: this.plan.map((n, i) => ({
+        intent: n.intent,
+        expected: n.expected,
+        status: this.nodeStatuses[i] || 'pending',
+        reason: this.nodeReasons[i],
+        fails: i === this.planIdx ? this.nodeFails : undefined
+      })),
+      current: Math.min(this.planIdx + 1, Math.max(this.plan.length, 1))
+    }
+  }
+
+  /**
+   * 人工批准当前节点通过（人工介入区按钮）：跳过其复核、视为预期已达成并推进到下一节点。
+   * 暂停中（如复核多次失败已升级人工）批准即自动继续执行。
+   */
+  approveNode(): void {
+    if (!this.plan.length || this.planIdx >= this.plan.length) {
+      throw new Error('没有待批准的节点（任务未在节点链模式或全部节点已通过）')
+    }
+    const idx = this.planIdx
+    const node = this.plan[idx]
+    this.nodeStatuses[idx] = 'passed'
+    this.nodeReasons[idx] = '人工批准通过（跳过复核）'
+    this.planIdx = Math.min(this.planIdx + 1, this.plan.length)
+    this.nodeFails = 0
+    this.nodeLastFailReason = ''
+    const next =
+      this.planIdx < this.plan.length
+        ? `继续执行节点${this.planIdx + 1}「${this.plan[this.planIdx].intent}」，预期: ${this.plan[this.planIdx].expected}。`
+        : '全部节点已完成。'
+    if (this.planIdx < this.plan.length) this.nodeStatuses[this.planIdx] = 'active'
+    this.lastResults.push(
+      `系统提示: 人工已批准节点${idx + 1}「${node.intent}」通过（跳过复核，视为预期已达成）。${next}`
+    )
+    this.setState({
+      plan: this.planStatus(),
+      statusText: `人工已批准节点${idx + 1}通过${this.planIdx < this.plan.length ? `，进入节点 ${this.planIdx + 1}` : '，全部节点完成'}`
+    })
+    // 批准即继续：复核升级人工导致的暂停一并恢复
+    if (this.pauseRequested) this.resumeTask()
+  }
+
+  /**
+   * 计划阶段：把任务分解为「意图 + 预期」的节点链（链式节点执行）。
+   * 失败自动重试一次；仍失败不阻塞任务——但必须显式告知（toast + 状态栏），
+   * 静默降级会表现为「没出现节点链还自动执行」，用户无从分辨是关了复核还是规划挂了。
+   */
+  private async buildPlan(task: string, provider: LlmProvider, epoch: number): Promise<void> {
+    let nodes: PlanNode[] | null = null
+    let lastErr = ''
+    for (let attempt = 0; attempt < 2 && !nodes; attempt++) {
+      try {
+        this.setState({ statusText: attempt === 0 ? '规划任务节点链…' : '节点链规划失败，重试…' })
+        const out = await provider.chat(
+          PLAN_SYSTEM_PROMPT,
+          [{ role: 'user', content: task.slice(0, 2000) }],
+          this.abortCtrl!.signal
+        )
+        if (epoch !== this.epoch) return
+        this.setState({
+          usage: {
+            ...this.state.usage,
+            inputTokens: this.state.usage.inputTokens + out.usage.inputTokens,
+            outputTokens: this.state.usage.outputTokens + out.usage.outputTokens
+          }
+        })
+        nodes = parsePlan(out.text)
+        if (!nodes) lastErr = '模型输出不是合法的节点 JSON'
+      } catch (e: any) {
+        // 用户停止/暂停打断的异常不算规划失败，直接让位给 checkpoint 处理
+        if (this.abortCtrl?.signal.aborted) return
+        lastErr = String(e?.message || e).slice(0, 80)
+      }
+    }
+    if (epoch !== this.epoch) return
+    if (!nodes || !nodes.length) {
+      this.broadcast({
+        channel: 'toast',
+        message: `节点链规划失败（${lastErr || '未知原因'}），本次退化为逐步执行、不做节点复核`,
+        kind: 'info'
+      })
+      this.setState({ statusText: `节点链规划失败（${lastErr || '未知原因'}），退化为逐步执行` })
+      return
+    }
+    this.plan = nodes
+    this.planIdx = 0
+    this.nodeStatuses = nodes.map((_, i) => (i === 0 ? 'active' : 'pending'))
+    this.nodeReasons = nodes.map(() => undefined)
+    this.setState({ plan: this.planStatus() })
+    this.broadcast({ channel: 'toast', message: `任务已分解为 ${nodes.length} 个节点，逐步复核执行`, kind: 'info' })
+  }
+
+  /**
+   * 节点复核结果处理：通过 → 推进节点；未通过 → 视觉优先自愈重试，同错/多次失败升级人工介入。
+   * 返回 true=当前节点已过（可推进/收尾），false=当前节点未过（不应收尾）。
+   */
+  private handleNodeVerdict(verdict: Verdict, stepN: number): boolean {
+    const idx = this.planIdx
+    const node = this.plan[idx]
+    const label = `节点${idx + 1}「${node.intent}」`
+    if (verdict.passed) {
+      this.nodeStatuses[idx] = 'passed'
+      this.nodeReasons[idx] = verdict.source === 'skip' ? `复核跳过（${verdict.reason}）` : undefined
+      this.planIdx = Math.min(this.planIdx + 1, this.plan.length)
+      this.nodeFails = 0
+      this.nodeLastFailReason = ''
+      if (this.planIdx < this.plan.length) {
+        this.nodeStatuses[this.planIdx] = 'active'
+        const next = this.plan[this.planIdx]
+        this.lastResults.push(
+          `系统提示: ${label}复核通过（${verdict.source}: ${verdict.reason}）。进入节点${this.planIdx + 1}「${next.intent}」，预期: ${next.expected}。本节点预期达成后在输出 JSON 里加 "node_done":true。`
+        )
+        this.setState({
+          plan: this.planStatus(),
+          statusText: `第 ${stepN} 步：${label} 复核通过，进入节点 ${this.planIdx + 1}`
+        })
+      } else {
+        this.lastResults.push(`系统提示: ${label}复核通过（${verdict.source}: ${verdict.reason}），全部节点已完成。`)
+        this.setState({ plan: this.planStatus(), statusText: `第 ${stepN} 步：${label} 复核通过，全部节点完成` })
+      }
+      return true
+    }
+    // —— 复核未通过：自愈重试（视觉优先） ——
+    this.nodeFails++
+    this.nodeReasons[idx] = verdict.reason
+    const sameReason = !!verdict.reason && verdict.reason === this.nodeLastFailReason
+    this.nodeLastFailReason = verdict.reason
+    if (this.nodeFails >= 3 || (sameReason && this.nodeFails >= 2)) {
+      // 同样的问题反复失败：不再盲目重试，升级人工介入
+      this.nodeStatuses[idx] = 'escalated'
+      this.setState({
+        plan: this.planStatus(),
+        state: 'paused',
+        statusText: `${label} 复核未通过：${verdict.reason}。请人工确认/指路，或批准本节点通过后点「继续」`
+      })
+      this.broadcast({
+        channel: 'toast',
+        message: `${label} 多次复核未通过：${verdict.reason}。已暂停等待人工介入（可在人工介入区批准本节点通过）`,
+        kind: 'captcha'
+      })
+      try {
+        this.tabManager.notifyHuman(`${label} 复核未通过`, `${verdict.reason}。请人工确认/修正后点击「继续」。`)
+      } catch {}
+      this.pauseRequested = true
+      this.nodeFails = 0
+      return false
+    }
+    this.nodeStatuses[idx] = 'failed'
+    // 自愈优先视觉判断：临时开启视觉兜底（截图 + 看图定位/坐标点击）
+    this.visionFallbackLeft = Math.max(this.visionFallbackLeft, 2)
+    this.lastResults.push(
+      `系统提示: ${label} 复核未通过（${verdict.reason}）。预期「${node.expected}」尚未达成：请重新检查最新页面并修正本节点（已临时开启视觉兜底，可结合截图看图定位）；预期达成前不要输出 node_done，也不要跳到后面的节点。`
+    )
+    this.setState({
+      plan: this.planStatus(),
+      statusText: `第 ${stepN} 步：${label} 复核未通过：${verdict.reason}，自愈重试（${this.nodeFails}/3）`
+    })
+    return false
+  }
+
+  /**
+   * S2 分类自愈策略：按诊断结果注入提示/开启兜底/升级人工。
+   * 每类只做一件事，互不越权；hint 直接进下一步提示词（模型可执行的人话）。
+   */
+  private async applyDiagnosis(
+    d: Diagnosis,
+    executed: AgentAction[],
+    extract: ExtractResult,
     task: string,
-    provider: LlmProvider,
-    settings: Pick<Settings, 'maxSteps' | 'maxElements' | 'vision' | 'visionFallback' | 'baseURL' | 'model' | 'aiMode'>,
-    epoch: number
+    stepN: number,
+    fallbackAllowed: boolean
   ): Promise<void> {
+    switch (d.kind) {
+      case 'locate': {
+        // 原 locateFailStreak 联动：连续定位失败 → 视觉兜底（截图看图定位）
+        this.locateFailStreak++
+        if (this.locateFailStreak >= 2 && fallbackAllowed && this.visionFallbackLeft === 0) {
+          this.visionFallbackLeft = 3
+          this.locateFailStreak = 0
+          this.lastResults.push(
+            '系统提示: 连续定位不到目标元素，已临时开启「视觉兜底」——接下来几步会附带页面截图，你可以直接用 {"name":"click_xy","x":500,"y":300} 按截图上的归一化坐标（0~1000）点击目标；能找到元素编号时仍优先用 click index。'
+          )
+          this.setState({ statusText: `第 ${stepN} 步：元素定位失败，已开启视觉兜底（截图定位）` })
+        }
+        this.lastResults.push(d.hint)
+        break
+      }
+      case 'semantic': {
+        // 重排提示：列出与任务最相关的 Top-5 候选，帮模型换对输入框
+        const top = extract.candidates
+          .map((c, i) => ({
+            i,
+            c,
+            s: scoreCandidate({ text: c.text, extra: c.extra, role: c.role, tag: c.tag }, task).score
+          }))
+          .sort((a, b) => b.s - a.s)
+          .slice(0, 5)
+        const list = top.map((t) => `[${t.i}] ${(t.c.text || t.c.extra || '').slice(0, 20)}(${Math.round(t.s * 100)}%)`).join(' ')
+        this.lastResults.push(`${d.hint} 与任务最相关的候选: ${list || '（无）'}`)
+        this.setState({ statusText: `第 ${stepN} 步：疑似填错字段，已提示改选语义匹配的输入框` })
+        break
+      }
+      case 'page_changed':
+      case 'data_missing':
+        this.lastResults.push(d.hint)
+        break
+      case 'loop': {
+        // 同一动作反复失败：不再盲目重试，升级人工介入
+        this.locateFailStreak = 0
+        this.failStreakCount = 0
+        this.setState({ state: 'paused', statusText: `动作反复失败已暂停：${d.hint}` })
+        this.broadcast({
+          channel: 'toast',
+          message: `动作「${executed[0]?.name || ''}」连续失败，已暂停等待人工介入`,
+          kind: 'captcha'
+        })
+        try {
+          this.tabManager.notifyHuman('动作反复失败', '同一操作连续失败 3 次以上，请人工确认/指路后点击「继续」。')
+        } catch {}
+        this.pauseRequested = true
+        break
+      }
+      default:
+        break
+    }
+  }
+
+  /** S2 步数耗尽的结构化诊断：卡点节点 + 最近失败类型 + 可执行建议 */
+  private exhaustedDiagnosis(maxSteps: number): string {
+    const lines: string[] = [`已达最大步数 ${maxSteps}，任务未完成。诊断:`]
+    if (this.plan.length && this.planIdx < this.plan.length) {
+      const node = this.plan[Math.min(this.planIdx, this.plan.length - 1)]
+      lines.push(`- 卡在节点${this.planIdx + 1}「${node.intent}」（预期: ${node.expected}）`)
+    }
+    // 最近 5 步的失败动作归因
+    const recent = this.steps.slice(-5).filter((s) => s.actions.some((a) => a.error))
+    if (recent.length) {
+      const kinds = recent
+        .map((s) => {
+          const bad = s.actions.find((a) => a.error)!
+          const kind = /疑似填错字段/.test(bad.error || '')
+            ? 'semantic（疑似填错字段）'
+            : /已失效|不可见|找不到|无法定位/.test(bad.error || '')
+              ? 'locate（定位失败）'
+              : '其他错误'
+          return `第${s.n}步 ${bad.name}: ${kind}`
+        })
+        .join('；')
+      lines.push(`- 最后 ${recent.length} 步持续失败：${kinds}`)
+    } else {
+      lines.push('- 最近步骤无显式失败（可能是原地打转或目标始终未达成）')
+    }
+    lines.push('- 建议：检查目标页面字段命名是否与任务描述一致（可在设置中开启/调整语义匹配）、补充该站点经验库，或把任务拆小后重试。')
+    lines.push('如需继续，可重新发起任务。')
+    return lines.join('\n')
+  }
+
+  private async loop(task: string, provider: LlmProvider, settings: Settings, epoch: number): Promise<void> {
     let consecutiveParseFail = 0
+    let planAttempted = false
     let skipCaptchaCheckOnce = false
     // 视觉模式：设置开启且该模型未被确认"不支持图片"；任务内降级标志（模型拒图后本任务不再发图）
     const visionKey = `${settings.baseURL}|${settings.model}`
@@ -1006,11 +1392,23 @@ export class AgentRunner {
     // 混合模式（本地快速决策）：失败后冷却若干步；本地推理过慢则本任务禁用
     let localCooldown = 0
     let localDisabled = false
+    // S6 语义初筛同样有任务级预算：本地小模型单次超预算（机器过慢）时本任务停用，
+    // 宁可多花云端 token 也不再每步空等一次慢推理（推理已在独立进程，这里只保时延）
+    let prescreenDisabled = false
 
     while (true) {
       // 暂停等待 / 停止判定（返回 false 则任务结束；epoch 失配=已被新运行取代）
       if (!(await this.checkpoint(epoch))) return
-      const signal = this.abortCtrl!.signal
+      // abort signal 一律在使用点实时读 this.abortCtrl!.signal——
+      // 暂停恢复会中途重建 controller，迭代开头的局部快照会变陈旧（已 abort），
+      // 导致后续模型调用/动作批被误中止白跑一轮（复核 P1-7）
+
+      // 0. 计划阶段（仅普通任务 + 复核模式开启）：任务分解为节点链；失败不阻塞，退化为无节点链执行
+      if (!this.testCtx && (settings.verifyMode || 'fast') !== 'off' && !planAttempted) {
+        planAttempted = true
+        await this.buildPlan(task, provider, epoch)
+        if (!(await this.checkpoint(epoch))) return
+      }
 
       // 模型步数（人工指导不算步数预算）；测试模式放宽（一个测试步骤可能消耗多个模型步）
       const stepN = this.steps.filter((s) => !s.userGuidance).length + 1
@@ -1018,10 +1416,18 @@ export class AgentRunner {
         ? Math.max(settings.maxSteps, this.testCtx.tc.steps.length * 8 + 6)
         : settings.maxSteps
       if (stepN > maxSteps) {
+        // S2 步数耗尽诊断化：不再一句"已达最大步数"，给出卡点与失败归因
+        this.telemetry.log('failure', stepN, { kind: 'exhausted', strategy: 'abort' })
+        this.telemetry.end({ state: 'exhausted', steps: this.steps.length, tokens: this.state.usage })
+        // 经验负反馈（P1-12）：命中本站经验却没跑成 → 相关经验降分，错误/陈旧经验可被淘汰
+        try {
+          feedbackExperience(this.tabManager.active()?.url || '', task, false)
+        } catch {}
+        const diagText = this.exhaustedDiagnosis(maxSteps)
         this.setState({
           state: 'done',
           statusText: `已达到最大步数 ${maxSteps}，任务结束`,
-          result: `已达最大步数 ${maxSteps}。如需继续，可重新发起任务。`
+          result: diagText
         })
         return
       }
@@ -1041,10 +1447,25 @@ export class AgentRunner {
 
       this.setState({ statusText: `第 ${stepN} 步：提取页面元素…` })
 
-      // 1. 提取当前页签元素
+      // 视觉开关提前判定：需要截图时与元素提取并行（省一次 CDP 串行往返）
+      const visionActive = settings.vision && !visionDegraded && !visionUnsupported.has(visionKey)
+      const fallbackAllowed = settings.visionFallback !== false && !visionDegraded && !visionUnsupported.has(visionKey)
+      const visionForced = fallbackAllowed && this.visionFallbackLeft > 0
+      if (this.visionFallbackLeft > 0) this.visionFallbackLeft--
+      const shotWanted = visionActive || visionForced
+
+      // 1. 提取当前页签元素（视觉模式与截图并行）。
+      //    S1：带 task 做语义重排（语义相关元素提前，重排在快照落盘前完成——编号即最终编号）
       let extract: ExtractResult
+      let visionShot: string | null = null
+      const wantSemantic = settings.semanticRecall !== false && !!task
       try {
-        extract = await this.executor.extract(tab)
+        const [ex, shot] = await Promise.all([
+          this.executor.extract(tab, { task: wantSemantic ? task : undefined }),
+          shotWanted ? tab.cdp.screenshotJpeg(70).catch(() => null) : Promise.resolve(null)
+        ])
+        extract = ex
+        visionShot = shot
         if (this.ocrEnhancer) {
           try {
             extract = await this.ocrEnhancer(extract, null)
@@ -1053,6 +1474,37 @@ export class AgentRunner {
       } catch (e: any) {
         throw new Error(`页面元素提取失败: ${e?.message || e}（页面可能在加载中，稍后重试）`)
       }
+
+      // S3 AX Tree 并联：浏览器引擎计算的 role/name 叠加进文本线索不足的候选（失败静默降级）
+      if (settings.axTree !== false) {
+        try {
+          const ax = await fetchAxTree(tab.cdp)
+          const axHits = annotateWithAx(extract, ax)
+          this.telemetry.log('extract', stepN, { ax: ax.length, axHits })
+        } catch {}
+      }
+
+      // S1 扩展提取：任务关键词一个都没命中且页面确实被截断 → 提高上限重提一次
+      if (
+        wantSemantic &&
+        settings.boostedExtract !== false &&
+        this.boostTried < 3 &&
+        extract.totalFound > extract.candidates.length &&
+        !this.executor.taskHitsCandidate(extract, task)
+      ) {
+        this.boostTried++
+        try {
+          extract = await this.executor.extractBoosted(tab, task, 160)
+          this.telemetry.log('extract', stepN, { boosted: true, candidates: extract.candidates.length })
+        } catch {}
+      }
+
+      this.telemetry.log('extract', stepN, {
+        candidates: extract.candidates.length,
+        totalFound: extract.totalFound,
+        truncated: extract.totalFound > extract.candidates.length // 关键指标：目标可能被截断
+      })
+      this.prevExtract = extract
 
       // DOM 提取稀疏 / 视觉兜底生效但模型看不了图 → OCR 整页识别兜底（图片型页面、Canvas 应用）
       const ocrWanted = extract.candidates.length < 3 || (this.visionFallbackLeft > 0 && (visionUnsupported.has(visionKey) || visionDegraded))
@@ -1066,7 +1518,7 @@ export class AgentRunner {
       }
       if (extract.candidates.length === 0) this.locateFailStreak++ // 一个元素都提不出来：定位困难
 
-      // 2. 验证码 / 登录检测
+      // 2. 验证码 / 登录检测 / 风控限流（block 级暂停交人工；warn 级指数退避放慢）
       if (!skipCaptchaCheckOnce) {
         try {
           const fr = await tab.cdp.evaluate<{
@@ -1074,12 +1526,14 @@ export class AgentRunner {
             hitSel: string[]
             textHit: boolean
             loginHint: boolean
+            warnHit: boolean
             url: string
           }>(DETECT_FRICTION_FN, [])
           const isCaptcha = fr.hitSel.length > 0 || fr.textHit || fr.urlHit
           if (isCaptcha) {
             skipCaptchaCheckOnce = true
             this.pauseRequested = true
+            this.telemetry.log('friction', stepN, { level: 'block', kind: 'captcha', hit: fr.hitSel[0] || fr.url.slice(0, 60) })
             this.setState({ state: 'captcha', statusText: '检测到验证码/安全验证，已暂停等待人工处理' })
             this.tabManager.notifyCaptcha(fr.hitSel[0] || fr.url.slice(0, 60) || '页面文本特征')
             // 记录一条提示性步骤
@@ -1087,6 +1541,19 @@ export class AgentRunner {
               { name: 'wait', result: '等待人工完成验证' }
             ], tab)
             continue
+          }
+          if (fr.warnHit) {
+            // R3-D2 指数退避：warn 级信号连续出现时逐步放慢（基础 1.5s ×2^n，上限 30s）
+            this.frictionWarns++
+            const backoff = Math.min(1500 * Math.pow(2, Math.min(this.frictionWarns, 5)), 30000)
+            this.telemetry.log('friction', stepN, { level: 'warn', kind: 'rate_limit', backoff, streak: this.frictionWarns })
+            this.lastResults.push(
+              `系统提示: 页面提示「操作过于频繁/稍后再试」（疑似限流）。已自动放慢节奏（退避 ${Math.round(backoff / 1000)}s），不要高频重试。`
+            )
+            await new Promise((r) => setTimeout(r, backoff))
+            if (!(await this.checkpoint(epoch))) return
+          } else if (this.frictionWarns > 0) {
+            this.frictionWarns = 0
           }
           if (fr.loginHint) {
             let host = ''
@@ -1103,19 +1570,22 @@ export class AgentRunner {
         skipCaptchaCheckOnce = false
       }
 
-      // 3. 组装提示词并调用模型（问题经验库按当前页域名匹配注入）
+      // 3. 组装提示词并调用模型（问题经验库 + S5 自动经验库按当前页域名匹配注入）
       const tabsInfo = this.tabManager.infoList()
-      // 视觉模式：调用模型前截一张较高质量的视口截图发给模型；截失败则本步静默走纯文本
-      const visionActive = settings.vision && !visionDegraded && !visionUnsupported.has(visionKey)
-      // 视觉兜底：元素列表定位不到目标时临时开几步「看图定位」（含坐标点击），
-      // 不必为了偶尔的疑难页面全程开着视觉模式烧 token
-      const fallbackAllowed = settings.visionFallback !== false && !visionDegraded && !visionUnsupported.has(visionKey)
-      const visionForced = fallbackAllowed && this.visionFallbackLeft > 0
-      if (this.visionFallbackLeft > 0) this.visionFallbackLeft--
       const kbTips = matchKB(tab.url).map((e) => ({ domain: e.domain, problem: e.problem, solution: e.solution }))
+      const expTips =
+        settings.autoExperience !== false && !this.testCtx ? matchExperience(tab.url, task) : []
       // 快照当前排队指导（调用成功前不出队：暂停中断重跑本步时指导不丢）
       const guidanceCount = this.pendingGuidance.length
       const guidance = this.pendingGuidance.slice(0, guidanceCount)
+      // S5 教训沉淀素材：记录本步注入的指导文本（其后的批全成功时写入 lesson）
+      if (guidance.length) {
+        this.lastGuidanceText = guidance
+          .map((g) => g.text)
+          .filter(Boolean)
+          .join('；')
+          .slice(0, 400)
+      }
       if (localCooldown > 0) localCooldown--
 
       // 3.5 混合模式：本地快速决策直出简单步骤（严格门控 + 契约校验；失败/不确定立即回退云端）
@@ -1128,6 +1598,7 @@ export class AgentRunner {
         !visionActive && // 视觉信息本地小模型看不到
         guidance.length === 0 && // 人工指导/经验库是高优先指令，必须云端处理
         kbTips.length === 0 &&
+        expTips.length === 0 &&
         stepN > 1 && // 首步由云端建立任务理解
         this.fastllm?.isReady() &&
         this.localGateOk(extract)
@@ -1175,14 +1646,42 @@ export class AgentRunner {
         }
         this.setState({ statusText: `第 ${stepN} 步：⚡本地快速决策（${Math.round(this.fastllm!.genMs)}ms，未走云端）` })
       } else {
-        let visionShot: string | null = null
-        if (visionActive || visionForced) {
+        // 视觉截图已在元素提取时并行取得；截失败则本步静默走纯文本
+        useVision = (visionActive || visionForced) && !!visionShot
+        // S6 本地语义初筛：候选过多时让本地小模型挑 Top-K（语义分 Top-3 强制保留防筛掉目标；
+        // 编号保持原始编号——快照解析不受影响；初筛失败自动全量，绝不丢元素）
+        let keepIdx: number[] | undefined
+        if (settings.prescreen !== false && !prescreenDisabled && extract.candidates.length > 20) {
           try {
-            visionShot = await tab.cdp.screenshotJpeg(70)
+            const picked = await this.fastllm?.prescreen(
+              extract.candidates.map((c) => `${c.role} ${c.text} ${c.extra}`),
+              task,
+              12
+            )
+            if ((this.fastllm?.genMs || 0) > 8000) {
+              prescreenDisabled = true
+              this.telemetry.log('extract', stepN, { prescreenOff: true, genMs: this.fastllm?.genMs })
+            }
+            if (picked?.length) {
+              const top3: number[] = []
+              for (let i = 0; i < extract.candidates.length && top3.length < 3; i++) {
+                const s = scoreCandidate(
+                  {
+                    text: extract.candidates[i].text,
+                    extra: extract.candidates[i].extra,
+                    role: extract.candidates[i].role,
+                    tag: extract.candidates[i].tag
+                  },
+                  task
+                ).score
+                if (s >= 0.5) top3.push(i)
+              }
+              keepIdx = [...new Set([...picked.filter((i) => i < extract.candidates.length), ...top3])]
+            }
           } catch {}
         }
-        useVision = (visionActive || visionForced) && !!visionShot
-        const elementLines = this.executor.formatForPrompt(extract, settings.maxElements, useVision)
+        const elementLines = this.executor.formatForPrompt(extract, settings.maxElements, useVision, keepIdx)
+        this.telemetry.log('extract', stepN, { prescreened: keepIdx?.length || extract.candidates.length })
         const userMsg = buildStepMessage({
           task,
           tabs: tabsInfo,
@@ -1196,6 +1695,8 @@ export class AgentRunner {
           guidance,
           vision: useVision,
           kbTips,
+          expTips: expTips.length ? expTips : undefined,
+          plan: !this.testCtx && this.plan.length ? { nodes: this.plan, current: this.planIdx + 1 } : undefined,
           test: this.testCtx ? this.buildTestScriptContext() : undefined
         })
         this.lastResults = []
@@ -1224,11 +1725,11 @@ export class AgentRunner {
           (this.testCtx ? TEST_MODE_ADDON : '')
 
         try {
-          llmOut = await provider.chat(systemPrompt, [{ role: 'user', content }], signal)
+          llmOut = await provider.chat(systemPrompt, [{ role: 'user', content }], this.abortCtrl!.signal)
         } catch (e: any) {
           const hasImage = Array.isArray(content)
           // 视觉模式下模型拒图（纯文本模型遇到 image 块）：降级并重跑本步（会话内记住，后续任务不再发图）
-          if (hasImage && useVision && !signal.aborted && isVisionUnsupportedError(e)) {
+          if (hasImage && useVision && !this.abortCtrl!.signal.aborted && isVisionUnsupportedError(e)) {
             visionUnsupported.add(visionKey)
             visionDegraded = true
             const ds = this.recordStep(
@@ -1241,20 +1742,20 @@ export class AgentRunner {
             continue
           }
           // 模型不支持图片（纯文本模型遇到 image 块常直接报错）：去掉截图重试一次
-          if (hasImage && !signal.aborted) {
+          if (hasImage && !this.abortCtrl!.signal.aborted) {
             try {
               visionRetryUsed = true
-              llmOut = await provider.chat(systemPrompt, [{ role: 'user', content: userMsg }], signal)
+              llmOut = await provider.chat(systemPrompt, [{ role: 'user', content: userMsg }], this.abortCtrl!.signal)
               if (useVision) visionDegraded = true // 保险：未命中启发式的拒图也按降级处理
               this.lastResults.push('系统提示: 当前模型不支持图片输入，截图已被忽略，请仅依据文字与元素列表执行。')
             } catch (e2: any) {
-              if (signal.aborted) {
+              if (this.abortCtrl!.signal.aborted) {
                 if (!(await this.checkpoint())) return
                 continue
               }
               throw new Error(`模型调用失败: ${e2?.message || e2}`)
             }
-          } else if (signal.aborted) {
+          } else if (this.abortCtrl!.signal.aborted) {
             // 暂停中断：等待恢复后重跑本步；停止则结束
             if (!(await this.checkpoint())) return
             continue
@@ -1262,7 +1763,7 @@ export class AgentRunner {
             throw new Error(`模型调用失败: ${e?.message || e}`)
           }
         }
-        if (signal.aborted) {
+        if (this.abortCtrl!.signal.aborted) {
           if (!(await this.checkpoint())) return
           continue
         }
@@ -1272,6 +1773,12 @@ export class AgentRunner {
         this.pendingGuidance.splice(0, guidanceCount)
         this.setState({ statusText: `第 ${stepN} 步：模型思考中…` })
       }
+      this.telemetry.log('llm_call', stepN, {
+        local: localUsed,
+        vision: useVision,
+        input: llmOut.usage.inputTokens,
+        output: llmOut.usage.outputTokens
+      })
 
       const usage = {
         inputTokens: this.state.usage.inputTokens + llmOut.usage.inputTokens,
@@ -1311,6 +1818,66 @@ export class AgentRunner {
         continue
       }
 
+      // 4.5 S4 clarify：模型不确定、向人工提问 → 暂停等人工（每任务上限 3 次，超出转提示自行判断）
+      const clarifyAction = parsed.actions.find((a) => a.name === 'clarify')
+      if (clarifyAction) {
+        const q = (clarifyAction.query || clarifyAction.text || '').slice(0, 300) || '模型不确定目标，请指路'
+        parsed.actions = parsed.actions.filter((a) => a.name !== 'clarify')
+        this.clarifyCount++
+        if (!this.testCtx && this.clarifyCount <= 3) {
+          this.telemetry.log('human', stepN, { kind: 'clarify', query: q.slice(0, 100) })
+          this.recordStep(stepN, `不确定，向人工提问：${q}`, [{ name: 'clarify', result: '已暂停等待人工回复' }], tab, {
+            input: llmOut.usage.inputTokens,
+            output: llmOut.usage.outputTokens
+          })
+          this.lastResults.push(
+            `系统提示: 已把你的问题转给人工：${q}。人工回复（人工指导）后点「继续」，或直接批准节点；回复内容会在下一步注入。`
+          )
+          this.setState({ state: 'paused', statusText: `AI 提问等待人工：${q.slice(0, 40)}` })
+          this.broadcast({ channel: 'toast', message: `AI 需要确认：${q.slice(0, 80)}`, kind: 'captcha' })
+          try {
+            this.tabManager.notifyHuman('AI 请求确认', q)
+          } catch {}
+          this.pauseRequested = true
+          continue
+        }
+        this.lastResults.push('系统提示: clarify 次数已达上限（或测试模式不允许），请基于元素列表与语义匹配提示自行选择最可能的选项继续。')
+        if (!parsed.actions.length) parsed.actions.push({ name: 'wait', seconds: 2 })
+      }
+
+      // 4.6 S4 多候选裁决：模型给出 candidates 数组时按语义分自动定夺（比模型硬选更准）
+      if (settings.multiCandidate !== false) {
+        for (const a of parsed.actions) {
+          if (!Array.isArray(a.candidates) || !a.candidates.length || a.index != null) continue
+          const scored = a.candidates
+            .filter((i) => Number.isInteger(i) && i >= 0 && i < extract.candidates.length)
+            .map((i) => ({
+              i,
+              s: scoreCandidate(
+                {
+                  text: extract.candidates[i].text,
+                  extra: extract.candidates[i].extra,
+                  role: extract.candidates[i].role,
+                  tag: extract.candidates[i].tag
+                },
+                task
+              ).score
+            }))
+            .sort((x, y) => y.s - x.s)
+          if (scored.length && scored[0].s >= 0.6) {
+            const from = a.candidates!.length
+            a.index = scored[0].i
+            a.candidates = undefined
+            this.lastResults.push(
+              `系统裁决: 从 ${from} 个候选中为 ${a.name} 选定 [${scored[0].i}]（相似度 ${Math.round(scored[0].s * 100)}%）`
+            )
+          } else {
+            a.candidates = undefined
+            a.error = '多候选均不匹配（语义相似度不足），请重新观察页面元素列表'
+          }
+        }
+      }
+
       // 5. 执行动作批（测试模式：test_step_done 是控制信号，进执行器前剥离；protectedSubmit 透传生产保护）
       this.setState({ statusText: `第 ${stepN} 步：执行 ${parsed.actions.length} 个动作…`, usage })
       const stepDoneSignal = !!this.testCtx && parsed.actions.some((x) => x.name === 'test_step_done')
@@ -1318,8 +1885,10 @@ export class AgentRunner {
         this.testCtx ? parsed.actions.filter((x) => x.name !== 'test_step_done') : parsed.actions,
         {
           memory: this.state.memory,
-          signal,
+          signal: this.abortCtrl!.signal,
           settings: getSettings(),
+          task: this.testCtx ? undefined : task,
+          url: tab.url,
           prevActions: this.lastExecutedActions,
           protectedSubmit: this.testCtx?.protectedSubmit,
           // 测试模式专属执行开关（普通任务恒缺省，executor 分支不进入）
@@ -1335,23 +1904,54 @@ export class AgentRunner {
         .filter((a) => a.name !== 'done' && a.name !== 'expect' && a.name !== 'test_step_done')
         .map(({ result: _r, error: _e, ...rest }) => rest)
 
-      // 视觉兜底触发：连续定位失败（元素失效/不可见/页面提不出元素）→ 接下来 3 步带截图让模型看图定位
-      const locateFail = executed.some(
-        (a) => !!a.error && /已失效|不可见|找不到|无法定位|没有可点击|超出范围/.test(a.error)
-      )
-      if (locateFail) this.locateFailStreak++
-      else if (!locateFail && executed.some((a) => !a.error)) this.locateFailStreak = 0
-      if (this.locateFailStreak >= 2 && fallbackAllowed && this.visionFallbackLeft === 0) {
-        this.visionFallbackLeft = 3
-        this.locateFailStreak = 0
-        this.lastResults.push(
-          '系统提示: 连续定位不到目标元素，已临时开启「视觉兜底」——接下来几步会附带页面截图，你可以直接用 {"name":"click_xy","x":500,"y":300} 按截图上的归一化坐标（0~1000）点击目标；能找到元素编号时仍优先用 click index。'
+      // S2 失败分类学：先维护「同一动作连续失败」计数（loop 判定），再七类归因→分类自愈
+      const failNames = executed.filter((a) => a.error).map((a) => a.name)
+      if (failNames.length) {
+        this.lastFailureKind = 'action_error'
+        if (failNames[0] === this.failStreakName) this.failStreakCount++
+        else {
+          this.failStreakName = failNames[0]
+          this.failStreakCount = 1
+        }
+      } else {
+        this.failStreakName = ''
+        this.failStreakCount = 0
+      }
+      if (settings.diagnose !== false && executed.some((a) => a.error)) {
+        const d = diagnose({
+          actions: executed,
+          extract,
+          prevExtract: this.prevExtract || undefined,
+          sameActionStreak: this.failStreakCount,
+          stepNo: stepN,
+          maxSteps
+        })
+        if (d) {
+          this.lastFailureKind = d.kind
+          this.telemetry.log('failure', stepN, {
+            kind: d.kind,
+            strategy: d.strategy,
+            action: failNames[0],
+            error: executed.find((a) => a.error)?.error?.slice(0, 80)
+          })
+          await this.applyDiagnosis(d, executed, extract, task, stepN, fallbackAllowed)
+        }
+      } else {
+        // 诊断关闭：保留原有的定位失败→视觉兜底联动
+        const locateFail = executed.some(
+          (a) => !!a.error && /已失效|不可见|找不到|无法定位|没有可点击|超出范围/.test(a.error)
         )
-        this.setState({ statusText: `第 ${stepN} 步：元素定位失败，已开启视觉兜底（截图定位）` })
+        if (locateFail) this.locateFailStreak++
+        else if (executed.some((a) => !a.error)) this.locateFailStreak = 0
+        if (this.locateFailStreak >= 2 && fallbackAllowed && this.visionFallbackLeft === 0) {
+          this.visionFallbackLeft = 3
+          this.locateFailStreak = 0
+        }
       }
 
-      // 收集动作结果供下一步（read_content / extract_images 等大文本）
+      // 收集动作结果供下一步（read_content / extract_images 等大文本）+ S0 动作埋点
       for (const a of executed) {
+        this.telemetry.log('action', stepN, { name: a.name, ok: !a.error, error: a.error?.slice(0, 80) })
         if (a.error) this.lastResults.push(`动作 ${a.name} 出错: ${a.error}`)
         else if (
           a.result &&
@@ -1362,6 +1962,31 @@ export class AgentRunner {
             a.name === 'paste_rich')
         )
           this.lastResults.push(`[${a.name}] ${a.result}`)
+      }
+
+      // S5 经验沉淀 B：上一批注入过人工指导、且本批全部成功 → 人工的纠正是宝贵教训
+      if (
+        settings.autoExperience !== false &&
+        !this.testCtx &&
+        this.lastGuidanceText &&
+        executed.length &&
+        !executed.some((a) => a.error)
+      ) {
+        try {
+          let host = ''
+          try {
+            host = new URL(tab.url).host
+          } catch {}
+          upsertExperience({
+            domain: host,
+            kind: 'lesson',
+            key: this.lastFailureKind || '人工纠正',
+            value: `用户指导（${this.lastFailureKind || '纠正'}后成功）: ${this.lastGuidanceText.slice(0, 200)}`
+          })
+        } catch {}
+        this.lastGuidanceText = ''
+      } else if (!executed.some((a) => a.error)) {
+        this.lastGuidanceText = ''
       }
 
       // 原生弹窗自动应答反馈（普通/测试任务统一）：文案告知模型，下一步可判断是否补救
@@ -1392,7 +2017,60 @@ export class AgentRunner {
       // 测试模式：断言收集 / 步骤推进 / fail-fast（返回 false 结束循环，收尾统一走 finishTest）
       if (this.testCtx && !(await this.handleTestPostBatch(executed, stepDoneSignal))) return
 
+      // 6.5 节点链复核（普通任务）：模型声明 node_done 或输出 done 时，用节点「预期」复核本节点；
+      //     未通过 → 视觉优先自愈重试（不推进、不收尾），连续失败/同错复发升级人工介入
+      let nodeGateOpen = true
+      if (!this.testCtx && this.plan.length && this.planIdx < this.plan.length && (parsed.nodeDone || doneAction)) {
+        this.setState({ statusText: `第 ${stepN} 步：复核节点 ${this.planIdx + 1} 预期…` })
+        const verdict = await verifyNode({
+          node: this.plan[this.planIdx],
+          cdp: tab.cdp,
+          // 复核在动作执行后进行：URL/标题用页签实时值（extract 是本步开始时的旧快照）
+          extract: { ...extract, url: tab.url || extract.url, title: tab.title || extract.title },
+          settings,
+          provider,
+          fastllm: this.fastllm,
+          lastResults: this.lastResults,
+          memory: this.state.memory
+        })
+        nodeGateOpen = this.handleNodeVerdict(verdict, stepN)
+      }
+
+      // done 与节点链仲裁：声称完成但节点链未走完 → 拦下继续推进（最多拦 2 次，之后尊重模型判断收尾）
+      if (doneAction && !this.testCtx && this.plan.length && (!nodeGateOpen || this.planIdx < this.plan.length)) {
+        this.doneHeld++
+        if (this.doneHeld <= 2) {
+          const left = this.plan.length - this.planIdx
+          const cur = this.plan[Math.min(this.planIdx, this.plan.length - 1)]
+          this.lastResults.push(
+            nodeGateOpen
+              ? `系统提示: 你输出了 done，但节点链还有 ${left} 个节点未完成（当前节点${this.planIdx + 1}「${cur.intent}」预期: ${cur.expected}）。请先推进当前节点；若剩余节点确实无需执行，请在下一步说明理由后再次输出 done。`
+              : `系统提示: 你输出了 done，但当前节点${this.planIdx + 1}「${cur.intent}」复核未通过（预期: ${cur.expected}）。请先把当前节点做对再收尾。`
+          )
+          continue
+        }
+      }
+
       if (doneAction) {
+        this.telemetry.end({ state: 'success', steps: this.steps.length, tokens: this.state.usage })
+        // S5 经验沉淀 C：任务成功 → 成功路径（同站点同类任务下次直接参考）+ 命中经验加分
+        if (settings.autoExperience !== false && !this.testCtx) {
+          try {
+            let host = ''
+            try {
+              host = new URL(tab.url).host
+            } catch {}
+            if (this.plan.length) {
+              upsertExperience({
+                domain: host,
+                kind: 'path',
+                key: task.slice(0, 16),
+                value: this.plan.map((n) => n.intent).join(' → ').slice(0, 300)
+              })
+            }
+            feedbackExperience(tab.url, task, true)
+          } catch {}
+        }
         this.setState({
           state: 'done',
           statusText: '任务完成',
@@ -1421,11 +2099,17 @@ export class AgentRunner {
       tabTitle: tab.title,
       url: tab.url,
       title: '',
+      nodeIdx: this.plan.length && !this.testCtx ? Math.min(this.planIdx + 1, this.plan.length) : undefined,
       tokens,
       screenshot,
       ts: Date.now()
     }
     this.steps.push(step)
+    // 时间线截图内存上限：只保留最近 40 步的截图（每张 JPEG 数百 KB，长任务全量保留会拖高
+    // 主进程内存）；带动作出错的步保留——测试报告的失败步骤截图靠倒查时间线取用
+    const keep = 40
+    const stale = this.steps.length > keep ? this.steps[this.steps.length - keep - 1] : null
+    if (stale?.screenshot && !stale.actions.some((a) => a.error)) stale.screenshot = undefined
     this.setState({ stepCount: this.steps.length })
     return step
   }

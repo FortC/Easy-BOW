@@ -1,5 +1,6 @@
+import { Settings as SettingsIcon, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
-import { DEFAULT_SETTINGS, type CCSwitchProviderInfo, type FastLlmState, type Protocol, type Settings } from '@shared/types'
+import { DEFAULT_SETTINGS, type CCSwitchProviderInfo, type ExperienceEntry, type FastLlmState, type Protocol, type Settings } from '@shared/types'
 import { useModalFocus } from '../hooks/useDelayedUnmount'
 
 const PRESETS: { name: string; provider: Protocol; baseURL: string; model: string }[] = [
@@ -30,13 +31,33 @@ export default function SettingsModal(props: {
   const [fast, setFast] = useState<FastLlmState | null>(null)
   const [fastBusy, setFastBusy] = useState(false)
   const [version, setVersion] = useState('')
+  // S5 自动经验库（AI 自动沉淀；可查看/删除）
+  const [expList, setExpList] = useState<ExperienceEntry[] | null>(null)
   const bodyRef = useRef<HTMLDivElement>(null)
   // 点遮罩不关闭（避免误触丢失正在编辑的配置），但 Esc 关闭并做焦点管理
   const { closing, requestClose, onBackdropClick } = useModalFocus(bodyRef, props.onClose, props.open !== false)
 
   useEffect(() => {
     window.easybow.appVersion().then(setVersion).catch(() => {})
+    window.easybow.getExperience().then(setExpList).catch(() => setExpList([]))
   }, [])
+
+  /** 删除一条自动经验（S5 风险缓解：错误经验固化时 UI 可删） */
+  const removeExp = async (id: number) => {
+    if (!expList) return
+    const next = expList.filter((e) => e.id !== id)
+    setExpList(next)
+    try {
+      await window.easybow.setExperience(next)
+    } catch {}
+  }
+
+  const clearExp = async () => {
+    setExpList([])
+    try {
+      await window.easybow.setExperience([])
+    } catch {}
+  }
 
   useEffect(() => {
     let alive = true
@@ -135,9 +156,9 @@ export default function SettingsModal(props: {
         tabIndex={-1}
       >
         <div className="modal-head">
-          <h3>⚙ 设置 — AI 接口</h3>
+          <h3 className="with-ico"><SettingsIcon size={16} strokeWidth={2} /> 设置 — AI 接口</h3>
           <button className="close-x" aria-label="关闭设置" title="关闭（Esc）" onClick={requestClose}>
-            ✕
+            <X size={14} strokeWidth={2.5} />
           </button>
         </div>
 
@@ -261,6 +282,22 @@ export default function SettingsModal(props: {
           <div className="field-hint">只在「元素失效/不可见/页面提不出元素」连着发生时触发，连点 3 步后自动回到常规模式；模型不支持图片时改用本地 OCR 文字兜底</div>
         </div>
 
+        <div className="form-row">
+          <label>节点复核模式（任务分解为节点链，每节点按「预期」复核，未通过自动修正重试）</label>
+          <select
+            value={s.verifyMode || 'fast'}
+            onChange={(e) => set({ verifyMode: e.target.value as 'off' | 'fast' | 'strict' })}
+          >
+            <option value="fast">快速（默认：本地信号 + 本地快速决策模型复核，0 额外 token）</option>
+            <option value="strict">严格（加云端大模型终审，更准但每个节点多一次小调用）</option>
+            <option value="off">关闭（不分解节点、不复核，逐步执行）</option>
+          </select>
+          <div className="field-hint">
+            复核顺序：页面文字/URL/选择器本地判定 → 本地快速决策模型 →（严格模式）云端大模型；未通过时自动开启视觉看图修正并重试（最多 3
+            次），多次失败暂停等人工介入
+          </div>
+        </div>
+
         <div className="form-inline">
           <div className="form-row">
             <label>单任务最大步数（{s.maxSteps}）</label>
@@ -300,9 +337,147 @@ export default function SettingsModal(props: {
             </select>
           </div>
           <div className="form-row">
+            <label>关闭窗口时</label>
+            <select
+              value={s.closeAction || 'ask'}
+              onChange={(e) => set({ closeAction: e.target.value as 'ask' | 'tray' | 'exit' })}
+            >
+              <option value="ask">每次询问（默认：问最小化到托盘还是退出）</option>
+              <option value="tray">最小化到托盘（AI 任务继续跑，托盘图标可回到窗口）</option>
+              <option value="exit">直接退出程序</option>
+            </select>
+          </div>
+          <div className="form-row">
             <label>主页</label>
             <input value={s.homepage} onChange={(e) => set({ homepage: e.target.value.trim() })} />
           </div>
+        </div>
+
+        <div className="form-row">
+          <label>🧠 智能增强（v2.0：语义匹配 / 失败自愈 / 经验沉淀；出问题时可逐项关闭回滚）</label>
+          <div className="field-hint">
+            语义重排把与任务相关的元素提前（商品名称≈品名）；填后校验把「值填对但字段填错」显式报错；
+            失败自愈按七类失败归因并注入修正提示；AX 树给自定义控件补浏览器引擎语义；拟人化操作逐字符输入+曲线移动鼠标
+          </div>
+        </div>
+        <div className="form-inline">
+          <div className="form-row">
+            <label>语义重排</label>
+            <select value={s.semanticRecall === false ? '0' : '1'} onChange={(e) => set({ semanticRecall: e.target.value === '1' })}>
+              <option value="1">开启（默认）</option>
+              <option value="0">关闭</option>
+            </select>
+          </div>
+          <div className="form-row">
+            <label>填后语义校验</label>
+            <select value={s.semanticVerify === false ? '0' : '1'} onChange={(e) => set({ semanticVerify: e.target.value === '1' })}>
+              <option value="1">开启（默认）</option>
+              <option value="0">关闭</option>
+            </select>
+          </div>
+          <div className="form-row">
+            <label>扩展提取</label>
+            <select value={s.boostedExtract === false ? '0' : '1'} onChange={(e) => set({ boostedExtract: e.target.value === '1' })}>
+              <option value="1">开启（默认）</option>
+              <option value="0">关闭</option>
+            </select>
+          </div>
+        </div>
+        <div className="form-inline">
+          <div className="form-row">
+            <label>失败自愈诊断</label>
+            <select value={s.diagnose === false ? '0' : '1'} onChange={(e) => set({ diagnose: e.target.value === '1' })}>
+              <option value="1">开启（默认）</option>
+              <option value="0">关闭</option>
+            </select>
+          </div>
+          <div className="form-row">
+            <label>多候选裁决</label>
+            <select value={s.multiCandidate === false ? '0' : '1'} onChange={(e) => set({ multiCandidate: e.target.value === '1' })}>
+              <option value="1">开启（默认）</option>
+              <option value="0">关闭</option>
+            </select>
+          </div>
+          <div className="form-row">
+            <label>AX 树感知</label>
+            <select value={s.axTree === false ? '0' : '1'} onChange={(e) => set({ axTree: e.target.value === '1' })}>
+              <option value="1">开启（默认）</option>
+              <option value="0">关闭</option>
+            </select>
+          </div>
+        </div>
+        <div className="form-inline">
+          <div className="form-row">
+            <label>经验自动沉淀</label>
+            <select value={s.autoExperience === false ? '0' : '1'} onChange={(e) => set({ autoExperience: e.target.value === '1' })}>
+              <option value="1">开启（默认）</option>
+              <option value="0">关闭</option>
+            </select>
+          </div>
+          <div className="form-row">
+            <label>本地语义初筛</label>
+            <select value={s.prescreen === false ? '0' : '1'} onChange={(e) => set({ prescreen: e.target.value === '1' })}>
+              <option value="1">开启（默认）</option>
+              <option value="0">关闭</option>
+            </select>
+          </div>
+          <div className="form-row">
+            <label>拟人化操作</label>
+            <select value={s.humanLike === false ? '0' : '1'} onChange={(e) => set({ humanLike: e.target.value === '1' })}>
+              <option value="1">开启（默认：逐字符输入/曲线鼠标）</option>
+              <option value="0">关闭（瞬时操作，最快）</option>
+            </select>
+          </div>
+        </div>
+        <div className="form-inline">
+          <div className="form-row">
+            <label>运行埋点（trace）</label>
+            <select value={s.telemetry === false ? '0' : '1'} onChange={(e) => set({ telemetry: e.target.value === '1' })}>
+              <option value="1">开启（默认：本地 jsonl，不发任何数据）</option>
+              <option value="0">关闭</option>
+            </select>
+          </div>
+          <div className="form-row">
+            <label>持久化会话</label>
+            <select
+              value={s.persistSession === false ? '0' : '1'}
+              onChange={(e) => set({ persistSession: e.target.value === '1' })}
+            >
+              <option value="1">开启（默认：登录态跨启动保留）</option>
+              <option value="0">关闭（每次启动全新会话）</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="form-row">
+          <label>
+            自动经验库（AI 任务中自动沉淀的站点字段映射/教训/成功路径，注入提示词加速二次执行）
+            {expList && expList.length > 0 && (
+              <span className="ccimport-btn" style={{ marginLeft: 8 }} onClick={clearExp}>
+                清空
+              </span>
+            )}
+          </label>
+          {expList === null ? (
+            <div className="field-hint">读取中…</div>
+          ) : expList.length === 0 ? (
+            <div className="field-hint">暂无自动经验——跑几个任务后，AI 会把「商品名称→实际字段名」这类对应关系自动记下来</div>
+          ) : (
+            <div className="ccimport-list">
+              {expList.slice(0, 12).map((e) => (
+                <div key={e.id} className="ccimport-item" title={e.value}>
+                  <span className="ccimport-tag">{e.kind === 'field_map' ? '字段映射' : e.kind === 'lesson' ? '教训' : '路径'}</span>
+                  <span className="ccimport-name">{e.domain || '全局'}</span>
+                  <span className="ccimport-meta">
+                    {e.key.slice(0, 16)} → {e.value.slice(0, 40)}（验证 {e.score} 次{e.enabled ? '' : '，已停用'}）
+                  </span>
+                  <span className="ccimport-tag" onClick={() => removeExp(e.id)} title="删除这条经验">
+                    <X size={11} strokeWidth={2.5} />
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {testResult && <div className={`test-result ${testResult.ok ? 'ok' : 'bad'}`}>{testResult.message}</div>}

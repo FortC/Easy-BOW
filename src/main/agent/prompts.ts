@@ -1,5 +1,6 @@
-import type { AgentAction, GuidanceMessage, StepRecord, TabInfo } from '@shared/types'
+import type { AgentAction, GuidanceMessage, PlanNode, StepRecord, TabInfo } from '@shared/types'
 import type { ExtractResult as FullExtractResult } from '../extractor'
+import { renderPlanBlock } from './plan'
 
 export const SYSTEM_PROMPT = `你是 EasyBow，一个浏览器自动化助手。你通过「编号元素列表」观察网页，输出 JSON 动作序列来操作真实浏览器，完成用户任务。
 
@@ -18,12 +19,13 @@ export const SYSTEM_PROMPT = `你是 EasyBow，一个浏览器自动化助手。
 - {"name":"back"} / {"name":"forward"}
 - {"name":"wait","seconds":1-15}
 - {"name":"read_content"}   读取当前页正文与表格（Markdown），结果在下一步反馈给你
-- {"name":"extract_images"}   抓取当前页的图片资源链接（img/srcset/懒加载/背景图，按尺寸排序），结果在下一步反馈。需要商品主图、详情图、图片素材时必须用这个抓原始资源链接，禁止用截图代替
+- {"name":"extract_images"}   抓取当前页的图片资源链接（仿图片助手插件：DOM+网络嗅探合并，覆盖 img/srcset/懒加载/背景图/XHR 动态加载的图，按真实尺寸排序），结果在下一步反馈。需要商品主图、详情图、图片素材时必须用这个抓原始资源链接，禁止用截图代替。哪张是主图、哪些是详情图/规格图由你按尺寸、alt、URL 特征判断对应关系（列表头有判读提示）
 - {"name":"save","key":"记忆键","value":"要跨页签保存的数据"}   保存到任务记忆（不受历史压缩影响）
 - {"name":"recall","key":"记忆键"}   查看记忆内容
 - {"name":"new_tab","url":"可选"}
 - {"name":"switch_tab","index":页签序号1-5}
 - {"name":"close_tab","index":页签序号1-5}
+- {"name":"clarify","query":"要问用户的问题"}   不确定时向用户提问：任务会暂停等待人工回复（每任务最多 3 次），问题里带上最像的候选编号与文字
 - {"name":"done","result":"任务最终结果说明"}   任务真正完成时使用，必须放最后
 
 ## 规则
@@ -39,7 +41,11 @@ export const SYSTEM_PROMPT = `你是 EasyBow，一个浏览器自动化助手。
 10. 在线文档/富文本编辑器（腾讯文档 docs.qq.com、飞书、语雀、Notion 等）：这类页面默认处于预览态，必须先 click 正文/画布区域（通常在页面中央的大块区域）进入编辑态（出现光标、工具栏变化），下一步才能 type 输入。若元素列表里找不到输入框，不要盲目滚动找，先点击文档正文区域试试；用户人工点进正文后，直接对当前光标位置 type 即可
 11. 「用户指导」区块是用户暂停期间亲自给出的指示（可含截图指路），优先级最高，必须严格遵守；用户点击「继续」后页面可能已被人工改动，以最新元素列表为准，不要重复用户已完成的操作
 12. 写文档（腾讯文档/飞书/语雀/Notion/Word online 等）：目标是空白或新建文档时，默认用 paste_rich 写排版良好的内容——开头 # 大标题与一段概览、## 分小节、要点用列表、关键数据 **加粗**，不要用 type 倾倒无格式的长文本（用户明确要求纯文本除外）。需要插图时：先 extract_images 拿图片链接，再在正文相应位置 paste_image 嵌入（可在图前用 type 写一句图注）。注意：type 会先清空目标内容，可能覆盖已有文档；追加/补充内容一律用 paste_rich（光标处粘贴，不动已有内容）。在线文档处于预览态时先 click 正文进入编辑态（见规则10）
-13. 页面弹出的浏览器原生确认框（confirm/alert/prompt，不在元素列表里）由系统自动确认，其文案会出现在下一步的「上一步动作结果」中：据此判断刚才的操作是否达到预期，若该确认并非任务期望（如误触删除），如实说明并纠正；页面内的 DOM 弹窗/遮罩（自定义 Modal/对话框）是普通元素，其按钮就在元素列表里，直接按编号点击即可`
+13. 页面弹出的浏览器原生确认框（confirm/alert/prompt，不在元素列表里）由系统自动确认，其文案会出现在下一步的「上一步动作结果」中：据此判断刚才的操作是否达到预期，若该确认并非任务期望（如误触删除），如实说明并纠正；页面内的 DOM 弹窗/遮罩（自定义 Modal/对话框）是普通元素，其按钮就在元素列表里，直接按编号点击即可
+14. 批量填表/写文档必须按 1、2、3…顺序逐段完成：一段写完、核对好，再写下一段，禁止回头在已写内容前面/中间补插文字；某个字段数据获取失败（如图片打不开、内容读不到）时，在该位置写「（xx获取失败）」占位后继续后续字段，全部完成后再统一重试失败项；禁止因单项失败反复回头改动，导致整体内容错乱
+15. 不确定时不要硬选：列表里没有把握的目标时，输出 {"name":"clarify","query":"你指的是哪个字段？候选：[3]xx [7]xx [12]xx"}，禁止猜一个凑数（clarify 会暂停任务等人工回复）
+16. 多候选优先：能缩小到 2-3 个但无法定夺时，输出 "candidates":[3,7,12]（与 click/type 同用、不填 index），系统会结合语义相似度自动裁决，比你硬选更准
+17. 元素列表末尾的「语义匹配提示」段列出了与任务描述语义相关的元素（含同义词与相似度）：字段名与任务用词不一致时（如任务说"商品名称"而页面叫"品名"）优先从中选择；提示只是参考，仍要结合 role 与页面实际语义确认`
 
 /** 视觉模式追加段（开启时拼在 SYSTEM_PROMPT 后；关闭时提示词与上面逐字节一致） */
 export const VISION_ADDON = `
@@ -66,6 +72,19 @@ export const VISION_FALLBACK_ADDON = `
 3. 目标不在当前视口时先 scroll，再在下一步的截图上定位点击
 4. 坐标点击后必须看下一步的结果确认是否点中；没点中则按新截图修正坐标重试
 5. thought 简短，不要描述截图内容`
+
+/**
+ * 任务描述增强器（✨ AI 增强按钮）：把用户的粗糙描述增强为清晰、具体的任务指令。
+ * 只做「格式 + 内容」增强，不启动任务；输出纯文本任务描述。
+ */
+export const ENHANCE_SYSTEM_PROMPT = `你是浏览器自动化任务的「任务描述增强器」。用户给你一段粗糙的任务描述，你把它增强为清晰、具体、可直接交给浏览器自动化 AI 执行的任务指令。
+要求：
+1. 保留用户原意与全部关键信息（网址、账号、字段名、数值、数量、时间等），禁止虚构用户没提到的具体数据
+2. 结构化表达：多步骤用 1. 2. 3. 编号；数据字段用列表；关键要求（如"不要提交""等我确认""只要前3条"）显式写出
+3. 补全执行必需的细节：明确在哪个页签/页面操作、读取哪些字段、数据存任务记忆还是直接填写、完成后用 done 说明什么结果
+4. 可合理补充通用约束：遇登录/验证码等待人工处理、失败如实报告、填写后核对
+5. 只输出增强后的任务描述纯文本；禁止解释、禁止 markdown 代码块、禁止"增强后："之类前后缀
+6. 长度控制在原文 1~3 倍，禁止注水`
 
 /**
  * 测试模式追加段（仅测试运行时拼在 SYSTEM_PROMPT 后；普通任务永不出现，非测试提示词逐字节不变）。
@@ -137,6 +156,10 @@ export interface StepContext {
   vision?: boolean
   /** 问题经验库：用户积累的站点处理经验（当前页匹配项），优先级高于模型直觉 */
   kbTips: { domain: string; problem: string; solution: string }[]
+  /** S5 自动经验库：AI 此前任务自动沉淀的经验行（当前页+任务匹配项），优先级高于模型直觉 */
+  expTips?: string[]
+  /** 节点链计划（普通任务复核模式；缺省时提示词与无计划模式逐字节一致） */
+  plan?: { nodes: PlanNode[]; current: number }
   /** 测试模式：测试脚本上下文（仅测试运行时存在；缺省时提示词与普通任务逐字节一致） */
   test?: TestScriptContext
 }
@@ -197,7 +220,11 @@ function summarizeActions(actions: AgentAction[]): string {
     .join(',')
 }
 
-/** 构造每步的 user 消息（无状态、含压缩历史，token 可控） */
+/**
+ * 构造每步的 user 消息（无状态、含压缩历史，token 可控）。
+ * 段落顺序=「稳定前缀在前（任务/记忆/经验库/历史），易变内容在后（页签/页面/元素/上一步）」：
+ * 让 OpenAI/DeepSeek 自动前缀缓存与 Anthropic 缓存尽量命中，多步任务输入 token 显著变便宜、首字更快。
+ */
 export function buildStepMessage(ctx: StepContext): string {
   const parts: string[] = []
 
@@ -205,6 +232,50 @@ export function buildStepMessage(ctx: StepContext): string {
 
   // 测试模式：任务下方紧跟测试脚本区块（普通任务 ctx.test 缺省，本区块不拼入，输出逐字节不变）
   if (ctx.test) parts.push(renderTestBlock(ctx.test))
+
+  // —— 稳定区（跨步基本不变，前缀缓存命中区） ——
+
+  const memKeys = Object.entries(ctx.memory)
+  if (memKeys.length) {
+    const memLines = memKeys
+      .slice(0, 20)
+      .map(([k, v]) => {
+        const preview = v.length > 40 ? v.slice(0, 40) + `…(共${v.length}字,用{{${k}}}引用)` : v
+        return `${k}=${preview}`
+      })
+      .join('\n')
+    parts.push(`# 任务记忆（跨页签保持）\n${memLines}${memKeys.length > 20 ? `\n…共${memKeys.length}条` : ''}`)
+  }
+
+  if (ctx.kbTips?.length) {
+    const tips = ctx.kbTips
+      .slice(0, 8)
+      .map((t) => `- ${t.domain ? `[${t.domain}] ` : ''}${t.problem ? t.problem + '：' : ''}${t.solution}`)
+      .join('\n')
+      .slice(0, 1800)
+    parts.push(`# 问题经验库（用户积累的正确处理方式，遇到对应场景必须按此执行，优先级高于你的判断）\n${tips}`)
+  }
+
+  // S5 自动经验库：AI 自己踩坑沉淀的经验（同站点/同字段意图命中时注入）
+  if (ctx.expTips?.length) {
+    parts.push(`# 历史经验（此前任务自动积累，优先级高于你的判断）\n${ctx.expTips.slice(0, 6).join('\n').slice(0, 1200)}`)
+  }
+
+  // 历史压缩：全部步骤一行摘要（只追加不改写，前缀缓存友好；用户指导单独标记，避免被当成模型自己的动作）
+  if (ctx.steps.length) {
+    const hist = ctx.steps
+      .map((s) => {
+        if (s.userGuidance) {
+          return `第${s.n}步: 👤用户指导「${s.thought.slice(0, 60)}」${s.screenshot ? '（含截图）' : ''}`
+        }
+        const errs = s.actions.filter((a) => a.error).length
+        return `第${s.n}步: ${s.thought.slice(0, 40)}（${summarizeActions(s.actions)}${errs ? ` ⚠${errs}个动作出错` : ''}）`
+      })
+      .join('\n')
+    parts.push(`# 已执行步骤（摘要）\n${hist}`)
+  }
+
+  // —— 易变区（每步都不同，放在后面以保护前缀缓存） ——
 
   const activeIdx = ctx.tabs.findIndex((t) => t.id === ctx.activeTabId)
   const tabLines = ctx.tabs
@@ -225,36 +296,6 @@ export function buildStepMessage(ctx: StepContext): string {
       : `# 可交互元素（编号仅对当前页签有效）\n${ctx.elementLines}`
   )
 
-  // 用户人工指导：放在元素列表后、紧跟任务的高优位置
-  if (ctx.guidance?.length) {
-    const lines = ctx.guidance
-      .slice(0, 5)
-      .map((g) => `- 用户说：${g.text || '（见截图）'}${g.image ? '（用户提供了截图指路，图片附在本消息末尾，请看图理解要点哪个区域）' : ''}`)
-      .join('\n')
-    parts.push(`# 用户指导（用户暂停期间亲自给出，优先级最高，必须严格遵守）\n${lines}`)
-  }
-
-  if (ctx.kbTips?.length) {
-    const tips = ctx.kbTips
-      .slice(0, 8)
-      .map((t) => `- ${t.domain ? `[${t.domain}] ` : ''}${t.problem ? t.problem + '：' : ''}${t.solution}`)
-      .join('\n')
-      .slice(0, 1800)
-    parts.push(`# 问题经验库（用户积累的正确处理方式，遇到对应场景必须按此执行，优先级高于你的判断）\n${tips}`)
-  }
-
-  const memKeys = Object.entries(ctx.memory)
-  if (memKeys.length) {
-    const memLines = memKeys
-      .slice(0, 20)
-      .map(([k, v]) => {
-        const preview = v.length > 40 ? v.slice(0, 40) + `…(共${v.length}字,用{{${k}}}引用)` : v
-        return `${k}=${preview}`
-      })
-      .join('\n')
-    parts.push(`# 任务记忆（跨页签保持）\n${memLines}${memKeys.length > 20 ? `\n…共${memKeys.length}条` : ''}`)
-  }
-
   if (ctx.lastResults.length) {
     const r = ctx.lastResults
       .map((s) => s.slice(0, 3000))
@@ -263,20 +304,22 @@ export function buildStepMessage(ctx: StepContext): string {
     parts.push(`# 上一步动作结果\n${r}`)
   }
 
-  // 历史压缩：全部步骤一行摘要（用户指导单独标记，避免被当成模型自己的动作）
-  if (ctx.steps.length) {
-    const hist = ctx.steps
-      .map((s) => {
-        if (s.userGuidance) {
-          return `第${s.n}步: 👤用户指导「${s.thought.slice(0, 60)}」${s.screenshot ? '（含截图）' : ''}`
-        }
-        const errs = s.actions.filter((a) => a.error).length
-        return `第${s.n}步: ${s.thought.slice(0, 40)}（${summarizeActions(s.actions)}${errs ? ` ⚠${errs}个动作出错` : ''}）`
-      })
+  // 用户人工指导：放在消息末尾的高优位置（模型对末尾内容注意力最强）
+  if (ctx.guidance?.length) {
+    const lines = ctx.guidance
+      .slice(0, 5)
+      .map((g) => `- 用户说：${g.text || '（见截图）'}${g.image ? '（用户提供了截图指路，图片附在本消息末尾，请看图理解要点哪个区域）' : ''}`)
       .join('\n')
-    parts.push(`# 已执行步骤（摘要）\n${hist}`)
+    parts.push(`# 用户指导（用户暂停期间亲自给出，优先级最高，必须严格遵守）\n${lines}`)
   }
 
-  parts.push(`# 下一步\n输出 JSON（thought + 最多5个动作）：`)
+  // 节点链进度（复核模式；仅普通任务且计划生成成功时拼入）
+  if (ctx.plan?.nodes?.length) parts.push(renderPlanBlock(ctx.plan.nodes, ctx.plan.current))
+
+  parts.push(
+    ctx.plan?.nodes?.length
+      ? `# 下一步\n输出 JSON（thought + 最多5个动作；当前节点预期达成时加 "node_done":true）：`
+      : `# 下一步\n输出 JSON（thought + 最多5个动作）：`
+  )
   return parts.join('\n\n')
 }

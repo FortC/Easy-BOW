@@ -33,14 +33,22 @@ const PATCHED = `        await fs.rm(dir, { recursive: true, force: true });
             }
         }`
 
-let src = readFileSync(FILE, 'utf8')
+let src = ''
+try {
+  src = readFileSync(FILE, 'utf8')
+} catch (e) {
+  console.warn('[easybow] 警告: 未找到 app-builder-lib/out/util/electronGet.js（electron-builder 未安装或目录结构已变?），补丁跳过')
+  process.exit(0)
+}
 if (src.includes('EASYBOW-PATCH')) {
   console.log('electronGet 补丁已存在，跳过')
   process.exit(0)
 }
 if (!src.includes(ORIGINAL)) {
-  console.error('electronGet.js 中未找到目标片段（electron-builder 版本可能已变），补丁未写入')
-  process.exit(1)
+  // 不再 exit(1) 阻断 npm install（复核 P1-6）：缺补丁的后果只是打包时 rename 偶发
+  // EPERM 需要重跑 dist，不致命
+  console.warn('[easybow] 警告: electronGet.js 未找到目标片段（electron-builder 版本已变?），EPERM 重试补丁未写入')
+  process.exit(0)
 }
 src = src.replace(ORIGINAL, PATCHED)
 writeFileSync(FILE, src, 'utf8')

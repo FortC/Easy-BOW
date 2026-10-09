@@ -6,7 +6,8 @@
  */
 import { app } from 'electron'
 import { join } from 'path'
-import { readFileSync, writeFileSync } from 'fs'
+import { readFileSync } from 'fs'
+import { writeJsonAtomic } from './fsutil'
 import type { MainEvent, Schedule } from '@shared/types'
 
 type Broadcast = (ev: MainEvent) => void
@@ -73,7 +74,7 @@ export class Scheduler {
 
   private persist(): void {
     try {
-      writeFileSync(this.file, JSON.stringify(this.schedules, null, 2))
+      writeJsonAtomic(this.file, this.schedules)
     } catch {}
     this.broadcast({ channel: 'schedules', schedules: this.schedules })
   }

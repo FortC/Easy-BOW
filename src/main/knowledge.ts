@@ -1,5 +1,6 @@
 import { app } from 'electron'
-import { readFileSync, writeFileSync, existsSync } from 'fs'
+import { readFileSync, existsSync } from 'fs'
+import { writeJsonAtomic } from './fsutil'
 import { join } from 'path'
 import type { KBEntry } from '@shared/types'
 
@@ -57,7 +58,7 @@ export function setKB(entries: KBEntry[]): KBEntry[] {
 
 function save(): void {
   try {
-    writeFileSync(kbPath(), JSON.stringify(cached || [], null, 2), 'utf-8')
+    writeJsonAtomic(kbPath(), cached || [])
   } catch (e) {
     console.error('[easybow] 保存经验库失败:', e)
   }

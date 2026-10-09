@@ -258,22 +258,25 @@
     var out = await detSession.run(feeds)
     var prob = out[detSession.outputNames[0]].data
     var boxes = detBoxes(prob, dt.rw, dt.rh, dt.ratio, img.w, img.h)
-    var lines = []
+    // {y, text} 成对承载：空识别的框直接不参与行合并——
+    // 此前 lines 只在非空时 push、合并却按 boxes 下标取，任一框识别为空后
+    // 文本与 y 全部错位，整页 OCR 顺序/分行错乱（复核报告 P0-2）
+    var items = []
     for (var i = 0; i < Math.min(boxes.length, 120); i++) {
       var b = boxes[i]
       var crop = cropRgba(img, b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0)
       var t = await recText(crop)
-      if (t) lines.push(t)
+      if (t) items.push({ y: (b.y0 + b.y1) / 2, text: t })
     }
     // 按 y 合并成行
     var merged = []
     var lastY = -99
-    for (var k = 0; k < Math.min(boxes.length, lines.length); k++) {
-      var y = Math.round((boxes[k].y0 + boxes[k].y1) / 2)
+    for (var k = 0; k < items.length; k++) {
+      var y = Math.round(items[k].y)
       if (Math.abs(y - lastY) <= 8 && merged.length) {
-        merged[merged.length - 1] += ' ' + lines[k]
+        merged[merged.length - 1] += ' ' + items[k].text
       } else {
-        merged.push(lines[k])
+        merged.push(items[k].text)
         lastY = y
       }
     }

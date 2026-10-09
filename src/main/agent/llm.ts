@@ -108,7 +108,8 @@ export class AnthropicProvider implements LlmProvider {
     const res = await this.client.messages.create(
       {
         model: this.model,
-        system,
+        // 系统提示词逐字不变 → 打提示词缓存标记：多步任务每步命中缓存（费用约 1/10、首字更快）
+        system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
         messages: messages.map((m) => ({ role: m.role, content: toAnthropicContent(m.content) })),
         max_tokens: 2048,
         temperature: 0.2

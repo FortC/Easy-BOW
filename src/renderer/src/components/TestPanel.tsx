@@ -1,3 +1,5 @@
+import { Check, CircleCheck, CircleX, FlaskConical, Hourglass, LoaderCircle, Play, Square, X } from 'lucide-react'
+import type { ReactNode } from 'react'
 import { useEffect, useRef, useState } from 'react'
 import type { MainEvent, TestCaseEntry, TestEnv, TestRunStatus } from '@shared/types'
 import { useModalFocus } from '../hooks/useDelayedUnmount'
@@ -27,20 +29,20 @@ function loadDraft(): { reqMd: string; caseMd: string } {
   }
 }
 
-const STEP_ICON: Record<string, string> = {
-  pending: '⏳',
-  running: '🔄',
-  passed: '✅',
-  failed: '❌',
-  skipped: '⏭️'
+const STEP_ICON: Record<string, ReactNode> = {
+  pending: <Hourglass size={13} strokeWidth={2} />,
+  running: <LoaderCircle size={13} strokeWidth={2} className="spin" />,
+  passed: <CircleCheck size={13} strokeWidth={2} />,
+  failed: <CircleX size={13} strokeWidth={2} />,
+  skipped: <Square size={13} strokeWidth={2} />
 }
 
 const RUN_VERDICT: Record<string, { text: string; cls: string }> = {
   running: { text: '执行中', cls: 'run-running' },
-  passed: { text: '✅ 全部通过', cls: 'run-passed' },
-  failed: { text: '❌ 存在失败', cls: 'run-failed' },
-  error: { text: '⚠️ 运行异常', cls: 'run-failed' },
-  stopped: { text: '⏹️ 已停止', cls: 'run-stopped' }
+  passed: { text: '全部通过', cls: 'run-passed' },
+  failed: { text: '存在失败', cls: 'run-failed' },
+  error: { text: '运行异常', cls: 'run-failed' },
+  stopped: { text: '已停止', cls: 'run-stopped' }
 }
 
 /** 浏览器仿真测试面板：需求 MD → 测试用例 MD → 运行 → 报告（+用例库/失败重跑/定时回归入口） */
@@ -201,7 +203,7 @@ export default function TestPanel(props: {
         props.onToast('测试状态已自动重置（主进程已不在执行）', 'info')
       }
     }, 5000)
-    return () => window.clearTimeout(t)
+    return () => window.clearInterval(t)
   }, [run?.state, agentLive, props.onToast])
 
   const refreshReports = () =>
@@ -418,7 +420,7 @@ export default function TestPanel(props: {
         aria-label="展开测试面板"
         onClick={() => props.onCollapsedChange(false)}
       >
-        <span className="test-fab-icon">🧪</span>
+        <span className="test-fab-icon"><FlaskConical size={18} strokeWidth={2} /></span>
         <span className="test-fab-text">
           {run ? `${RUN_VERDICT[run.state]?.text || run.state}` : '测试面板'}
           {run && run.totalSteps ? ` ${Math.min(run.currentStep || 0, run.totalSteps)}/${run.totalSteps}` : ''}
@@ -439,13 +441,13 @@ export default function TestPanel(props: {
         tabIndex={-1}
       >
         <div className="modal-head">
-          <h3>🧪 浏览器仿真测试</h3>
+          <h3 className="with-ico"><FlaskConical size={16} strokeWidth={2} /> 浏览器仿真测试</h3>
           <span className="test-head-ops">
             <button className="btn mini" title="收起为右侧悬浮按钮，让出浏览器画面" onClick={() => props.onCollapsedChange(true)}>
               收起
             </button>
             <button className="close-x" aria-label="关闭测试面板" title="关闭（Esc）" onClick={requestClose}>
-              ✕
+              <X size={14} strokeWidth={2.5} />
             </button>
           </span>
         </div>
@@ -659,7 +661,7 @@ export default function TestPanel(props: {
                 校验
               </button>
               <button className="btn primary" onClick={doStart} disabled={running || !caseMd.trim()}>
-                ▶ 运行测试
+                <Play size={12} strokeWidth={2.5} /> 运行测试
               </button>
               {running && (
                 <button className="btn danger" onClick={() => window.easybow.testStop().catch(() => {})}>
@@ -785,7 +787,7 @@ export default function TestPanel(props: {
                         <div className="test-asserts">
                           {s.assertions.map((a, i) => (
                             <div key={i} className={`test-assert ${a.passed ? 'ok' : 'bad'}`}>
-                              <span>{a.passed ? '✓' : '✗'}</span>
+                              <span>{a.passed ? <Check size={11} strokeWidth={3} /> : <X size={11} strokeWidth={3} />}</span>
                               <code>{a.raw}</code>
                               {!a.passed && a.actual && <em>实际: {a.actual}</em>}
                             </div>

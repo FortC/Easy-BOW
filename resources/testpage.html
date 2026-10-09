@@ -56,6 +56,9 @@
 
   <div class="box">
     <p>图片资源抓取测试：</p>
+    <!-- 网络嗅探用例：仅 JS 加载、DOM 里没有对应 <img>，只有 Performance 资源嗅探能抓到
+         （不用 <link preload>：file:// 协议下不产生资源记录） -->
+    <script>new Image().src = './netprobe.png'</script>
     <img id="img-main" alt="商品主图" width="320" height="320"
       src="data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='320' height='320'%3E%3Crect width='320' height='320' fill='%234f86da'/%3E%3C/svg%3E">
     <img id="img-icon" alt="icon" width="16" height="16"
@@ -182,6 +185,15 @@
         document.getElementById('save-ok').textContent = ''
       })
     </script>
+  </div>
+
+  <!-- v2.0 语义测试区：表格布局字段（label 在相邻 td，输入框自身无 label/placeholder/name 线索） -->
+  <div class="box">
+    <p>表格布局表单（语义匹配测试：字段名在相邻单元格，模拟老式 ERP）：</p>
+    <table border="1" cellpadding="6" id="sem-table">
+      <tr><td>名称</td><td><input id="sem-name"></td><td>名称编码</td><td><input id="sem-code"></td></tr>
+      <tr><td>单价</td><td><input id="sem-price"></td><td>数量</td><td><input id="sem-qty"></td></tr>
+    </table>
   </div>
 
   <div class="spacer">（占位高度，用于滚动测试）</div>

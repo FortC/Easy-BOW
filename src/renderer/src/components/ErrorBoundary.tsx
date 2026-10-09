@@ -1,3 +1,4 @@
+import { TriangleAlert } from 'lucide-react'
 import { Component, type ErrorInfo, type ReactNode } from 'react'
 
 /**
@@ -22,7 +23,7 @@ export default class ErrorBoundary extends Component<
     if (this.state.error) {
       return (
         <div className="eb-root">
-          <div className="eb-icon">⚠</div>
+          <div className="eb-icon"><TriangleAlert size={28} strokeWidth={2} /></div>
           <div className="eb-title">界面渲染出错</div>
           <div className="eb-msg">{String(this.state.error?.message || this.state.error)}</div>
           <button

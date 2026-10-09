@@ -1,3 +1,4 @@
+import { AlarmClock, FlaskConical, Pause, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import type { Schedule } from '@shared/types'
 import { useModalFocus } from '../hooks/useDelayedUnmount'
@@ -38,6 +39,9 @@ export default function ScheduleModal(props: {
   })
   const [dailyTime, setDailyTime] = useState('09:00')
   const [intervalMin, setIntervalMin] = useState(30)
+  // 绑定回归用例时选择执行环境档案（含生产保护标记）：定时触发也走同一道生产保护门禁
+  const [envs, setEnvs] = useState<Array<{ name: string; protected?: boolean }>>([])
+  const [envName, setEnvName] = useState('')
   const [saving, setSaving] = useState(false)
   const bodyRef = useRef<HTMLDivElement>(null)
   const { closing, requestClose, onBackdropClick } = useModalFocus(bodyRef, props.onClose, props.open)
@@ -45,6 +49,10 @@ export default function ScheduleModal(props: {
   const refresh = () => window.easybow.getSchedules().then(setList).catch(() => {})
   useEffect(() => {
     refresh()
+    window.easybow
+      .getTestEnvs()
+      .then(setEnvs)
+      .catch(() => {})
   }, [])
 
   // 首次打开时把任务名预填一次（常驻挂载，initialTask 变化不应覆盖用户已输入的内容）
@@ -64,6 +72,7 @@ export default function ScheduleModal(props: {
     setTask(s.task)
     setName(s.name)
     setBoundCaseId(s.testCaseId)
+    setEnvName(s.envName || '')
     setPolicy(s.type)
     if (s.type === 'once' && s.at) {
       const d = new Date(s.at)
@@ -80,6 +89,7 @@ export default function ScheduleModal(props: {
     setTask(props.initialTask || props.initialTestCase?.name || '')
     setName(props.initialTestCase ? `回归: ${props.initialTestCase.name}` : '')
     setBoundCaseId(props.initialTestCase?.id)
+    setEnvName('')
   }
 
   const save = async () => {
@@ -93,7 +103,7 @@ export default function ScheduleModal(props: {
       const base = {
         name: name.trim() || t.slice(0, 20),
         task: t,
-        ...(boundCaseId != null ? { testCaseId: boundCaseId } : {}),
+        ...(boundCaseId != null ? { testCaseId: boundCaseId, envName: envName || undefined } : {}),
         enabled: true,
         type: policy,
         ...(policy === 'once' ? { at: new Date(atLocal).getTime() } : {}),
@@ -145,7 +155,7 @@ export default function ScheduleModal(props: {
         <div className="modal-head">
           <h3>⏰ 定时任务{editing ? '（编辑）' : '（新增）'}</h3>
           <button className="close-x" aria-label="关闭定时任务" title="关闭（Esc）" onClick={requestClose}>
-            ✕
+            <X size={14} strokeWidth={2.5} />
           </button>
         </div>
 
@@ -167,6 +177,18 @@ export default function ScheduleModal(props: {
             <button className="btn mini unbind-btn" onClick={() => setBoundCaseId(undefined)}>
               解绑（改为普通任务）
             </button>
+            <div className="form-row" style={{ marginTop: 8 }}>
+              <label>执行环境（生产保护环境到点提交前仍需人工确认）</label>
+              <select value={envName} onChange={(e) => setEnvName(e.target.value)}>
+                <option value="">（不使用环境档案）</option>
+                {envs.map((e) => (
+                  <option key={e.name} value={e.name}>
+                    {e.name}
+                    {e.protected ? '（生产保护）' : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
         )}
         <div className="form-row">
@@ -218,8 +240,8 @@ export default function ScheduleModal(props: {
                 <div key={s.id} className={`sch-item ${s.enabled ? '' : 'off'}`}>
                   <div className="sch-item-main">
                     <div className="sch-item-name">
-                      {s.enabled ? '⏰' : '⏸'}
-                      {s.testCaseId != null ? '🧪' : ''} {s.name}
+                      {s.enabled ? <AlarmClock size={12} strokeWidth={2} /> : <Pause size={12} strokeWidth={2} />}
+                      {s.testCaseId != null ? <FlaskConical size={12} strokeWidth={2} /> : null} {s.name}
                       <span className="sch-item-policy">{describe(s)}</span>
                     </div>
                     <div className="sch-item-meta">

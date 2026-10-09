@@ -30,8 +30,13 @@ if (src.includes('supportedDevices.push("wasm", "webgpu", "cpu");\n  defaultDevi
   process.exit(0)
 }
 if (!src.includes(ORIGINAL)) {
-  console.error('补丁锚点未找到（transformers 版本变了？），请检查 scripts/patch-transformers.mjs')
-  process.exit(1)
+  // 不再 exit(1) 阻断 npm install（复核 P1-6）：transformers 升级导致锚点变化时，
+  // 后果只是 fastllm 注入 WASM 失败→初始化报错自动回退云端，可观测且不伤及其它功能
+  console.warn(
+    '[easybow] 警告: patch-transformers 锚点未找到（transformers 版本已变?）。' +
+      '本地快速决策模型可能无法注入 WASM 后端（运行时自动回退云端），请检查 scripts/patch-transformers.mjs'
+  )
+  process.exit(0)
 }
 src = src.replace(ORIGINAL, PATCHED)
 writeFileSync(FILE, src)

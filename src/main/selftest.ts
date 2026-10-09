@@ -5,7 +5,8 @@
  */
 import { join } from 'path'
 import { app } from 'electron'
-import { appendFileSync } from 'fs'
+import { appendFileSync, readFileSync } from 'fs'
+import { createServer } from 'http'
 
 /** 进度直写文件（同步无缓冲）：stdout 在 Windows 重定向下块缓冲，会掩盖真实卡点 */
 const TRACE_FILE = join(process.cwd(), 'selftest-trace.log')
@@ -28,12 +29,43 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
 }
 
+/** 临时起本地 http 服务托管 fixture 目录（随机端口）。
+ *  图片网络嗅探走 Performance Resource Timing，file:// 页面不产生资源记录，
+ *  只有 http 页面才能回归「DOM 里没有的图片也能从网络层抓到」。 */
+function startFixtureServer(rootDir: string): Promise<{ url: string; close: () => void }> {
+  const srv = createServer((req, res) => {
+    const rel = decodeURIComponent(String(req.url).split('?')[0]).replace(/^\/+|\/+$/g, '') || 'testpage.html'
+    try {
+      const data = readFileSync(join(rootDir, rel))
+      res.writeHead(200, { 'Content-Type': /\.png$/i.test(rel) ? 'image/png' : 'text/html; charset=utf-8' })
+      res.end(data)
+    } catch {
+      res.writeHead(404)
+      res.end('not found')
+    }
+  })
+  return new Promise((resolve) => {
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address()
+      const port = typeof addr === 'object' && addr ? addr.port : 0
+      resolve({ url: `http://127.0.0.1:${port}/testpage.html`, close: () => srv.close() })
+    })
+  })
+}
+
 export async function runSelftest(deps: SelftestDeps): Promise<void> {
-  const results: { name: string; ok: boolean; detail?: string }[] = []
+  const results: { name: string; ok: boolean; detail?: string; skipped?: boolean }[] = []
   const check = (name: string, ok: boolean, detail?: string) => {
     results.push({ name, ok, detail })
     console.log(`[${ok ? 'PASS' : 'FAIL'}] ${name}${detail ? ' — ' + detail : ''}`)
     trace(`[check] ${ok ? 'PASS' : 'FAIL'} ${name}`)
+  }
+  // SKIP：前置条件不满足（如 OCR 模型缺失）时不执行也不计入通过/总数——
+  // 「条件不满足也算通过」会掩盖真实回归（复核 P1-3）
+  const skip = (name: string, reason?: string) => {
+    results.push({ name, ok: true, skipped: true, detail: reason })
+    console.log(`[SKIP] ${name}${reason ? ' — ' + reason : ''}`)
+    trace(`[check] SKIP ${name}`)
   }
 
   try {
@@ -111,6 +143,11 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
         []
       )
       check('输入+点击提交', out === '已提交: 订单A1024', `表单结果: ${out}`)
+      if (!ex.overlay) {
+        // 覆盖层缺失 = 轨迹/光晕/顶栏/拆除/输入路由 5 项安全检查整体未执行（P1-2）：
+        // 遮罩未拆净会让 Chromium 输入路由仍派发给隐藏视图（页面点不动），必须显式失败
+        check('overlay 安全检查组（轨迹/光晕/顶栏/拆除/输入路由）', false, 'overlay 未创建，5 项安全相关检查未执行')
+      }
       if (ex.overlay) {
         check(
           '鼠标轨迹动画',
@@ -315,20 +352,30 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
       check('拖动动作(滑块)', false, String(e?.message || e))
     }
 
-    // 7.7 图片资源抓取（主图/详情图抓链接，非截图；小图标过滤；按尺寸排序）
+    // 7.7 图片资源抓取（主图/详情图抓链接，非截图；小图标过滤；按尺寸排序；
+    //     含网络嗅探回归：fixture 里 netprobe.png 只由内联 JS 加载、DOM 无对应 img，
+    //     能从 http 资源记录抓到并探测出真实尺寸 120x90 才算嗅探链路通）
     try {
+      const srv = await startFixtureServer(join(fixturePath, '..'))
+      await tm.navigate(srv.url)
+      await sleep(1500)
       const imgOut = await ex.executeBatch(
         [{ name: 'extract_images' }],
         { memory: {}, signal: new AbortController().signal, settings: { speed: 'normal' } as any }
       )
       const r = imgOut[0].result || ''
+      const netHit = r.includes('netprobe.png') && r.includes('网络嗅探') && r.includes('120x90')
       check(
-        '图片资源抓取(主图/详情图)',
-        !imgOut[0].error && r.includes('商品主图') && r.includes('详情图') && !r.includes('alt=icon'),
-        `抓到 ${Math.max(0, (r.match(/\[\d+\]/g) || []).length)} 张：${r.split('\n')[0].slice(0, 50)}`
+        '图片资源抓取(DOM+网络嗅探)',
+        !imgOut[0].error && r.includes('商品主图') && r.includes('详情图') && !r.includes('alt=icon') && netHit,
+        `抓到 ${Math.max(0, (r.match(/\[\d+\]/g) || []).length)} 张，网络嗅探=${netHit ? '命中(netprobe.png 120x90)' : '未命中'}：${r.split('\n')[0].slice(0, 40)}`
       )
+      srv.close()
+      // 后续测试回到 file:// fixture
+      await tm.navigate(fixture)
+      await sleep(1000)
     } catch (e: any) {
-      check('图片资源抓取(主图/详情图)', false, String(e?.message || e))
+      check('图片资源抓取(DOM+网络嗅探)', false, String(e?.message || e))
     }
 
     // 7.8 SPA 重挂载后的元素重定位：旧序号路径指向错误节点（标签不符）时，
@@ -818,7 +865,7 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
               }
             }
             await ui.executeJavaScript(
-              `(() => { const b = Array.from(document.querySelectorAll('button')).find(x => (x.textContent||'').includes('定时')); b && b.click(); })()`,
+              `(() => { const b = document.querySelector('.sch-open-btn') || Array.from(document.querySelectorAll('button, span[role="button"]')).find(x => (x.textContent||'').includes('定时')); b && b.click(); })()`,
               true
             )
             await sleep(700) // 等弹窗弹入动画结束
@@ -868,6 +915,201 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
       check('定时任务(策略计算)', false, String(e?.message || e))
     }
 
+    // 8.99 v2.0 智能增强：语义匹配 / 填后校验 / 失败分类 / 经验沉淀 / 埋点 / UA一致性 / AX并联
+    try {
+      // 1) 语义基础：归一化 / 同义词 / Dice
+      const sem = await import('./semantic')
+      const normOk = sem.normalize('ＡＢ　１２：') === 'ab12' && sem.normalize('商品 名称！') === '商品名称'
+      const synOk = sem.expandSynonyms('商品').has('产品') && sem.expandSynonyms('收货人').has('联系人')
+      const diceOk = sem.dice('商品名称', '商品名称') === 1 && sem.dice('商品名称', '名称编码') < 0.4
+      check('v2.0语义基础(归一化/同义词/Dice)', normOk && synOk && diceOk, `norm=${normOk} syn=${synOk} dice=${diceOk}`)
+
+      // 2) 填后校验验收 6 用例（升级方案 3.5 验收表）
+      const v1 = sem.verifyFieldMatch(['名称'], '填入商品名称')
+      const v2 = sem.verifyFieldMatch(['商品名'], '填入商品名称')
+      const v3a = sem.verifyFieldMatch(['联系人'], '填写收货人电话')
+      const v3b = sem.verifyFieldMatch(['手机'], '填写收货人电话')
+      const v4 = sem.verifyFieldMatch(['单价'], '设置商品价格')
+      const v5 = sem.verifyFieldMatch(['名称'], '填入商品标题')
+      const v6 = sem.verifyFieldMatch(['名称编码'], '填入商品名称')
+      check(
+        'v2.0语义校验验收(6用例)',
+        v1.ok && v2.ok && v3a.ok && v3b.ok && v4.ok && v5.ok && !v6.ok,
+        `名称=${v1.ok} 商品名=${v2.ok} 收货人电话拆分=${v3a.ok && v3b.ok} 单价=${v4.ok} 标题→名称=${v5.ok} 名称编码拦截=${!v6.ok}(得分${v6.score.toFixed(2)})`
+      )
+
+      // 3) 语义重排（目标提前 + 提示段）与本地初筛渲染（keepIdx 编号不变）
+      const { rerankByTask, formatCandidates: fcSem } = await import('./extractor')
+      const fakeCands = Array.from({ length: 30 }, (_, i) => ({
+        framePaths: [] as number[][],
+        path: [] as number[],
+        tag: 'INPUT',
+        role: 'input文本',
+        text: '',
+        extra: i === 25 ? 'label=名称' : '',
+        rect: { x: 0, y: 0, w: 10, h: 10 },
+        inViewport: true
+      }))
+      const fakeRes2: any = {
+        title: 't',
+        url: 'u',
+        scrollY: 0,
+        scrollHeight: 100,
+        viewportW: 100,
+        viewportH: 100,
+        candidates: fakeCands,
+        totalFound: 30,
+        imgCount: 0
+      }
+      const rer = rerankByTask(fakeRes2, '填入商品名称')
+      const idx25 = rer.candidates.findIndex((c) => c.extra === 'label=名称')
+      const fmt = fcSem(rer)
+      check(
+        'v2.0语义重排(目标提前+提示段)',
+        (rer.semanticHints?.length || 0) > 0 && idx25 >= 0 && idx25 < 3 && fmt.includes('语义匹配提示') && fmt.includes('[0]'),
+        `原第25位 → 重排后第${idx25}位，命中提示${rer.semanticHints?.length || 0}条`
+      )
+      const kept = fcSem(fakeRes2, false, [2, 25])
+      const keptLines = kept.split('\n')
+      check(
+        'v2.0本地初筛渲染(keepIdx编号不变)',
+        keptLines.length === 2 && keptLines[0].startsWith('[2]') && keptLines[1].startsWith('[25]'),
+        keptLines.map((l) => l.slice(0, 14)).join(' | ')
+      )
+
+      // 4) 活页面：表格布局邻近文本 + 属性锚点 + 重排到位 + 填后校验端到端（静默错填拦截）
+      const ftab2 = tm.active()
+      if (!ftab2) throw new Error('fixture 页签不可用')
+      const semLive = await ex.extract(ftab2, { task: '填入商品名称' })
+      const nameCand = semLive.candidates.find((c) => (c.extra || '').includes('id=sem-name'))
+      const codeCand = semLive.candidates.find((c) => (c.extra || '').includes('id=sem-code'))
+      const attrCand = semLive.candidates.find((c) => (c.extra || '').includes('name=username'))
+      const adjName = !!nameCand && /adj=名称($|\s)/.test(nameCand.extra || '')
+      const adjCode = !!codeCand && /adj=名称编码/.test(codeCand.extra || '')
+      check(
+        'v2.0表格布局邻近文本+属性锚点',
+        adjName && adjCode && !!attrCand && semLive.candidates.indexOf(nameCand!) < 8,
+        `name邻近=${adjName} code邻近=${adjCode} name=username锚点=${!!attrCand} name输入框重排后第${semLive.candidates.indexOf(nameCand!)}位`
+      )
+      const semCtx: any = {
+        memory: {},
+        signal: new AbortController().signal,
+        settings: { speed: 'normal', autoExperience: false } as any,
+        task: '填入商品名称',
+        url: ftab2.url
+      }
+      const wrongOut = await ex.executeBatch([{ name: 'type', index: semLive.candidates.indexOf(codeCand!), text: '蓝牙耳机' }], semCtx)
+      const rightOut = await ex.executeBatch([{ name: 'type', index: semLive.candidates.indexOf(nameCand!), text: '蓝牙耳机' }], semCtx)
+      check(
+        'v2.0填后语义校验(静默错填拦截)',
+        !!wrongOut[0]?.error && wrongOut[0].error!.includes('疑似填错字段') && !rightOut[0]?.error,
+        `错填=${wrongOut[0]?.error || '未报错(静默!)'} 正填=${(rightOut[0]?.result || '').slice(0, 36)}`
+      )
+
+      // 5) 失败分类学 diagnose
+      const diag = await import('./diagnose')
+      const mkEx = (url: string): any => ({ title: '', url, scrollY: 0, scrollHeight: 1, viewportW: 1, viewportH: 1, candidates: [], totalFound: 0, imgCount: 0 })
+      const dLocate = diag.diagnose({ actions: [{ name: 'click', error: '元素[3]已失效' }], extract: mkEx('https://a.com/x'), sameActionStreak: 1, stepNo: 2, maxSteps: 30 })
+      const dSem = diag.diagnose({ actions: [{ name: 'type', error: '疑似填错字段：目标「商品名称」' }], extract: mkEx('https://a.com/x'), sameActionStreak: 1, stepNo: 2, maxSteps: 30 })
+      const dData = diag.diagnose({ actions: [{ name: 'read_content', result: '(页面没有可读文本)' }], extract: mkEx('https://a.com/x'), sameActionStreak: 0, stepNo: 2, maxSteps: 30 })
+      const dLoop = diag.diagnose({ actions: [{ name: 'click', error: '点击失败xx' }], extract: mkEx('https://a.com/x'), sameActionStreak: 3, stepNo: 2, maxSteps: 30 })
+      const dPage = diag.diagnose({ actions: [{ name: 'expect', error: '断言失败: x' }], extract: mkEx('https://a.com/changed'), prevExtract: mkEx('https://a.com/x'), sameActionStreak: 0, stepNo: 2, maxSteps: 30 })
+      const dNull = diag.diagnose({ actions: [{ name: 'wait' }], extract: mkEx('https://a.com/x'), sameActionStreak: 0, stepNo: 2, maxSteps: 30 })
+      check(
+        'v2.0失败分类(七类归因)',
+        dLocate?.kind === 'locate' && dSem?.kind === 'semantic' && dData?.kind === 'data_missing' && dLoop?.kind === 'loop' && dPage?.kind === 'page_changed' && !dNull,
+        `locate=${dLocate?.kind} semantic=${dSem?.kind} data=${dData?.kind} loop=${dLoop?.kind} page_changed=${dPage?.kind} 正常不介入=${!dNull}`
+      )
+
+      // 6) 经验沉淀（写入/匹配/置信度淘汰）
+      const exp = await import('./experience')
+      exp.upsertExperience({ domain: 'erp.example.com', kind: 'field_map', key: '商品名称', value: '名称' })
+      const expLines = exp.matchExperience('https://erp.example.com/order', '填入商品名称')
+      const expMiss = exp.matchExperience('https://other.com/x', '随便看看')
+      const expBefore = exp.getExperience().find((e) => e.domain === 'erp.example.com')
+      exp.feedbackExperience('https://erp.example.com/order', '填入商品名称', false)
+      exp.feedbackExperience('https://erp.example.com/order', '填入商品名称', false)
+      const expAfter = exp.getExperience().find((e) => e.domain === 'erp.example.com')
+      check(
+        'v2.0经验沉淀(写入/匹配/置信度淘汰)',
+        expLines.length > 0 && expLines[0].includes('商品名称') && expMiss.length === 0 && expBefore?.enabled === true && expAfter?.enabled === false,
+        `命中=${expLines.length} 异域不命中=${expMiss.length === 0} 两次负反馈后停用=${expAfter?.enabled === false}`
+      )
+      exp.setExperience([])
+
+      // 7) 埋点 Telemetry（jsonl 落盘 + 关闭静默）
+      const { Telemetry } = await import('./telemetry')
+      const tmTrace = new Telemetry()
+      tmTrace.start('自测任务', true)
+      tmTrace.log('extract', 1, { candidates: 10, truncated: false })
+      tmTrace.log('action', 1, { name: 'click', ok: true })
+      tmTrace.end({ state: 'success', steps: 2 })
+      const tl = readFileSync(tmTrace.filePath, 'utf-8').trim().split('\n')
+      const tlOk = tl.length === 4 && JSON.parse(tl[0]).type === 'task_start' && JSON.parse(tl[3]).type === 'task_end'
+      const tmOff = new Telemetry()
+      tmOff.start('x', false)
+      tmOff.log('extract', 1, {})
+      tmOff.end({ state: 'success' })
+      check('v2.0埋点telemetry(jsonl落盘+可关闭)', tlOk && tmOff.filePath === '', `${tl.length} 行事件；关闭时静默=${tmOff.filePath === ''}`)
+
+      // 8) R1 UA 一致性 + webdriver 隐藏
+      const tabUa = tm.active()!.view.webContents.getUserAgent()
+      const uaOk = !/Electron/i.test(tabUa) && /Chrome\/\d+/.test(tabUa)
+      const wd = await tm.active()!.cdp.evaluate<any>(String(() => navigator.webdriver), [])
+      check('v2.0 UA一致性+webdriver隐藏', uaOk && wd === undefined, `UA=${tabUa.slice(0, 70)} webdriver=${String(wd)}`)
+
+      // 9) 提示词契约（clarify / 多候选 / 历史经验区块）
+      const { SYSTEM_PROMPT: SP2, buildStepMessage: bsm2 } = await import('./agent/prompts')
+      const msgExp = bsm2({
+        task: 't',
+        tabs: [],
+        activeTabId: 1,
+        extract: { candidates: [], title: 't', url: 'u', scrollHeight: 0, viewportH: 0, scrollY: 0 } as any,
+        elementLines: '',
+        maxElements: 80,
+        memory: {},
+        steps: [],
+        lastResults: [],
+        kbTips: [],
+        expTips: ['- [field_map] 商品名称 → 实际字段「名称」(已验证 2 次)']
+      })
+      check(
+        'v2.0提示词契约(clarify/多候选/历史经验)',
+        SP2.includes('clarify') && SP2.includes('candidates') && msgExp.includes('# 历史经验') && msgExp.includes('field_map'),
+        `clarify=${SP2.includes('clarify')} 多候选=${SP2.includes('candidates')} 经验区块=${msgExp.includes('# 历史经验')}`
+      )
+
+      // 10) AX 树注解（纯函数：偏移探测 + 只补线索不足者；活页面拉取不炸）
+      const { annotateWithAx, fetchAxTree } = await import('./axtree')
+      const axRes: any = {
+        title: '',
+        url: 'u',
+        scrollY: 0,
+        scrollHeight: 1,
+        viewportW: 100,
+        viewportH: 100,
+        candidates: [
+          { framePaths: [], path: [], tag: 'DIV', role: 'Generic', text: '', extra: '', rect: { x: 10, y: 10, w: 40, h: 20 }, inViewport: true },
+          { framePaths: [], path: [], tag: 'BUTTON', role: 'button', text: '登录按钮现已就绪', extra: '', rect: { x: 10, y: 50, w: 40, h: 20 }, inViewport: true }
+        ],
+        totalFound: 2,
+        imgCount: 0
+      }
+      const axItems = [
+        { x: 10, y: 10, w: 40, h: 20, desc: 'textbox 用户名' },
+        { x: 10, y: 50, w: 40, h: 20, desc: 'button 登录' }
+      ]
+      const axHits = annotateWithAx(axRes, axItems)
+      const axLive = await fetchAxTree(tm.active()!.cdp).catch(() => null)
+      check(
+        'v2.0 AX树注解(偏移探测+线索补充)',
+        axHits === 1 && (axRes.candidates[0].extra || '').includes('ax=textbox_用户名') && !(axRes.candidates[1].extra || '').includes('ax=') && axLive !== null,
+        `叠加${axHits}条(仅线索不足者) c0=${axRes.candidates[0].extra} c1已有文本不补=${!(axRes.candidates[1].extra || '').includes('ax=')} 活页面AX条目=${axLive?.length ?? '拉取失败'}`
+      )
+    } catch (e: any) {
+      check('v2.0智能增强', false, String(e?.stack || e))
+    }
+
     // 9. OCR 整页识别（模型可用时）
     try {
       const ocr = await import('./ocr')
@@ -882,7 +1124,7 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
         const hit = /A1024|订单号|张三|提交/.test(text)
         check('OCR整页识别', hit, `识别 ${text.length} 字: ${text.replace(/\n/g, ' ').slice(0, 80)}`)
       } else {
-        check('OCR整页识别', true, `OCR 未启用（${st0.reason}），跳过`)
+        skip('OCR整页识别', `OCR 未启用（${st0.reason}）`)
       }
     } catch (e: any) {
       check('OCR整页识别', false, String(e?.message || e))
@@ -902,6 +1144,70 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
       check('页签关闭清理快照', hadSnap && !leaked, `关闭前有快照=${hadSnap} 关闭后残留=${leaked}`)
     } catch (e: any) {
       check('页签关闭清理快照', false, String(e?.message || e))
+    }
+
+    // 9.11 跨页签数据搬运 e2e（产品立身之本，此前零覆盖——复核 P1-1）：
+    // A 页存记忆 → 新开 B 页签加载同一表单 → {{记忆}} 替换填入 → 回读断言。
+    // 同时回归「提取快照按页签隔离」（B 的 type 必须解析 B 自己的快照）
+    let tabA: import('./tabs').Tab | null = null
+    try {
+      const { getSettings } = await import('./settings')
+      const marker = `E2E跨页签${Date.now().toString(36)}`
+      await tm.navigate(fixture)
+      await sleep(1200)
+      // A 页签：写入标记并存记忆
+      tabA = tm.active()!
+      const resA = await ex.extract(tabA)
+      const kwA = resA.candidates.findIndex((c) => c.tag.toUpperCase() === 'INPUT' && (c.text + c.extra).includes('搜索'))
+      if (kwA < 0) throw new Error(`A 页签未找到搜索框（候选 ${resA.candidates.length} 个）`)
+      const mem: Record<string, string> = {}
+      await ex.executeBatch(
+        [
+          { name: 'type', index: kwA, text: marker },
+          { name: 'save', key: '搬运值', value: marker }
+        ],
+        { memory: mem, signal: new AbortController().signal, settings: getSettings() }
+      )
+      if (mem['搬运值'] !== marker) throw new Error(`save 未落记忆: ${JSON.stringify(mem).slice(0, 80)}`)
+      // B 页签：新建并加载同一 fixture，{{记忆}} 填入
+      tm.newTab(fixture)
+      await sleep(1600)
+      // 新页签若在弹窗打开（browserHidden）期间创建，layout 只隐藏不给 bounds——
+      // 强制一次 relayout（等价用户动一下窗口），再验证仍为 0 则是 layout 链路真问题
+      const hiddenAtB = tm.isBrowserHidden()
+      tm.onWindowResized()
+      await sleep(300)
+      const tabB = tm.active()!
+      if (tabB.id === tabA.id) throw new Error('新页签未生效')
+      const resB = await ex.extract(tabB)
+      const kwB = resB.candidates.findIndex((c) => c.tag.toUpperCase() === 'INPUT' && (c.text + c.extra).includes('搜索'))
+      if (kwB < 0)
+        throw new Error(
+          `B 页签未找到搜索框（候选 ${resB.candidates.length} 个；诊断 url=${resB.url} title=${resB.title} totalFound=${resB.totalFound} vp=${resB.viewportW}x${resB.viewportH} tabUrl=${tabB.url} bounds=${JSON.stringify((tabB as any).view?.getBounds?.() ?? null)} hidden=${hiddenAtB}）`
+        )
+      await ex.executeBatch(
+        [{ name: 'type', index: kwB, text: '{{搬运值}}' }],
+        { memory: mem, signal: new AbortController().signal, settings: getSettings() }
+      )
+      // 回读 B 页签输入框实际值（fixture 的搜索框 id=kw）
+      const got = await tabB.cdp.evaluate<string>(
+        String(() => (document.getElementById('kw') as HTMLInputElement | null)?.value ?? '(null)'),
+        []
+      )
+      check(
+        '跨页签搬运(A存记忆→B{{记忆}}填入)',
+        got === marker,
+        `B 页签实际值="${got.slice(0, 40)}" 期望="${marker}"`
+      )
+    } catch (e: any) {
+      check('跨页签搬运(A存记忆→B{{记忆}}填入)', false, String(e?.message || e))
+    } finally {
+      // 无论成败都关掉 B：残留的重复 fixture 页签会干扰后续第 10 节的页签类用例
+      const cur = tm.all().find((t) => t.id !== tabA?.id && (t.url || '').includes('testpage'))
+      if (cur && tm.all().length > 1) {
+        tm.closeTab(cur.id)
+        await sleep(400)
+      }
     }
 
     // 10. 浏览器仿真测试（feature/browser-test）
@@ -1011,6 +1317,103 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
         `普通模式含测试区块=${msgNormal.includes('# 测试脚本')} 测试模式含=${msgTest.includes('# 测试脚本')}`
       )
 
+      // 10.2b 提示词稳定前缀顺序（提示词缓存友好）：记忆/历史（稳定区）在页签/元素（易变区）之前；
+      //     节点链区块仅在 plan 存在时注入
+      const msgFull = buildStepMessage({
+        ...fixedCtx,
+        memory: { 订单号: 'A1024' },
+        steps: [{ n: 1, thought: '打开页面', actions: [{ name: 'goto', url: 'https://example.com' }], tabId: 1, tabTitle: '页签一', url: 'u', title: '', ts: 1 }],
+        plan: {
+          nodes: [
+            { intent: '打开页面', expected: '页面加载完成' },
+            { intent: '读取数据', expected: '拿到订单号' }
+          ],
+          current: 2
+        }
+      })
+      const orderOk =
+        msgFull.indexOf('# 任务记忆') < msgFull.indexOf('# 已执行步骤') &&
+        msgFull.indexOf('# 已执行步骤') < msgFull.indexOf('# 页签') &&
+        msgFull.indexOf('# 页签') < msgFull.indexOf('# 可交互元素') &&
+        msgFull.includes('# 节点进度') &&
+        msgFull.includes('node_done') &&
+        !msgNormal.includes('# 节点进度')
+      check(
+        '提示词稳定前缀顺序+节点区块',
+        orderOk,
+        `记忆@${msgFull.indexOf('# 任务记忆')} 历史@${msgFull.indexOf('# 已执行步骤')} 页签@${msgFull.indexOf('# 页签')} 节点=${msgFull.includes('# 节点进度')}`
+      )
+
+      // 10.2c 节点计划解析 + 复核判定解析（纯函数，无网络）
+      const { parsePlan } = await import('./agent/plan')
+      const planOk = parsePlan('```json\n{"nodes":[{"intent":"搜索","expected":"出现结果列表","check":{"kind":"text_visible","value":"结果"}},{"intent":"记录","expected":"存入记忆"}]}\n```')
+      const planBad = parsePlan('这不是 JSON')
+      check(
+        '节点计划解析(parsePlan)',
+        !!planOk && planOk.length === 2 && planOk[0].check?.kind === 'text_visible' && !planBad,
+        `节点数=${planOk?.length} check=${planOk?.[0]?.check?.kind || '无'} 非法输入=${!planBad}`
+      )
+
+      // 10.2d 模板自动变量解析（纯函数；{{记忆键}} 不是变量不得误替换）
+      const { resolveTemplateVars } = await import('./templates')
+      const now = new Date()
+      const pad = (n: number) => String(n).padStart(2, '0')
+      const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+      const resolved = resolveTemplateVars('日期={{日期}} 网址={{当前网址}} 引用={{记忆键}}', {
+        title: '订单页',
+        url: 'https://example.com/orders'
+      })
+      const tplOk =
+        resolved.includes(`日期=${today}`) &&
+        resolved.includes('网址=https://example.com/orders') &&
+        resolved.includes('引用={{记忆键}}')
+      check('模板自动变量解析', tplOk, resolved.slice(0, 80))
+
+      // 10.2e 任务模板 UI + ✨AI 增强按钮（DOM 存在性：chips 行/📄 菜单按钮/增强按钮随输入出现）
+      const uiT = deps.getUiWebContents?.()
+      if (uiT) {
+        const dom = await uiT.executeJavaScript(
+          `(function(){
+            var bar = !!document.querySelector('.tpl-bar') && !!document.querySelector('.tpl-more')
+            var el = document.querySelector('.task-input')
+            if (!el) return { bar: bar, enhance: false }
+            var setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set
+            setter.call(el, '测试任务描述')
+            el.dispatchEvent(new Event('input', { bubbles: true }))
+            var enhance = !!document.querySelector('.enhance-btn')
+            setter.call(el, '')
+            el.dispatchEvent(new Event('input', { bubbles: true }))
+            return { bar: bar, enhance: enhance }
+          })()`,
+          true
+        )
+        check(
+          '任务模板UI+AI增强按钮',
+          dom?.bar === true && dom?.enhance === true,
+          `模板栏=${dom?.bar} 增强按钮=${dom?.enhance}`
+        )
+      }
+
+      // 10.2f webp 图片解码兜底：nativeImage 只认 PNG/JPEG，webp（淘宝主图常见）走 Chromium 画布转 PNG
+      {
+        const { decodeImageToPng } = await import('./imgdec')
+        const { nativeImage } = await import('electron')
+        // 1x1 webp 样本（魔数 RIFF....WEBP）
+        const webp = Buffer.from('UklGRhoAAABXRUJQVlA4TA0AAAAvAAAAEAcQERGIiP4HAA==', 'base64')
+        try {
+          const direct = nativeImage.createFromBuffer(webp)
+          const png = await decodeImageToPng(webp)
+          const nat = nativeImage.createFromBuffer(png)
+          check(
+            'webp画布解码兜底(imgdec)',
+            png.length > 0 && png[0] === 0x89 && !nat.isEmpty(),
+            `nativeImage直解=${direct.isEmpty() ? '空(符合预期)' : '可用'} 画布转PNG=${png.length}B 尺寸=${nat.getSize().width}x${nat.getSize().height}`
+          )
+        } catch (e: any) {
+          check('webp画布解码兜底(imgdec)', false, String(e?.message || e))
+        }
+      }
+
       // 回到自测 fixture 页（此前 9.9 开关过页签）
       await tm.navigate(fixture)
       await sleep(900)
@@ -1112,7 +1515,7 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
         `error=${ff[0]?.error || '无'} 实际=${JSON.stringify(regState)}`
       )
 
-      // 10.7 JS 原生弹窗自动应答（仅启用 policy 时接管；应答后 evaluate 不再被阻塞）
+      // 10.7 JS 原生弹窗自动应答（接管常开：运行期 policy 自动应答；空闲/人工接管期弹消息框由人工决定）
       ftab.cdp.setDialogPolicy('accept')
       await sleep(300) // 等 Page.enable 生效
       const snapDlg = await ex.extract(ftab)
@@ -1130,6 +1533,37 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
         `记录=${dlgLog || '无'} 页面结果=${dlgResult}（注：CDP 派发输入触发的 confirm 上报类型可能是 alert，以文案与应答结果判定为准）`
       )
       ftab.cdp.setDialogPolicy(null)
+
+      // 10.7b 弹窗接管常开：policy=null（空闲/人工接管期）也有人应答，
+      // 用测试钩子模拟人工点「确定」——覆盖用户实测的「原生 Electron 弹框悬空没人点」场景
+      {
+        const { Cdp: CdpCls } = await import('./cdp')
+        let asked = ''
+        CdpCls.humanDialogResponder = async (_t: string, m: string) => {
+          asked = m
+          return 0
+        }
+        try {
+          await ftab.cdp.evaluate(
+            String(function clickConfirmBtn() {
+              const b = document.getElementById('confirm-btn')
+              if (b) b.click()
+            }),
+            []
+          )
+        } catch {}
+        await sleep(300)
+        const idleLog = ftab.cdp.consumeDialogs()
+        CdpCls.humanDialogResponder = null
+        try {
+          ftab.cdp.clearPendingDialog()
+        } catch {}
+        check(
+          '弹窗接管常开(空闲期人工应答)',
+          !!idleLog && idleLog.includes('人工确认') && asked.includes('确定要删除'),
+          `记录=${idleLog || '无'} 问句=${asked || '无'}`
+        )
+      }
 
       // 10.8 测试页签独立分区：ensureTestTab 幂等复用同一页签
       const t1 = tm.ensureTestTab()
@@ -1378,8 +1812,13 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
     check('自测流程', false, String(e?.stack || e))
   }
 
-  const failed = results.filter((r) => !r.ok)
-  console.log(`\n========== 自测结果: ${results.length - failed.length}/${results.length} 通过 ==========`)
+  const failed = results.filter((r) => !r.ok && !r.skipped)
+  const passedCount = results.length - failed.length - results.filter((r) => r.skipped).length
+    console.log(`\n========== 自测结果: ${passedCount}/${results.length - results.filter((r) => r.skipped).length} 通过 ==========`)
+  const skipped = results.filter((r) => r.skipped)
+  if (skipped.length) {
+    console.log('跳过项: ' + skipped.map((x) => x.name).join(', '))
+  }
   if (failed.length) {
     console.log('失败项: ' + failed.map((f) => f.name).join(', '))
   }

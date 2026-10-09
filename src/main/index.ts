@@ -1,12 +1,15 @@
-import { app, BrowserWindow, clipboard, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, shell, Tray } from 'electron'
 import { join } from 'path'
-import { TabManager } from './tabs'
+import { TabManager, chromeLikeUA } from './tabs'
 import { Executor } from './executor'
 import { AgentRunner } from './agent/runner'
 import { Overlay } from './overlay'
-import { getSettings, saveSettings } from './settings'
+import { getSettings, saveSettings, sanitizeSettingsPatch, settingsReloadAfterReady } from './settings'
 import { getKB, setKB } from './knowledge'
+import { getExperience, setExperience, flushExperience } from './experience'
+import { getTemplates, saveTemplate, deleteTemplate, resolveTemplateVars } from './templates'
 import { createProvider, isVisionUnsupportedError, TINY_TEST_IMAGE } from './agent/llm'
+import { ENHANCE_SYSTEM_PROMPT } from './agent/prompts'
 import { listCCSwitchProviders } from './ccswitch'
 import { recordHistory, touchHistoryTitle, listHistory, removeHistory, clearHistory } from './history'
 import { formatCandidates } from './extractor'
@@ -34,8 +37,8 @@ import {
 } from './testcase/store'
 import type { KBEntry, MainEvent, Schedule, Settings, TestCase, TestEnv } from '@shared/types'
 
-// 禁用站点 webview 的默认菜单干扰
-process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true'
+// 安全警告只在开发态抑制（生产态保留，便于发现 IPC/证书类问题）
+if (!app.isPackaged) process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true'
 
 // 后台/最小化运行支持（默认关）：抑制 Chromium 后台节流（渲染/定时器/被遮挡窗口），
 // 保证测试或任务在窗口最小化时仍全速执行。commandLine 开关须在 app ready 前设置，故重启生效。
@@ -61,6 +64,70 @@ let executor: Executor
 let runner: AgentRunner
 let fastllm: FastLlm
 let scheduler: Scheduler
+
+/* —— 托盘与关闭行为（用户反馈：关闭后进程残留、托盘看不到图标） —— */
+let tray: Tray | null = null
+let trayBalloonShown = false
+/** 真正退出标记：close 拦截（最小化到托盘）只在非退出路径生效。
+ *  注意与下方 shutdown 的防重入标志相互独立——reallyQuit 先置本标记再 app.quit()，
+ *  before-quit 的清理必须照常执行（否则退出时不释放任何资源） */
+let quitting = false
+
+function trayIconPath(): string {
+  return app.isPackaged ? join(process.resourcesPath, 'tray.png') : join(__dirname, '../../resources/tray.png')
+}
+
+function showMainWindow(): void {
+  if (!win || win.isDestroyed()) {
+    createWindow()
+    return
+  }
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+}
+
+function createTray(): void {
+  if (tray) return
+  const icon = nativeImage.createFromPath(trayIconPath())
+  if (icon.isEmpty()) {
+    console.warn('[easybow] 托盘图标加载失败:', trayIconPath())
+    return
+  }
+  tray = new Tray(icon)
+  tray.setToolTip('EasyBow — AI 浏览器')
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: '显示 EasyBow', click: () => showMainWindow() },
+      { type: 'separator' },
+      { label: '退出 EasyBow', click: () => reallyQuit() }
+    ])
+  )
+  tray.on('click', () => showMainWindow())
+}
+
+/** 最小化到托盘：窗口隐藏（页面与任务继续跑），首次给一条气泡提示指引 */
+function hideToTray(): void {
+  createTray()
+  if (!win || win.isDestroyed()) return
+  win.hide()
+  if (!trayBalloonShown) {
+    trayBalloonShown = true
+    try {
+      tray?.displayBalloon?.({
+        iconType: 'info',
+        title: 'EasyBow 仍在运行',
+        content: '窗口已最小化到托盘，后台任务不受影响。点击托盘图标重新打开；右键托盘图标可完全退出。'
+      })
+    } catch {}
+  }
+}
+
+/** 真正退出：走 app.quit → before-quit 统一清理（cleanup.ts + 强制退出保险丝） */
+function reallyQuit(): void {
+  quitting = true
+  app.quit()
+}
 
 /** 直接发送已构造的事件（AgentRunner 的 broadcast 回调走这里，避免二次包裹导致渲染层拿到的 status 缺字段） */
 function sendEvent(ev: MainEvent): void {
@@ -106,11 +173,59 @@ function createWindow(): void {
       sandbox: true
     }
   })
+  // R1 指纹一致性：主窗口（UI 渲染器）同样使用自洽 Chromium UA（站点页签在 TabManager 侧设置）
+  win.webContents.setUserAgent(chromeLikeUA())
 
   win.on('resize', () => tabManager?.onWindowResized())
   win.on('closed', () => {
     win = null
   })
+
+  // 关闭行为（用户反馈：点关闭后进程残留、托盘又看不到图标，不知道程序还在跑）：
+  // close 默认拦截——按设置分流为「最小化到托盘 / 退出」；每次询问时弹窗并可记住选择。
+  // 最小化到托盘时窗口只是隐藏，AI 任务与页签继续跑；退出走 reallyQuit 统一清理。
+  win.on('close', (e) => {
+    if (quitting) return
+    e.preventDefault()
+    const act = getSettings().closeAction || 'ask'
+    if (act === 'tray') {
+      hideToTray()
+      return
+    }
+    if (act === 'exit') {
+      reallyQuit()
+      return
+    }
+    const w = win
+    if (!w || w.isDestroyed()) return
+    void (async () => {
+      const st = runner?.getStatus().state
+      const running = st === 'running' || st === 'paused' || st === 'captcha'
+      const r = await dialog.showMessageBox(w, {
+        type: 'question',
+        buttons: ['最小化到托盘', '退出程序'],
+        defaultId: running ? 0 : 1,
+        cancelId: 1,
+        checkboxLabel: '记住我的选择，不再询问',
+        title: '关闭 EasyBow',
+        message: '要最小化到托盘，还是退出程序？',
+        detail: running
+          ? 'AI 任务正在运行：最小化到托盘不会中断任务，可从右下角托盘图标回到窗口；退出程序会中断当前任务。'
+          : '最小化到托盘后可从右下角托盘图标快速回到窗口；退出程序将完全关闭 EasyBow。'
+      })
+      if (w.isDestroyed()) return
+      if (r.response === 0) {
+        if (r.checkboxChecked) saveSettings({ closeAction: 'tray' })
+        hideToTray()
+      } else {
+        if (r.checkboxChecked) saveSettings({ closeAction: 'exit' })
+        reallyQuit()
+      }
+    })()
+  })
+
+  // 托盘常驻（新托盘图标 Windows 默认收进溢出区 ^，可拖到可见区）：关闭窗口后仍给用户入口
+  createTray()
 
   // —— UI 渲染器自愈：界面卡死/崩溃时自动重建（页签与页面在主进程，状态不丢） ——
   // 否则一次渲染器卡死会让窗口永远冻结在最后一帧，点什么都没反应
@@ -209,7 +324,14 @@ function createWindow(): void {
       if (s.testCaseId != null) {
         const entry = getTestCase(s.testCaseId)
         if (!entry) return Promise.reject(new Error(`定时回归用例 ${s.testCaseId} 已被删除，请编辑该定时任务`))
-        return runner.startTestRun(entry.md, { failFast: true, caseId: entry.id })
+        // 定时回归同样解析环境档案：生产保护（env.protected）不因「到点自动触发」而失效
+        //（复核 P1-11：此前定时路径不传 env，指向生产的用例到点无人确认自动提交/删除）
+        const env = findTestEnv(s.envName)
+        return runner.startTestRun(entry.md, {
+          failFast: true,
+          caseId: entry.id,
+          env: env ? { name: env.name, baseUrl: env.baseUrl, protected: env.protected } : undefined
+        })
       }
       return runner.startTask(s.task)
     },
@@ -228,6 +350,7 @@ function createWindow(): void {
   onCleanup(() => disposeOcr())
   onCleanup(() => scheduler.stop())
   onCleanup(() => runner.dispose())
+  onCleanup(() => flushExperience())
   onCleanup(() => fastllm.dispose())
   onCleanup(() => tabManager.destroyAll())
 
@@ -259,9 +382,21 @@ function registerIpc(): void {
     })
 
   ipcMain.handle('settings:get', () => getSettings())
-  ipcMain.handle('settings:set', (_e, s: Settings) => saveSettings(s))
+  // 渲染进程不可信（C5）：只接受白名单字段 + 类型/枚举/范围校验，非法字段静默丢弃保留原值
+  ipcMain.handle('settings:set', (_e, s: Settings) => saveSettings(sanitizeSettingsPatch(s)))
   ipcMain.handle('kb:get', () => getKB())
   ipcMain.handle('kb:set', (_e, entries: KBEntry[]) => setKB(entries))
+  // 自动经验库（S5：AI 任务中自动沉淀；UI 查看与删除）
+  ipcMain.handle('exp:get', () => getExperience())
+  ipcMain.handle('exp:set', ok((entries: import('@shared/types').ExperienceEntry[]) => setExperience(Array.isArray(entries) ? entries : [])))
+  // 任务模板（任务输入快速填充）
+  ipcMain.handle('templates:get', () => getTemplates())
+  ipcMain.handle('templates:save', ok((t: { id?: number; name: string; group?: string; text: string; pinned?: boolean }) => saveTemplate(t)))
+  ipcMain.handle('templates:delete', ok((id: number) => deleteTemplate(Number(id))))
+  ipcMain.handle('templates:resolve', ok((text: string) => {
+    const tab = tabManager.active()
+    return resolveTemplateVars(String(text || ''), tab ? { title: tab.title || '', url: tab.url || '' } : undefined)
+  }))
   // 读取系统剪贴板图片（人工介入「附截图」）：走主进程 Electron clipboard（W3C 风格新 API），
   // 返回 dataURL 或 null；渲染进程 navigator.clipboard.read() 因无 clipboard-read 权限必然失败
   ipcMain.handle('clipboard:readImage', async () => {
@@ -348,6 +483,23 @@ function registerIpc(): void {
   ipcMain.handle('agent:stop', () => runner.stopTask())
   ipcMain.handle('agent:status', () => runner.getStatus())
   ipcMain.handle('agent:guidance', ok((text: string, image?: string) => runner.sendGuidance(text, image)))
+  // 人工批准当前节点通过（跳过其复核并推进；暂停中自动继续）
+  ipcMain.handle('agent:approveNode', ok(() => runner.approveNode()))
+  // 清空显示：时间线/任务记忆/状态回到空闲
+  ipcMain.handle('agent:clearDisplay', ok(() => runner.clearDisplay()))
+  // 任务描述 AI 增强（✨ 按钮）：格式 + 内容增强，只改写任务文本、不启动任务
+  ipcMain.handle(
+    'agent:enhanceTask',
+    ok(async (task: string) => {
+      const s = getSettings()
+      if (!s.apiKey) throw new Error('请先在「设置」中配置 AI 接口（baseURL / API Key / 模型）')
+      const provider = createProvider(s)
+      const out = await provider.chat(ENHANCE_SYSTEM_PROMPT, [{ role: 'user', content: String(task || '').slice(0, 4000) }])
+      const text = (out.text || '').trim().replace(/```(?:\w+)?/g, '').trim()
+      if (!text) throw new Error('增强结果为空，请重试')
+      return text.slice(0, 8000)
+    })
+  )
 
   // —————— 浏览器仿真测试 ——————
   // 需求 MD → 用例 MD（一次 LLM 调用，不占页签）
@@ -476,13 +628,17 @@ if (!gotLock) {
   app.quit()
 } else {
   app.on('second-instance', () => {
-    if (win) {
+    if (win && !win.isDestroyed() && win.isVisible()) {
       if (win.isMinimized()) win.restore()
       win.focus()
+    } else {
+      showMainWindow()
     }
   })
 
   app.whenReady().then(async () => {
+    // safeStorage 需要 ready：此刻重新读盘解密 apiKey（模块顶层那次只读了布尔开关）
+    settingsReloadAfterReady()
     registerIpc()
     if (isFastllmTest(process.argv)) {
       await runFastllmTest((code) => app.exit(code))
@@ -506,11 +662,12 @@ if (!gotLock) {
   })
 
   // 退出清理：先释放全部长生命周期资源，再退出；保险丝兜底强制结束进程，
-  // 杜绝「窗口关了、进程还在后台占着锁，下次启动打不开」
-  let quitting = false
+  // 杜绝「窗口关了、进程还在后台占着锁，下次启动打不开」。
+  // shuttingDown 是清理防重入（多次 before-quit/quit），与 close 拦截的 quitting 互不影响
+  let shuttingDown = false
   const shutdown = async () => {
-    if (quitting) return
-    quitting = true
+    if (shuttingDown) return
+    shuttingDown = true
     try {
       await runCleanup()
     } catch {}

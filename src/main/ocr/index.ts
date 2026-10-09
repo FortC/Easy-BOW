@@ -62,20 +62,27 @@ function ensureWindow(): BrowserWindow {
   return workerWin
 }
 
+let jobChain: Promise<unknown> = Promise.resolve()
+
 function callWorker(msg: Record<string, unknown>, timeoutMs = 30000, force = false): Promise<any> {
-  return new Promise((resolve, reject) => {
-    if (!workerWin || workerWin.isDestroyed() || (!ready && !force)) {
-      reject(new Error('OCR worker 未就绪'))
-      return
-    }
-    const id = nextId++
-    const timer = setTimeout(() => {
-      pending.delete(id)
-      reject(new Error('OCR 处理超时'))
-    }, timeoutMs)
-    pending.set(id, { resolve, reject, timer })
-    workerWin.webContents.send('ocr:run', { id, ...msg })
-  })
+  const run = () =>
+    new Promise<any>((resolve, reject) => {
+      if (!workerWin || workerWin.isDestroyed() || (!ready && !force)) {
+        reject(new Error('OCR worker 未就绪'))
+        return
+      }
+      const id = nextId++
+      const timer = setTimeout(() => {
+        pending.delete(id)
+        reject(new Error('OCR 处理超时'))
+      }, timeoutMs)
+      pending.set(id, { resolve, reject, timer })
+      workerWin.webContents.send('ocr:run', { id, ...msg })
+    })
+  // 串行排队：worker 单 handler 顺序消费，并发请求会让同一识别会话交错
+  const p = jobChain.then(run, run)
+  jobChain = p.catch(() => {})
+  return p
 }
 
 /**
@@ -145,10 +152,28 @@ export async function tryInitOcr(): Promise<{ enabled: boolean; reason?: string 
         workerWin?.destroy()
       } catch {}
       workerWin = null
+      initing = null // 允许下次按需重试（后台占用期间加载失败不应永久禁用）
       return { enabled: false, reason: `OCR 初始化失败: ${e?.message || e}` }
     }
   })()
   return initing
+}
+
+/** 上次按需重试时间（30s 节流，防高频空转重试） */
+let lastInitTry = 0
+
+/** 就绪保障：未就绪时按需重试一次初始化（30s 节流）；模型缺失时静默保持禁用 */
+async function ensureReady(): Promise<boolean> {
+  if (ready) return true
+  const now = Date.now()
+  if (now - lastInitTry < 30000) return false
+  lastInitTry = now
+  try {
+    const st = await tryInitOcr()
+    return !!st.enabled
+  } catch {
+    return false
+  }
 }
 
 export function isOcrEnabled(): boolean {
@@ -157,13 +182,14 @@ export function isOcrEnabled(): boolean {
 
 /** 自测入口：对整图做 det+rec，返回识别文本 */
 export async function testRecognize(png: Buffer): Promise<string> {
+  if (!(await ensureReady())) return ''
   const r = await callWorker({ png: toTransferable(png) }, 60000)
   return r.text || ''
 }
 
 /** 整页截图 OCR（read_content 降级 / DOM 稀疏兜底） */
 export async function ocrPageText(tabManager: TabManager): Promise<string | null> {
-  if (!ready) return null
+  if (!(await ensureReady())) return null
   const tab = tabManager.active()
   if (!tab) return null
   const png = await tab.cdp.screenshotPng()
@@ -181,7 +207,7 @@ export async function ocrPageText(tabManager: TabManager): Promise<string | null
  * 每页最多处理 10 个区域。
  */
 export async function ocrEnhanceExtract(tabManager: TabManager, res: ExtractResult, _png: Buffer | null): Promise<ExtractResult> {
-  if (!ready || !res.candidates.length) return res
+  if (!res.candidates.length || !(await ensureReady())) return res
   const targets = res.candidates
     .map((c, i) => ({ c, i }))
     .filter(

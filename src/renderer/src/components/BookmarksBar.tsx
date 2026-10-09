@@ -1,3 +1,4 @@
+import { Star, X } from 'lucide-react'
 import type { KeyboardEvent } from 'react'
 import type { Bookmark } from '@shared/types'
 
@@ -20,7 +21,7 @@ export default function BookmarksBar(props: {
   return (
     <div className="favbar" aria-label="收藏栏">
       <span className="favbar-label" title="收藏的站点">
-        ★
+        <Star size={12} strokeWidth={2} fill="currentColor" />
       </span>
       <div className="favbar-list">
         {props.bookmarks.map((b) => (
@@ -44,7 +45,7 @@ export default function BookmarksBar(props: {
                 props.onRemove(b.url)
               }}
             >
-              ✕
+              <X size={11} strokeWidth={2.5} />
             </button>
           </span>
         ))}

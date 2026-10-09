@@ -1,3 +1,4 @@
+import { Globe, Settings as SettingsIcon } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { AgentStatus, Bookmark, MainEvent, Settings, StepRecord, TabInfo } from '@shared/types'
 import TabBar from './components/TabBar'
@@ -115,6 +116,9 @@ export default function App() {
           break
         case 'step':
           setSteps((s) => [...s, ev.step].slice(-60))
+          break
+        case 'steps-clear':
+          setSteps([])
           break
         case 'toast':
           pushToast(ev.message, ev.kind)
@@ -279,12 +283,12 @@ export default function App() {
           <div className="browser-placeholder">
             {overlayOpen ? (
               <>
-                <span className="ph-icon">⚙</span>
+                <span className="ph-icon"><SettingsIcon size={22} strokeWidth={2} /></span>
                 <span>浏览器已暂时隐藏，关闭弹窗后自动恢复（页面状态不丢失）</span>
               </>
             ) : (
               <>
-                <span className="ph-icon">🌐</span>
+                <span className="ph-icon"><Globe size={22} strokeWidth={2} /></span>
                 <span>浏览器区域加载中…</span>
               </>
             )}
@@ -300,7 +304,6 @@ export default function App() {
           collapsed={panelCollapsed}
           onExpandPanel={() => setPanelCollapsed(false)}
           onExpandEditor={() => setTaskEditorOpen(true)}
-          onOpenSettings={() => setSettingsOpen(true)}
           onOpenKB={() => setKbOpen(true)}
           onOpenSchedule={() => setScheduleOpen(true)}
           onToast={pushToast}

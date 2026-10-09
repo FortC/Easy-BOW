@@ -21,3 +21,9 @@ resources/fastmodel/
 
 # 本地临时中转（旧版本安装包归档，不入库）
 .trash-dist/
+
+# electron-builder 构建资源目录被全局 gitignore 的 build/ 规则误伤：
+# 目录本身豁免，内容除应用图标外仍忽略
+!build/
+build/*
+!build/icon.ico

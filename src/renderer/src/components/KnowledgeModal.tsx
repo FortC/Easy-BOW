@@ -1,3 +1,4 @@
+import { BookOpen, Pencil, Trash2, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import type { KBEntry } from '@shared/types'
 import { useModalFocus } from '../hooks/useDelayedUnmount'
@@ -65,9 +66,9 @@ export default function KnowledgeModal(props: { open: boolean; onClose: () => vo
         tabIndex={-1}
       >
         <div className="modal-head">
-          <h3>📚 问题经验库</h3>
+          <h3 className="with-ico"><BookOpen size={16} strokeWidth={2} /> 问题经验库</h3>
           <button className="close-x" aria-label="关闭问题经验库" title="关闭（Esc）" onClick={requestClose}>
-            ✕
+            <X size={14} strokeWidth={2.5} />
           </button>
         </div>
 
@@ -141,14 +142,14 @@ export default function KnowledgeModal(props: { open: boolean; onClose: () => vo
                         setSolution(e.solution)
                       }}
                     >
-                      ✎
+                      <Pencil size={12} strokeWidth={2} />
                     </button>
                     <button
                       title="删除"
                       aria-label={`删除 ${e.problem || e.domain || '该条目'}`}
                       onClick={() => persist(list.filter((x) => x.id !== e.id))}
                     >
-                      🗑
+                      <Trash2 size={12} strokeWidth={2} />
                     </button>
                   </span>
                 </div>

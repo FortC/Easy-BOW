@@ -1,3 +1,4 @@
+import { X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { HistoryEntry } from '@shared/types'
 import { LAYOUT } from '@shared/types'
@@ -175,7 +176,7 @@ export default function HistoryDropdown(props: {
                   remove(e.url)
                 }}
               >
-                ✕
+                <X size={12} strokeWidth={2.5} />
               </button>
             </div>
           ))}

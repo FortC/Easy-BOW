@@ -1,3 +1,4 @@
+import { Plus, X } from 'lucide-react'
 import type { KeyboardEvent } from 'react'
 import type { TabInfo } from '@shared/types'
 import { MAX_TABS } from '@shared/types'
@@ -56,13 +57,13 @@ export default function TabBar(props: {
               props.onClose(t.id)
             }}
           >
-            ✕
+            <X size={12} strokeWidth={2.5} />
           </button>
         </div>
       ))}
       {props.tabs.length < MAX_TABS && (
         <button className="tab-new" title="新建页签（Ctrl+T）" aria-label="新建页签" onClick={props.onNew}>
-          ＋
+          <Plus size={14} strokeWidth={2.5} />
         </button>
       )}
       <span className="app-title">EasyBow AI 浏览器</span>

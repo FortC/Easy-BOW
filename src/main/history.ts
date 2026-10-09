@@ -1,5 +1,6 @@
 import { app } from 'electron'
-import { readFileSync, writeFileSync, existsSync } from 'fs'
+import { readFileSync, existsSync } from 'fs'
+import { writeJsonAtomic } from './fsutil'
 import { join } from 'path'
 import type { HistoryEntry } from '@shared/types'
 
@@ -37,7 +38,7 @@ function persist(): void {
   saveTimer = setTimeout(() => {
     saveTimer = null
     try {
-      writeFileSync(historyPath(), JSON.stringify(load().slice(0, MAX_ENTRIES)), 'utf-8')
+      writeJsonAtomic(historyPath(), load().slice(0, MAX_ENTRIES))
     } catch (e) {
       console.error('[easybow] 保存历史记录失败:', e)
     }

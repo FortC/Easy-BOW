@@ -2,10 +2,24 @@ import { BrowserWindow, WebContentsView, session, app, Notification } from 'elec
 import { join } from 'path'
 import { Cdp } from './cdp'
 import { friendlyNavError } from './navError'
+import { getSettings } from './settings'
 import { MAX_TABS, type TabInfo } from '@shared/types'
 
 export interface Broadcast {
   (channel: string, payload: unknown): void
+}
+
+/**
+ * R1 指纹一致性：用真实 Chromium 版本动态构造 UA（默认 UA 末尾带 Electron/x.y.z，
+ * 等价于主动声明"我是 Electron 应用"）。不硬编码版本号——UA 与实际渲染引擎版本必须自洽，
+ * 版本不匹配比 Electron 标识更明显。
+ */
+export function chromeLikeUA(): string {
+  const major = String(process.versions.chrome || '').split('.')[0] || '130'
+  return (
+    `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ` +
+    `(KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`
+  )
 }
 
 export interface Tab {
@@ -50,8 +64,12 @@ export class TabManager {
   constructor(win: BrowserWindow, broadcast: Broadcast) {
     this.win = win
     this.broadcast = broadcast
-    this.ses = session.fromPartition('persist:easybow')
+    // R3 持久化会话：登录态/Cookie 跨启动保留（用户首次手动登录后，后续任务都在已登录态下执行——
+    // 对自有账号自动化，真实登录态的价值远高于任何指纹伪装）。persistSession=false 时退回内存会话。
+    this.ses = session.fromPartition(getSettings().persistSession === false ? 'easybow' : 'persist:easybow')
     this.ses.setSpellCheckerEnabled(false)
+    // R1：站点页签统一使用与引擎版本自洽的 Chromium UA（不带 Electron 标识）
+    this.ses.setUserAgent(chromeLikeUA())
 
     // 下载处理：自动保存到系统下载目录
     this.ses.on('will-download', (_e, item) => {
@@ -95,7 +113,10 @@ export class TabManager {
     const r = this.browserRect
     if (this.browserHidden) {
       // 隐藏：只切可见性（webContents 保持存活，登录态/页面状态不丢）。
-      // 不做 removeChildView 反复拆装视图——高频 resize/弹窗开合下拆装会放大合成器卡顿，极端时把渲染器卡死
+      // 不做 removeChildView 反复拆装视图——高频 resize/弹窗开合下拆装会放大合成器卡顿，极端时把渲染器卡死。
+      // bounds 照给：隐藏期间新建的页签若不带尺寸，恢复显示前它是 0x0（Chromium 不做布局，
+      // 元素提取/截图全空），且后续无人再触发 layout 时会一直停留在这个状态
+      t.view.setBounds(r)
       t.view.setVisible(false)
     } else {
       const cv = this.win.contentView
@@ -130,6 +151,7 @@ export class TabManager {
     }
     // 指定 partition 的页签用独立会话（测试页签隔离登录态）；普通页签行为与历史版本一致
     const ses = opts?.partition ? session.fromPartition(opts.partition) : this.ses
+    if (opts?.partition) ses.setUserAgent(chromeLikeUA()) // 独立分区页签同样使用自洽 UA
     const view = new WebContentsView({
       webPreferences: {
         session: ses
@@ -294,7 +316,11 @@ export class TabManager {
       if (/^[\w-]+(\.[\w-]+)+/.test(target)) target = 'https://' + target
       else target = 'https://www.baidu.com/s?wd=' + encodeURIComponent(target)
     }
-    if (!/^https?:|^file:/i.test(target)) return
+    // scheme 白名单：站点页签不可信，打包版只放行 http(s)（file:/data: 是多余攻击面，
+    // 与 setWindowOpenHandler 的 https 限制对齐）；开发/自测保留 file: 以加载本地 fixture
+    //（--selftest 是 CI/开发者主动触发的受信路径，打包版自测同样需要 file:）
+    const allowFile = !app.isPackaged || process.argv.includes('--selftest')
+    if (!/^https?:/i.test(target) && !(allowFile && /^file:/i.test(target))) return
     t.loading = true
     this.emitTabs()
     try {
@@ -332,6 +358,18 @@ export class TabManager {
     try {
       if (Notification.isSupported()) {
         const n = new Notification({ title: 'EasyBow 需要人工处理', body: '检测到滑块/验证码，请在浏览器中手动完成后点击「继续」。' })
+        n.show()
+      }
+      this.win.flashFrame(true)
+      setTimeout(() => this.win.flashFrame(false), 4000)
+    } catch {}
+  }
+
+  /** 通用人工介入提醒（节点复核多次失败等场景）：toast + 系统通知 + 任务栏闪烁 */
+  notifyHuman(title: string, body: string): void {
+    try {
+      if (Notification.isSupported()) {
+        const n = new Notification({ title: `EasyBow ${title}`, body })
         n.show()
       }
       this.win.flashFrame(true)

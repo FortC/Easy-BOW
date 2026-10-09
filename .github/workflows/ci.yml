@@ -1,0 +1,32 @@
+# CI 门禁（复核报告 C6 建议）：typecheck + 全量 e2e 自测。
+# 自测会启动有头 Electron 并断言 UI 布局，需要 Windows runner（自带桌面会话）。
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  selftest:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: npm install
+      - name: Typecheck
+        run: npm run typecheck
+      - name: e2e selftest（失败即门禁失败；junit 报告留档）
+        run: npm run selftest
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            **/reports/**/*.xml
+            **/reports/**/*.md
+          if-no-files-found: ignore

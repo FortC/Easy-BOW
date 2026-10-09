@@ -30,11 +30,38 @@ export interface Settings {
   visionFallback: boolean
   /** 测试：复用已保存的登录态（启动先探测，已登录则跳过登录步骤；失效才重登） */
   testLoginReuse: boolean
+  /** 节点复核模式：off 关闭 / fast 快速（本地信号+快速决策模型，默认）/ strict 严格（加云端大模型终审） */
+  verifyMode: 'off' | 'fast' | 'strict'
   /** 拟人化速度：normal 正常 / slow 慢速（风控敏感站点） */
   speed: 'normal' | 'slow'
   /** 支持后台/最小化运行（抑制 Chromium 后台节流；重启应用后生效，默认关=与历史行为一致） */
   bgRun?: boolean
+  /** 关闭窗口行为：ask 每次询问（默认）/ tray 最小化到托盘（任务继续跑）/ exit 直接退出 */
+  closeAction?: 'ask' | 'tray' | 'exit'
   homepage: string
+  /* —— v2.0 智能增强开关（全部默认开启；出问题可逐层关闭独立回滚） —— */
+  /** S0 任务级 trace 埋点（userData/traces/） */
+  telemetry?: boolean
+  /** S1 语义重排：按任务关键词把语义相关元素提前（商品名称≈名称） */
+  semanticRecall?: boolean
+  /** S1 填后语义校验：值填对了但字段不对时显式报错（静默错误归零） */
+  semanticVerify?: boolean
+  /** S1 扩展提取：目标关键词一个都没命中时提高上限重提取一次 */
+  boostedExtract?: boolean
+  /** S2 失败分类自愈（定位/语义/页面异变/数据缺失/循环 七类归因） */
+  diagnose?: boolean
+  /** S3 AX Tree 并联感知（浏览器引擎语义叠加进元素列表） */
+  axTree?: boolean
+  /** S4 多候选裁决 + clarify 不确定时升级人工 */
+  multiCandidate?: boolean
+  /** S5 经验自动沉淀（站点字段映射/失败教训/成功路径） */
+  autoExperience?: boolean
+  /** S6 本地小模型语义初筛（主模型输入 80→15 条，token 降约 40%） */
+  prescreen?: boolean
+  /** R2 行为拟真（逐字符键入/贝塞尔鼠标轨迹/惯性滚动；关闭恢复瞬时操作） */
+  humanLike?: boolean
+  /** R3 持久化会话（登录态跨启动保留；默认开=历史行为） */
+  persistSession?: boolean
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -48,9 +75,23 @@ export const DEFAULT_SETTINGS: Settings = {
   vision: false,
   visionFallback: true,
   testLoginReuse: true,
+  verifyMode: 'fast',
   speed: 'normal',
   bgRun: false,
-  homepage: 'https://www.baidu.com'
+  closeAction: 'ask',
+  homepage: 'https://www.baidu.com',
+  // v2.0 智能增强：全部默认开启（独立开关可逐层回滚）
+  telemetry: true,
+  semanticRecall: true,
+  semanticVerify: true,
+  boostedExtract: true,
+  diagnose: true,
+  axTree: true,
+  multiCandidate: true,
+  autoExperience: true,
+  prescreen: true,
+  humanLike: true,
+  persistSession: true
 }
 
 export const MAX_TABS = 5
@@ -78,6 +119,20 @@ export interface Bookmark {
   ts: number
 }
 
+/** 任务模板：任务输入快速填充（支持 {{自动变量}} 与 {{字段:说明}} 填空变量） */
+export interface TaskTemplate {
+  id: number
+  /** 模板名（chips/菜单显示） */
+  name: string
+  /** 分组名（空=未分组） */
+  group: string
+  /** 模板正文 */
+  text: string
+  /** 置顶：显示在输入框上方的快捷 chips 行 */
+  pinned: boolean
+  ts: number
+}
+
 /** 浏览历史条目（主进程记录并持久化） */
 export interface HistoryEntry {
   url: string
@@ -96,6 +151,23 @@ export interface KBEntry {
   problem: string
   /** 正确处理方式（注入给 AI 的指令） */
   solution: string
+  enabled: boolean
+}
+
+/** 自动经验库条目（S5）：AI 在任务中自动沉淀的经验，按域名+任务意图注入提示词 */
+export interface ExperienceEntry {
+  id: number
+  /** 适用站点域名（空=全局） */
+  domain: string
+  kind: 'field_map' | 'lesson' | 'path'
+  /** 匹配键（field_map=意图词 / path=任务摘要 / lesson=失败类型） */
+  key: string
+  /** 值（field_map=实际字段名 / path=节点链 / lesson=正确做法） */
+  value: string
+  /** 置信度：命中成功++ / 命中失败--；≤ -2 自动停用 */
+  score: number
+  createdAt: number
+  updatedAt: number
   enabled: boolean
 }
 
@@ -127,6 +199,8 @@ export type ActionName =
   | 'hover'
   // 视觉兜底：按截图归一化坐标点击（0~1000），用于元素列表定位不到目标时
   | 'click_xy'
+  // S4 不确定时向人工提问（暂停任务等人工回复；每任务最多 3 次）
+  | 'clarify'
 
 /** expect 断言类型 */
 export type ExpectKind =
@@ -169,6 +243,12 @@ export interface AgentAction {
   x?: number
   /** click_xy：截图上的归一化纵坐标 0~1000 */
   y?: number
+  /** S4 多候选：模型列出 2-3 个候选编号（与 click/type 同用、不填 index），系统语义裁决取最优 */
+  candidates?: number[]
+  /** S4 模型自述不确定度 0~1（仅记录，不影响执行） */
+  uncertain?: number
+  /** clarify：要向人工提出的问题 */
+  query?: string
   /** 执行结果摘要（主进程回填） */
   result?: string
   /** 执行错误（主进程回填） */
@@ -183,6 +263,8 @@ export interface StepRecord {
   tabTitle: string
   url: string
   title: string
+  /** 节点链：本步属于第几个节点（1-based；无计划时缺省） */
+  nodeIdx?: number
   /** 视口截图 jpeg dataURL（时间线展示；视觉模式下的模型输入截图另行截取） */
   screenshot?: string
   /** 本步模型是否收到了页面截图（视觉模式） */
@@ -326,6 +408,40 @@ export type AgentRunState =
   | 'error'
   | 'stopped'
 
+/** 节点的结构化预期（L0 确定性复核用；缺省=自然语言预期走模型复核） */
+export interface PlanNodeCheck {
+  kind: 'text_visible' | 'url_contains' | 'title_contains' | 'selector_exists' | 'selector_value' | 'selector_text'
+  value?: string
+  selector?: string
+  negate?: boolean
+}
+
+/** 任务节点（计划阶段产物：意图 + 预期 + 可选确定性校验） */
+export interface PlanNode {
+  intent: string
+  expected: string
+  check?: PlanNodeCheck
+}
+
+/** 节点运行状态（UI 节点进度条渲染用） */
+export type PlanNodeState = 'pending' | 'active' | 'passed' | 'failed' | 'escalated'
+
+export interface PlanNodeStatus {
+  intent: string
+  expected: string
+  status: PlanNodeState
+  /** 最近一次复核未通过的原因（UI 展示；通过后清空） */
+  reason?: string
+  /** 当前节点连续复核未通过次数 */
+  fails?: number
+}
+
+export interface PlanStatus {
+  nodes: PlanNodeStatus[]
+  /** 当前节点序号（1-based） */
+  current: number
+}
+
 export interface AgentStatus {
   state: AgentRunState
   task: string
@@ -333,6 +449,8 @@ export interface AgentStatus {
   statusText: string
   usage: { inputTokens: number; outputTokens: number; steps: number }
   memory: Record<string, string>
+  /** 节点链执行进度（计划失败/复核关闭时缺省） */
+  plan?: PlanStatus
   result?: string
   /** 已排队未注入给模型的人工指导条数 */
   pendingGuidance?: number
@@ -356,6 +474,9 @@ export interface Schedule {
   task: string
   /** 绑定测试用例库条目：到点跑该用例（定时回归）而非自由任务 */
   testCaseId?: number
+  /** 绑定回归执行的环境档案（含生产保护标记）：到点按它解析 baseUrl/protected，
+   *  不传则无生产保护门禁——定时触发也必须能拦截生产环境提交（复核 P1-11） */
+  envName?: string
   enabled: boolean
   /** once=执行一次(at 为绝对时间戳)；daily=每天 dailyMinute(0-1439)；interval=每 intervalMin 分钟 */
   type: 'once' | 'daily' | 'interval'
@@ -373,6 +494,8 @@ export type MainEvent =
   | { channel: 'tabs'; tabs: TabInfo[]; activeTabId: number }
   | { channel: 'agent-status'; status: AgentStatus }
   | { channel: 'step'; step: StepRecord }
+  /** 清空时间线显示（新任务开始 / 用户点「清空」） */
+  | { channel: 'steps-clear' }
   | { channel: 'toast'; message: string; kind: 'info' | 'success' | 'error' | 'captcha' }
   | { channel: 'ocr-status'; enabled: boolean; reason?: string }
   | { channel: 'fastllm'; status: FastLlmState }
@@ -414,6 +537,16 @@ export interface EasybowApi {
   // 问题经验库
   getKB(): Promise<KBEntry[]>
   setKB(entries: KBEntry[]): Promise<KBEntry[]>
+  // 自动经验库（S5：AI 任务中自动沉淀；UI 可查看/删除）
+  getExperience(): Promise<ExperienceEntry[]>
+  setExperience(entries: ExperienceEntry[]): Promise<ExperienceEntry[]>
+  // 任务模板（任务输入快速填充）
+  getTemplates(): Promise<TaskTemplate[]>
+  /** 新建或更新（带 id 为更新） */
+  saveTemplate(t: { name: string; group?: string; text: string; pinned?: boolean; id?: number }): Promise<TaskTemplate[]>
+  deleteTemplate(id: number): Promise<TaskTemplate[]>
+  /** 替换模板/任务文本里的自动变量（{{日期}} {{时间}} {{昨天}} {{今天}} {{明天}} {{当前网址}} {{页签标题}}） */
+  resolveTemplateVars(text: string): Promise<string>
   // 页签
   newTab(url?: string): Promise<{ tabs: TabInfo[]; activeTabId: number }>
   closeTab(id: number): Promise<{ tabs: TabInfo[]; activeTabId: number }>
@@ -428,6 +561,12 @@ export interface EasybowApi {
   clearHistory(): Promise<void>
   // Agent
   startTask(task: string): Promise<void>
+  /** ✨ AI 增强任务描述（格式 + 内容增强，返回增强后的任务文本；不启动任务） */
+  enhanceTask(task: string): Promise<string>
+  /** 人工批准当前节点通过（跳过其复核、视为预期已达成并推进；暂停中会自动继续） */
+  approveNode(): Promise<void>
+  /** 清空显示：时间线/任务记忆/状态回到空闲（仅空闲态可用） */
+  clearDisplay(): Promise<void>
   pauseTask(): Promise<void>
   resumeTask(): Promise<void>
   stopTask(): Promise<void>

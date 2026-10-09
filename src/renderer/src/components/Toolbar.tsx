@@ -1,5 +1,18 @@
 import { useEffect, useRef, useState } from 'react'
 import type { RefObject } from 'react'
+import {
+  ArrowLeft,
+  ArrowRight,
+  FlaskConical,
+  History,
+  PanelRightClose,
+  PanelRightOpen,
+  Pause,
+  Play,
+  RotateCw,
+  Settings,
+  Star
+} from 'lucide-react'
 import type { AgentRunState, TabInfo } from '@shared/types'
 
 export default function Toolbar(props: {
@@ -37,13 +50,13 @@ export default function Toolbar(props: {
   return (
     <div className="toolbar">
       <button className="nav-btn" title="后退" aria-label="后退" disabled={!props.activeTab?.canGoBack} onClick={props.onBack}>
-        ←
+        <ArrowLeft size={16} strokeWidth={2} />
       </button>
       <button className="nav-btn" title="前进" aria-label="前进" disabled={!props.activeTab?.canGoForward} onClick={props.onForward}>
-        →
+        <ArrowRight size={16} strokeWidth={2} />
       </button>
       <button className="nav-btn" title="刷新（F5）" aria-label="刷新" onClick={props.onReload}>
-        ⟳
+        <RotateCw size={16} strokeWidth={2} />
       </button>
       <input
         ref={props.inputRef}
@@ -80,7 +93,7 @@ export default function Toolbar(props: {
         onClick={props.onToggleFav}
         style={props.isFav ? { color: '#f5a623' } : undefined}
       >
-        {props.isFav ? '★' : '☆'}
+        <Star size={16} strokeWidth={2} fill={props.isFav ? 'currentColor' : 'none'} />
         <span className="lbl">收藏</span>
       </button>
       <button
@@ -90,11 +103,11 @@ export default function Toolbar(props: {
         aria-expanded={props.historyOpen}
         onClick={props.onHistory}
       >
-        🕐
+        <History size={16} strokeWidth={2} />
         <span className="lbl">历史</span>
       </button>
       <button className="nav-btn with-label" title="浏览器仿真测试（需求→用例→执行→报告）" aria-label="浏览器仿真测试" onClick={props.onTest}>
-        🧪
+        <FlaskConical size={16} strokeWidth={2} />
         <span className="lbl">测试</span>
       </button>
       {pauseable && (
@@ -103,7 +116,15 @@ export default function Toolbar(props: {
           onClick={props.onTakeover}
           title={props.agentState === 'running' ? '暂停 AI，人工接管操作浏览器' : 'AI 已暂停，点击继续'}
         >
-          {props.agentState === 'running' ? '⏸ 人工接管' : '▶ 继续任务'}
+          {props.agentState === 'running' ? (
+            <>
+              <Pause size={14} strokeWidth={2} /> 人工接管
+            </>
+          ) : (
+            <>
+              <Play size={14} strokeWidth={2} /> 继续任务
+            </>
+          )}
         </button>
       )}
       <button
@@ -113,11 +134,11 @@ export default function Toolbar(props: {
         aria-pressed={props.panelCollapsed}
         onClick={props.onTogglePanel}
       >
-        {props.panelCollapsed ? '◧' : '◨'}
+        {props.panelCollapsed ? <PanelRightOpen size={16} strokeWidth={2} /> : <PanelRightClose size={16} strokeWidth={2} />}
         <span className="lbl">面板</span>
       </button>
       <button className="nav-btn with-label" title="设置" aria-label="设置" onClick={props.onSettings}>
-        ⚙
+        <Settings size={16} strokeWidth={2} />
         <span className="lbl">设置</span>
       </button>
     </div>
