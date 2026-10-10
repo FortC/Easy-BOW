@@ -66,6 +66,9 @@ interface Resolved {
   /** T5 state 时效：执行前实时属性（快照的 disabled/checked 是时点值，不可信） */
   disabled?: boolean
   checked?: boolean
+  /** v4.2：path 解析到的元素实时可见文本（innerText/aria-label/title，≤40 字）——
+   *  用于「path 命中但 SPA 重渲染后指向了错误兄弟元素」的文本校验 */
+  text?: string
   /** 实际解析命中的候选（重定位后与原快照序号可能不同）：
    *  路径定位/赋值回读/标签判定必须全部消费它——否则点击的是重定位元素、
    *  赋值却落在旧快照序号上，重复文案/空文本控件场景直接「填错字段」（P0-1） */
@@ -488,7 +491,23 @@ export class Executor {
     if (!snap || index < 0 || index >= snap.candidates.length) return { found: false }
     const cand = snap.candidates[index]
     const r = await t.cdp.evaluate<Resolved>(RESOLVE_FN, [cand.framePaths, cand.path, cand.tag])
-    if (r.found) return { ...r, cand }
+    // v4.2 文本校验（「参数详情点不中」根因修复）：SPA 重渲染后 children 序号可能仍然有效
+    // 但已指向错误兄弟元素（点到了相邻 tab 还报成功）。path 命中且标签相符时，再比对解析到的
+    // 实时文本与快照候选文本——不符则视为失效，降级走锚点/语义重定位链。
+    // 输入类元素跳过（其「文本」是 value，输入后会变，比对必误伤）；空文本候选（图标）无从比对
+    if (r.found) {
+      const want = (cand.text || '').replace(/\s+/g, ' ').trim()
+      const got = (r.text || '').replace(/\s+/g, ' ').trim()
+      const textSensitive = !/^(INPUT|TEXTAREA|SELECT)$/.test(cand.tag) && want.length >= 2
+      const mismatch =
+        textSensitive && got.length >= 1 && !got.includes(want) && !want.includes(got) && want !== got
+      if (mismatch) {
+        // 与 path 失效同路径：fresh 重提取 + 定位链（锚点 → 文本全等 → …），文本不符的不会被
+        // ②级以外的位置级捞回——错点风险在此被截断
+      } else {
+        return { ...r, cand }
+      }
+    }
     const chainOn = getSettings().locatorChain !== false
     // DOM 变动（SPA 重渲染/虚拟滚动/懒加载占位/节点回收）：重新提取并按定位链重定位
     const fresh = await this.extract(t)

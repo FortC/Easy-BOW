@@ -614,7 +614,9 @@ function matchedViaOf(c: Candidate, task: string): string[] {
   return scoreCandidate({ text: c.text, extra: c.extra, role: c.role, tag: c.tag }, task).matchedVia
 }
 
-/** 在页面上下文中按 framePaths+path 定位元素，返回页面绝对坐标（供 CDP 点击） */
+/** 在页面上下文中按 framePaths+path 定位元素，返回页面绝对坐标（供 CDP 点击）。
+ *  v4.2：额外回传元素可见文本（innerText/aria-label/value）——上层用于「path 命中但
+ *  解析到了错误兄弟元素」的文本校验（SPA 重渲染后 children 序号仍有效但指向变了） */
 export const RESOLVE_FN = String(function resolve(framePaths: number[][], path: number[], expectTag?: string) {
   function walk(doc: Document, p: number[]): Element | null {
     let el: any = doc.documentElement
@@ -675,6 +677,12 @@ export const RESOLVE_FN = String(function resolve(framePaths: number[][], path: 
   let checked: boolean | undefined
   if (any.checked !== undefined && any.checked !== null) checked = any.checked === true
   else if (ariaChecked !== null) checked = ariaChecked === 'true'
+  // v4.2 文本回传：供上层校验「path 解析到的元素」与快照候选是否同一个
+  const txt = String(
+    (el as HTMLElement).innerText || el.getAttribute('aria-label') || el.getAttribute('title') || ''
+  )
+    .replace(/\s+/g, ' ')
+    .trim()
   return {
     found: true,
     x: Math.round(x * 100) / 100,
@@ -685,7 +693,8 @@ export const RESOLVE_FN = String(function resolve(framePaths: number[][], path: 
     w: Math.round(r.width),
     h: Math.round(r.height),
     disabled,
-    checked
+    checked,
+    text: txt.slice(0, 40)
   }
 })
 

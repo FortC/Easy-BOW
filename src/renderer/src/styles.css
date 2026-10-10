@@ -1334,3 +1334,33 @@ img.hdrop-fav { object-fit: contain; }
   padding: 6px 10px;
   margin-bottom: 8px;
 }
+
+/* —————— 智能 tab：紧凑开关网格 —————— */
+.pane-intro-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+.pane-intro-row .pane-intro { flex: 1; margin-bottom: 0; }
+.cfg-group { margin: 12px 0 6px; font-size: var(--fs-sub, 14px); font-weight: 600; color: var(--text1, #22272e); }
+.cfg-group span { font-weight: 400; font-size: var(--fs-sm, 12px); color: var(--text2, #7a8494); margin-left: 8px; }
+.cfg-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.cfg-toggle {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 7px 10px; border: 1px solid var(--border, #e2e5ea); border-radius: 8px;
+  background: var(--input-bg, #fafbfc); cursor: pointer; min-width: 0;
+  transition: border-color var(--t-base) var(--ease), background var(--t-base) var(--ease);
+}
+.cfg-toggle:hover { border-color: var(--accent); }
+.cfg-name { font-size: var(--fs-sm, 12px); color: var(--text1, #22272e); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cfg-select { font-size: var(--fs-sm, 12px); border: 1px solid var(--border, #e2e5ea); border-radius: 6px; padding: 2px 4px; background: #fff; }
+.cfg-switch {
+  flex: none; position: relative; width: 34px; height: 20px; border-radius: 10px;
+  border: none; background: #cfd6e0; cursor: pointer; padding: 0;
+  transition: background var(--t-base) var(--ease);
+}
+.cfg-switch.on { background: var(--accent); }
+.cfg-knob {
+  position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+  transition: left var(--t-base) var(--ease);
+}
+.cfg-switch.on .cfg-knob { left: 16px; }
+.cfg-details { margin-top: 12px; border: 1px solid var(--border, #e2e5ea); border-radius: 8px; padding: 8px 12px; background: var(--input-bg, #fafbfc); }
+.cfg-details summary { cursor: pointer; font-size: var(--fs-sub, 14px); font-weight: 600; color: var(--text1, #22272e); }

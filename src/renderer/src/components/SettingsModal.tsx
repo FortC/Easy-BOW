@@ -23,6 +23,25 @@ const TABS: Array<{ key: SettingsTab; label: string; icon: typeof Plug }> = [
   { key: 'browser', label: '浏览器', icon: Globe }
 ]
 
+/** 智能 tab 的紧凑开关行：名称 + iOS 风格滑动开关（取代 20 个下拉框，一眼扫完） */
+function Toggle(props: { label: string; tip?: string; on: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <label className="cfg-toggle" title={props.tip || ''}>
+      <span className="cfg-name">{props.label}</span>
+      <button
+        type="button"
+        className={`cfg-switch${props.on ? ' on' : ''}`}
+        role="switch"
+        aria-checked={props.on}
+        aria-label={props.label}
+        onClick={() => props.onChange(!props.on)}
+      >
+        <span className="cfg-knob" />
+      </button>
+    </label>
+  )
+}
+
 export default function SettingsModal(props: {
   open?: boolean
   initial: Settings | null
@@ -406,218 +425,120 @@ export default function SettingsModal(props: {
 
         {tab === 'smart' && (
           <div className="tab-pane" role="tabpanel">
-            <div className="pane-intro">感知与智能化开关：v2 智能增强 + v3 操控升级，全部默认开启、可逐项关闭独立回滚</div>
-
-            <div className="form-row">
-              <label>🧠 智能增强（v2.0：语义匹配 / 失败自愈 / 经验沉淀）</label>
-              <div className="field-hint">
-                语义重排把与任务相关的元素提前（商品名称≈品名）；填后校验把「值填对但字段填错」显式报错；
-                失败自愈按七类失败归因并注入修正提示；AX 树给自定义控件补浏览器引擎语义
+            <div className="pane-intro-row">
+              <div className="pane-intro" style={{ marginBottom: 0 }}>
+                感知与智能化开关：全部默认开启、可独立关闭回滚（点击行内开关切换；悬停名称看说明）
               </div>
-            </div>
-            <div className="form-inline">
-              <div className="form-row">
-                <label>语义重排</label>
-                <select value={s.semanticRecall === false ? '0' : '1'} onChange={(e) => set({ semanticRecall: e.target.value === '1' })}>
-                  <option value="1">开启（默认）</option>
-                  <option value="0">关闭</option>
-                </select>
-              </div>
-              <div className="form-row">
-                <label>填后语义校验</label>
-                <select value={s.semanticVerify === false ? '0' : '1'} onChange={(e) => set({ semanticVerify: e.target.value === '1' })}>
-                  <option value="1">开启（默认）</option>
-                  <option value="0">关闭</option>
-                </select>
-              </div>
-              <div className="form-row">
-                <label>扩展提取</label>
-                <select value={s.boostedExtract === false ? '0' : '1'} onChange={(e) => set({ boostedExtract: e.target.value === '1' })}>
-                  <option value="1">开启（默认）</option>
-                  <option value="0">关闭</option>
-                </select>
-              </div>
-            </div>
-            <div className="form-inline">
-              <div className="form-row">
-                <label>失败自愈诊断</label>
-                <select value={s.diagnose === false ? '0' : '1'} onChange={(e) => set({ diagnose: e.target.value === '1' })}>
-                  <option value="1">开启（默认）</option>
-                  <option value="0">关闭</option>
-                </select>
-              </div>
-              <div className="form-row">
-                <label>多候选裁决</label>
-                <select value={s.multiCandidate === false ? '0' : '1'} onChange={(e) => set({ multiCandidate: e.target.value === '1' })}>
-                  <option value="1">开启（默认）</option>
-                  <option value="0">关闭</option>
-                </select>
-              </div>
-              <div className="form-row">
-                <label>经验自动沉淀</label>
-                <select value={s.autoExperience === false ? '0' : '1'} onChange={(e) => set({ autoExperience: e.target.value === '1' })}>
-                  <option value="1">开启（默认）</option>
-                  <option value="0">关闭</option>
-                </select>
-              </div>
-            </div>
-            <div className="form-inline">
-              <div className="form-row">
-                <label>本地语义初筛</label>
-                <select value={s.prescreen === false ? '0' : '1'} onChange={(e) => set({ prescreen: e.target.value === '1' })}>
-                  <option value="1">开启（默认）</option>
-                  <option value="0">关闭</option>
-                </select>
-              </div>
-              <div className="form-row">
-                <label>拟人化操作</label>
-                <select value={s.humanLike === false ? '0' : '1'} onChange={(e) => set({ humanLike: e.target.value === '1' })}>
-                  <option value="1">开启（默认：逐字符输入/曲线鼠标）</option>
-                  <option value="0">关闭（瞬时操作，最快）</option>
-                </select>
-              </div>
-              <div className="form-row">
-                <label>运行埋点（trace）</label>
-                <select value={s.telemetry === false ? '0' : '1'} onChange={(e) => set({ telemetry: e.target.value === '1' })}>
-                  <option value="1">开启（默认：本地 jsonl，不发任何数据）</option>
-                  <option value="0">关闭</option>
-                </select>
-              </div>
+              <button
+                className="btn"
+                title="把本页全部开关恢复为官方默认值"
+                onClick={() =>
+                  set({
+                    semanticRecall: true,
+                    semanticVerify: true,
+                    boostedExtract: true,
+                    prescreen: true,
+                    axTree: true,
+                    ocrEnhance: true,
+                    structuredOut: true,
+                    timelineShot: 'smart',
+                    diagnose: true,
+                    multiCandidate: true,
+                    reflection: true,
+                    replan: true,
+                    actionVerify: true,
+                    smartWait: true,
+                    locatorChain: true,
+                    shadowDom: true,
+                    humanLike: true,
+                    telemetry: true,
+                    persistSession: true,
+                    autoExperience: true
+                  })
+                }
+              >
+                ↺ 恢复默认
+              </button>
             </div>
 
-            <div className="form-row">
-              <label>⚡ 操控升级（v3.0/v4.0：智能等待 / 定位链 / 反思重规划 / 视觉编号标注）</label>
-              <div className="field-hint">
-                智能等待用页面静默信号替代固定盲等；定位链在页面改版后按容器锚点/语义键重定位（写操作禁坐标兜底）；
-                反思禁止重复失败方式、卡住自动重规划（重规划后收尾强制 L2 复核）
-              </div>
-            </div>
-            <div className="form-inline">
-              <div className="form-row">
-                <label>智能等待</label>
-                <select value={s.smartWait === false ? '0' : '1'} onChange={(e) => set({ smartWait: e.target.value === '1' })}>
-                  <option value="1">开启（默认：DOM/网络静默信号）</option>
-                  <option value="0">关闭（固定等待，最保守）</option>
-                </select>
-              </div>
-              <div className="form-row">
-                <label>定位链</label>
-                <select value={s.locatorChain === false ? '0' : '1'} onChange={(e) => set({ locatorChain: e.target.value === '1' })}>
-                  <option value="1">开启（默认：锚点/语义/就近重定位）</option>
-                  <option value="0">关闭（退回「全等+序号」仲裁）</option>
-                </select>
-              </div>
-              <div className="form-row">
-                <label>Shadow DOM</label>
-                <select value={s.shadowDom === false ? '0' : '1'} onChange={(e) => set({ shadowDom: e.target.value === '1' })}>
-                  <option value="1">穿透（默认：组件库表单可见可操作）</option>
-                  <option value="0">关闭（回滚 v2.x：shadow 内元素不可见）</option>
-                </select>
-              </div>
-            </div>
-            <div className="form-inline">
-              <div className="form-row">
-                <label>反思（失败清单）</label>
-                <select value={s.reflection === false ? '0' : '1'} onChange={(e) => set({ reflection: e.target.value === '1' })}>
-                  <option value="1">开启（默认：禁止重复失败方式）</option>
-                  <option value="0">关闭</option>
-                </select>
-              </div>
-              <div className="form-row">
-                <label>动态重规划</label>
-                <select value={s.replan === false ? '0' : '1'} onChange={(e) => set({ replan: e.target.value === '1' })}>
-                  <option value="1">开启（默认：卡住自动重排节点）</option>
-                  <option value="0">关闭</option>
-                </select>
-              </div>
-              <div className="form-row">
-                <label>动作后核验</label>
-                <select value={s.actionVerify === false ? '0' : '1'} onChange={(e) => set({ actionVerify: e.target.value === '1' })}>
-                  <option value="1">开启（默认：页面无变化时提示）</option>
-                  <option value="0">关闭</option>
-                </select>
-              </div>
-            </div>
-            <div className="form-inline">
-              <div className="form-row">
-                <label>结构化输出</label>
-                <select value={s.structuredOut === false ? '0' : '1'} onChange={(e) => set({ structuredOut: e.target.value === '1' })}>
-                  <option value="1">开启（默认：JSON schema 原生输出，自动降级）</option>
-                  <option value="0">关闭（纯文本 JSON）</option>
-                </select>
-              </div>
-              <div className="form-row">
-                <label>AX 树感知</label>
-                <select value={s.axTree === false ? '0' : '1'} onChange={(e) => set({ axTree: e.target.value === '1' })}>
-                  <option value="1">开启（默认）</option>
-                  <option value="0">关闭</option>
-                </select>
-              </div>
-              <div className="form-row">
-                <label>OCR 图标增强</label>
-                <select value={s.ocrEnhance === false ? '0' : '1'} onChange={(e) => set({ ocrEnhance: e.target.value === '1' })}>
-                  <option value="1">开启（默认：后台并行，不拖慢单步）</option>
-                  <option value="0">关闭（图标无文字时不识别）</option>
-                </select>
-              </div>
-            </div>
-            <div className="form-inline">
-              <div className="form-row">
-                <label>时间线截图</label>
+            <div className="cfg-group">语义与感知 <span>元素提取、语义匹配与结构化输出的增强项</span></div>
+            <div className="cfg-grid">
+              <Toggle label="语义重排" tip="把与任务语义相关的元素提到列表前面（商品名称≈品名）" on={s.semanticRecall !== false} onChange={(v) => set({ semanticRecall: v })} />
+              <Toggle label="填后语义校验" tip="值填对了但字段不对时显式报错（静默错误归零）" on={s.semanticVerify !== false} onChange={(v) => set({ semanticVerify: v })} />
+              <Toggle label="扩展提取" tip="目标关键词一个都没命中时提高上限重提取一次" on={s.boostedExtract !== false} onChange={(v) => set({ boostedExtract: v })} />
+              <Toggle label="本地语义初筛" tip="候选过多时本地小模型先筛 Top-20（视口前 8 强制保留，1.2s 预算）" on={s.prescreen !== false} onChange={(v) => set({ prescreen: v })} />
+              <Toggle label="AX 树感知" tip="浏览器引擎计算的可访问性语义叠加进元素列表（自定义控件友好）" on={s.axTree !== false} onChange={(v) => set({ axTree: v })} />
+              <Toggle label="OCR 图标增强" tip="给无文字的图片类候选补 OCR 标签（后台并行，不拖慢单步）" on={s.ocrEnhance !== false} onChange={(v) => set({ ocrEnhance: v })} />
+              <Toggle label="结构化输出" tip="JSON schema 原生输出（探测式启用，失败自动降级）" on={s.structuredOut !== false} onChange={(v) => set({ structuredOut: v })} />
+              <label className="cfg-toggle" title="时间线截图的清晰度分级">
+                <span className="cfg-name">时间线截图</span>
                 <select
+                  className="cfg-select"
                   value={s.timelineShot ?? 'smart'}
                   onChange={(e) => set({ timelineShot: e.target.value as 'all' | 'smart' | 'off' })}
                 >
-                  <option value="smart">分级（默认：常规缩略/出错与完成高清）</option>
-                  <option value="all">全部高清</option>
+                  <option value="smart">分级</option>
+                  <option value="all">全高清</option>
                   <option value="off">不截图</option>
                 </select>
-              </div>
-              <div className="form-row">
-                <label>持久化会话</label>
-                <select
-                  value={s.persistSession === false ? '0' : '1'}
-                  onChange={(e) => set({ persistSession: e.target.value === '1' })}
-                >
-                  <option value="1">开启（默认：登录态跨启动保留）</option>
-                  <option value="0">关闭（每次启动全新会话）</option>
-                </select>
-              </div>
+              </label>
             </div>
 
-            <div className="form-row">
-              <label>
-                自动经验库（AI 任务中自动沉淀的站点字段映射/教训/成功路径，注入提示词加速二次执行）
-                {expList && expList.length > 0 && (
-                  <span className="ccimport-btn" style={{ marginLeft: 8 }} onClick={clearExp}>
-                    清空
-                  </span>
-                )}
-              </label>
-              {expList === null ? (
-                <div className="field-hint">读取中…</div>
-              ) : expList.length === 0 ? (
-                <div className="field-hint">暂无自动经验——跑几个任务后，AI 会把「商品名称→实际字段名」这类对应关系自动记下来</div>
-              ) : (
-                <div className="ccimport-list">
-                  {expList.slice(0, 12).map((e) => (
-                    <div key={e.id} className="ccimport-item" title={e.value}>
-                      <span className="ccimport-tag">{e.kind === 'field_map' ? '字段映射' : e.kind === 'lesson' ? '教训' : '路径'}</span>
-                      <span className="ccimport-name">{e.domain || '全局'}</span>
-                      <span className="ccimport-meta">
-                        {e.key.slice(0, 16)} → {e.value.slice(0, 40)}（验证 {e.score} 次{e.enabled ? '' : '，已停用'}）
-                      </span>
-                      <span className="ccimport-tag" onClick={() => removeExp(e.id)} title="删除这条经验">
-                        <X size={11} strokeWidth={2.5} />
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
+            <div className="cfg-group">自愈与守护 <span>失败恢复、防错点与等待策略</span></div>
+            <div className="cfg-grid">
+              <Toggle label="失败自愈诊断" tip="按七类失败归因并注入修正提示" on={s.diagnose !== false} onChange={(v) => set({ diagnose: v })} />
+              <Toggle label="多候选裁决" tip="模型给出 2-3 个候选编号时按语义相似度自动定夺" on={s.multiCandidate !== false} onChange={(v) => set({ multiCandidate: v })} />
+              <Toggle label="反思失败清单" tip="同一目标同一方式失败 2 次后禁止第 3 次重复" on={s.reflection !== false} onChange={(v) => set({ reflection: v })} />
+              <Toggle label="动态重规划" tip="连续无节点推进时自动重排剩余节点（收尾强制云端复核）" on={s.replan !== false} onChange={(v) => set({ replan: v })} />
+              <Toggle label="动作后核验" tip="动作后页面无变化时显式提示，防止模型脑补成功" on={s.actionVerify !== false} onChange={(v) => set({ actionVerify: v })} />
+              <Toggle label="智能等待" tip="DOM/网络静默信号替代固定盲等（特殊页面自动熔断回退）" on={s.smartWait !== false} onChange={(v) => set({ smartWait: v })} />
+              <Toggle label="定位链" tip="元素失效后按容器锚点/语义键重定位（含 path 命中文本校验）" on={s.locatorChain !== false} onChange={(v) => set({ locatorChain: v })} />
+              <Toggle label="Shadow DOM" tip="元素提取穿透 open shadow root（组件库表单可见可操作）" on={s.shadowDom !== false} onChange={(v) => set({ shadowDom: v })} />
             </div>
+
+            <div className="cfg-group">拟人与数据 <span>操作节奏、埋点与会话</span></div>
+            <div className="cfg-grid">
+              <Toggle label="拟人化操作" tip="逐字符输入 + 曲线移动鼠标（风控敏感站点建议开启；极速档自动跳过）" on={s.humanLike !== false} onChange={(v) => set({ humanLike: v })} />
+              <Toggle label="经验自动沉淀" tip="AI 任务中自动积累站点字段映射/教训/成功路径" on={s.autoExperience !== false} onChange={(v) => set({ autoExperience: v })} />
+              <Toggle label="运行埋点" tip="本地 jsonl 记录步耗时/失败分类（不发任何数据）" on={s.telemetry !== false} onChange={(v) => set({ telemetry: v })} />
+              <Toggle label="持久化会话" tip="登录态跨启动保留" on={s.persistSession !== false} onChange={(v) => set({ persistSession: v })} />
+            </div>
+
+            <details className="cfg-details">
+              <summary>自动经验库（{expList?.length ?? 0} 条）</summary>
+              <div className="form-row" style={{ marginTop: 8 }}>
+                <label>
+                  AI 任务中自动沉淀的站点字段映射/教训/成功路径，注入提示词加速二次执行
+                  {expList && expList.length > 0 && (
+                    <span className="ccimport-btn" style={{ marginLeft: 8 }} onClick={clearExp}>
+                      清空
+                    </span>
+                  )}
+                </label>
+                {expList === null ? (
+                  <div className="field-hint">读取中…</div>
+                ) : expList.length === 0 ? (
+                  <div className="field-hint">暂无自动经验——跑几个任务后，AI 会把「商品名称→实际字段名」这类对应关系自动记下来</div>
+                ) : (
+                  <div className="ccimport-list">
+                    {expList.slice(0, 12).map((e) => (
+                      <div key={e.id} className="ccimport-item" title={e.value}>
+                        <span className="ccimport-tag">{e.kind === 'field_map' ? '字段映射' : e.kind === 'lesson' ? '教训' : '路径'}</span>
+                        <span className="ccimport-name">{e.domain || '全局'}</span>
+                        <span className="ccimport-meta">
+                          {e.key.slice(0, 16)} → {e.value.slice(0, 40)}（验证 {e.score} 次{e.enabled ? '' : '，已停用'}）
+                        </span>
+                        <span className="ccimport-tag" onClick={() => removeExp(e.id)} title="删除这条经验">
+                          <X size={11} strokeWidth={2.5} />
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </details>
           </div>
         )}
-
         {tab === 'browser' && (
           <div className="tab-pane" role="tabpanel">
             <div className="pane-intro">浏览器行为与关于</div>
