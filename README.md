@@ -40,8 +40,8 @@ npm run fetch:model  # （可选）预拉取本地快速决策模型到 resource
 npm run dist         # 自动拉取模型 + 构建 + 打包：安装包 + 便携版到 dist/
 ```
 
-- `dist/EasyBow-Setup-3.0.1.exe` — NSIS 安装包（约 477MB，**已内置本地快速决策模型**，装完即用）
-- `dist/EasyBow-Portable-3.0.1.exe` — 免安装便携版（约 477MB，同内置）
+- `dist/EasyBow-Setup-4.0.0.exe` — NSIS 安装包（约 477MB，**已内置本地快速决策模型**，装完即用）
+- `dist/EasyBow-Portable-4.0.0.exe` — 免安装便携版（约 477MB，同内置）
 
 ### 使用步骤
 

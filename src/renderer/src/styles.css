@@ -1284,3 +1284,51 @@ img.hdrop-fav { object-fit: contain; }
   padding: 24px 12px; text-align: center;
   color: var(--text3); font-size: var(--fs-sm); line-height: 1.8;
 }
+
+/* —————— 设置弹窗分类标签页（配置项按 接口/执行/智能/浏览器 分组） —————— */
+.settings-tabs {
+  flex: none;
+  display: flex;
+  gap: 4px;
+  padding: 0 22px;
+  border-bottom: 1px solid var(--border, #e3e6ec);
+}
+.settings-tab {
+  appearance: none;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px 9px;
+  margin-bottom: -1px;
+  font-size: var(--fs-sub, 14px);
+  font-weight: 600;
+  color: var(--text2, #5b6472);
+  border-bottom: 2px solid transparent;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  transition: color var(--t-base) var(--ease), background var(--t-base) var(--ease), border-color var(--t-base) var(--ease);
+}
+.settings-tab:hover { color: var(--text1, #22272e); background: rgba(51, 112, 255, 0.04); }
+.settings-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.settings-tab.active svg { color: var(--accent); }
+.settings-tab svg { color: var(--text2, #8a93a3); }
+/* 面板顶部一行简介：交代本页管什么，降低「配置项太多」的认知负担 */
+.tab-pane { display: flex; flex-direction: column; gap: 4px; animation: fadeInTab var(--t-base) var(--ease); }
+@keyframes fadeInTab {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: none; }
+}
+.pane-intro {
+  font-size: var(--fs-sm, 12px);
+  color: var(--text2, #7a8494);
+  background: #f2f5fa;
+  border: 1px solid #e6ebf3;
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  margin-bottom: 8px;
+}

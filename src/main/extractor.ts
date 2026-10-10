@@ -538,6 +538,12 @@ export function formatCandidates(res: ExtractResult, withCoords = false, keepIdx
       const nx = Math.round(((c.rect.x + c.rect.w / 2) / vw) * 1000)
       const ny = Math.round(((c.rect.y + c.rect.h / 2) / vh) * 1000)
       parts.push(`@${Math.max(0, Math.min(1000, nx))},${Math.max(0, Math.min(1000, ny))}`)
+    } else if (c.inViewport && vw > 0 && vh > 0) {
+      // v4/A4：纯文本模式补粗粒度位置（8×6 网格，行列从 0 起）——「顶部菜单/底部下一页/中部表单」
+      // 这类空间指代可落地；每行只多 ~8 字符，token 代价可忽略
+      const gx = Math.max(0, Math.min(7, Math.floor(((c.rect.x + c.rect.w / 2) / vw) * 8)))
+      const gy = Math.max(0, Math.min(5, Math.floor(((c.rect.y + c.rect.h / 2) / vh) * 6)))
+      parts.push(`(格${gx},${gy})`)
     }
     if (!c.inViewport) parts.push('(需滚动到)')
     lines.push(parts.join(' '))
@@ -573,9 +579,9 @@ export function formatCandidates(res: ExtractResult, withCoords = false, keepIdx
 }
 
 /**
- * S1 语义重排：语义分 ≥ 0.5 的元素显著提前（按分排序），其余保持原序。
+ * S1 语义重排：语义分 ≥0.5 的 Top-N（topBoost 个，v4/A6 修订——此前全部 ≥0.5 都提前，
+ * 常见词如「订单/确定」会把一堆无关元素提到前面挤掉视口内主操作）显著提前，其余保持原序。
  * 必须在 executor 快照落盘前调用（编号即最终编号）；填充 semanticHints（Top-6 命中项及理由）。
- * 输入顺序仅来自视口/角色评分，与任务意图无关——这是「目标被截断/排后」短板的根治。
  */
 export function rerankByTask(res: ExtractResult, task: string, topBoost = 8): ExtractResult {
   if (!task || !res.candidates.length) return res
@@ -583,12 +589,16 @@ export function rerankByTask(res: ExtractResult, task: string, topBoost = 8): Ex
     c,
     sem: scoreCandidate({ text: c.text, extra: c.extra, role: c.role, tag: c.tag }, task).score
   }))
-  const boosted: typeof scored = []
+  const boostedAll: typeof scored = []
   const rest: typeof scored = []
-  for (const s of scored) (s.sem >= 0.5 ? boosted : rest).push(s)
-  if (!boosted.length) return res
-  boosted.sort((a, b) => b.sem - a.sem)
-  const merged = [...boosted, ...rest]
+  for (const s of scored) (s.sem >= 0.5 ? boostedAll : rest).push(s)
+  if (!boostedAll.length) return res
+  boostedAll.sort((a, b) => b.sem - a.sem)
+  // A6：只提前 topBoost 个（默认 8），其余高分项回到原位——重排是「提示」不是「洗牌」
+  const boostedSet = new Set(boostedAll.slice(0, Math.max(1, topBoost)).map((s) => s.c))
+  const boosted = boostedAll.slice(0, Math.max(1, topBoost))
+  const restAll = [...scored.filter((s) => !boostedSet.has(s.c))]
+  const merged = [...boosted, ...restAll]
   const out: ExtractResult = { ...res, candidates: merged.map((s) => s.c) }
   const hints: SemanticHint[] = []
   merged.forEach((s, i) => {

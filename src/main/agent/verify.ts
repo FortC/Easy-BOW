@@ -108,6 +108,12 @@ export async function verifyNode(opts: {
   // —— L2：云端大模型终审 ——
   // 触发条件：strict 模式 / forceL2（重规划任务 done 硬门禁）/ L1 未通过或不确定
   // （fast 模式下 L1 的"未通过"需 L2 确认，防小模型误判阻塞任务）
+  // v4/A1.4：写操作节点（提交/保存/删除/支付类预期）的「不确定/调用失败」不放行——
+  // 复核门在模型报错时对写操作形同虚设会直接放过错误提交；只读节点保持 skip 放行不空转
+  const writeish =
+    /提交|保存|删除|支付|下单|结算|发布|审批|审核|修改|更新|写入|填写|register|submit|save|delete|pay/i.test(
+      `${opts.node.intent} ${opts.node.expected}`
+    )
   const needL2 = !!opts.provider && (opts.forceL2 || mode === 'strict' || (l1Fail != null && l1Fail.pass !== true))
   if (needL2 && opts.provider) {
     // 云端复核失败先重试一次再降级：接口抖动一次就无条件放行 = 复核形同虚设（复核 P1-12）
@@ -119,16 +125,18 @@ export async function verifyNode(opts: {
         if (v.pass === false)
           return { passed: false, source: 'l2', reason: v.reason ? `大模型复核未通过（${v.reason}）` : '大模型复核未通过' }
         // T9 硬门禁：不确定不允许放行（P0-5「不允许 skip」）
-        if (opts.forceL2) return { passed: false, source: 'l2', reason: '强制 L2 复核判为不确定，按未通过处理' }
+        if (opts.forceL2 || writeish) return { passed: false, source: 'l2', reason: '复核判为不确定，按未通过处理' }
         return { passed: true, source: 'l2', reason: '大模型判为不确定，按通过处理' }
       } catch (e: any) {
         if (attempt === 0) {
           await new Promise((r) => setTimeout(r, 800))
           continue
         }
-        // T9 硬门禁：强制 L2 时调用失败不允许 skip
+        // T9 硬门禁：强制 L2 时调用失败不允许 skip；写操作节点同样不放行（转人工确认）
         if (opts.forceL2)
           return { passed: false, source: 'l2', reason: `强制 L2 复核调用失败，按未通过处理: ${String(e?.message || e).slice(0, 60)}` }
+        if (writeish)
+          return { passed: false, source: 'skip', reason: `写操作节点复核调用失败，不放行（转人工确认）: ${String(e?.message || e).slice(0, 60)}` }
         return { passed: true, source: 'skip', reason: `复核调用失败按通过处理: ${String(e?.message || e).slice(0, 60)}` }
       }
     }
@@ -138,8 +146,10 @@ export async function verifyNode(opts: {
     return { passed: false, source: 'skip', reason: '强制 L2 复核不可用（未配置云端接口），按未通过处理' }
   }
 
-  // fast 模式且 L1 无法判定（本地模型不可用/输出不可解析）→ 不阻塞任务（宁可放行也不空转）
+  // fast 模式且 L1 无法判定（本地模型不可用/输出不可解析）→ 不阻塞任务（宁可放行也不空转）；
+  // 写操作节点例外：无法判定 = 未证实达成，不放行
   if (l1Fail?.pass === false) return { passed: false, source: 'l1', reason: l1Fail.reason || '本地复核未通过' }
+  if (writeish) return { passed: false, source: 'skip', reason: '写操作节点无法自动判定，不放行（请人工确认或补充断言）' }
   return { passed: true, source: 'skip', reason: '无法自动判定，按通过处理' }
 }
 

@@ -24,6 +24,7 @@ const BOOLEANS: Array<keyof Settings> = [
   'boostedExtract',
   'diagnose',
   'axTree',
+  'ocrEnhance',
   'multiCandidate',
   'autoExperience',
   'prescreen',
@@ -84,7 +85,7 @@ export function sanitizeSettingsPatch(patch: unknown): Partial<Settings> {
   if (aiMode) out.aiMode = aiMode
   const verifyMode = optionalEnum(p.verifyMode, ['off', 'fast', 'strict'] as const)
   if (verifyMode) out.verifyMode = verifyMode
-  const speed = optionalEnum(p.speed, ['normal', 'slow'] as const)
+  const speed = optionalEnum(p.speed, ['fast', 'normal', 'slow'] as const)
   if (speed) out.speed = speed
   const closeAction = optionalEnum(p.closeAction, ['ask', 'tray', 'exit'] as const)
   if (closeAction) out.closeAction = closeAction

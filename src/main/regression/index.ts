@@ -347,11 +347,31 @@ async function runCase(
   return result
 }
 
-/** 回归入口：顺序跑 3 个任务型用例 → 报告落盘 → 打印报告路径并退出进程 */
+/** 回归入口：顺序跑任务型用例 → 报告落盘 → 打印报告路径并退出进程。
+ *  v4/P1-3 跑分模式：`--config=<name>` 指定单配置（cloud/hybrid/fast/soak），或 `--benchmark`
+ *  四配置轮跑（cloud 纯云端 / hybrid 混合现状 / hybrid+fast 极速 / soak 混合+全量感知增强），
+ *  报告带四配置横向对照（P50/P90 步耗时、成功率、token），供「现状 vs 优化」量化对比。 */
 export async function runRegression(): Promise<void> {
+  const argOf = (p: string) => process.argv.find((a) => a.startsWith(`--${p}=`))?.slice(p.length + 3)
+  const configName = argOf('config')
+  const benchmark = process.argv.includes('--benchmark')
+  const CONFIGS: Array<{ name: string; patch: Partial<Settings> }> = [
+    { name: 'cloud', patch: { aiMode: 'cloud', speed: 'normal', prescreen: false } },
+    { name: 'hybrid', patch: { aiMode: 'hybrid', speed: 'normal', prescreen: true } },
+    { name: 'hybrid-fast', patch: { aiMode: 'hybrid', speed: 'fast', prescreen: true } },
+    { name: 'soak', patch: { aiMode: 'hybrid', speed: 'normal', prescreen: true, ocrEnhance: true, axTree: true } }
+  ]
+  const picked = benchmark ? CONFIGS : configName ? CONFIGS.filter((c) => c.name === configName) : []
+  if (configName && !picked.length) {
+    console.error(`[regression] 未知 --config=${configName}（可用: ${CONFIGS.map((c) => c.name).join('/')}）`)
+    process.exit(2)
+  }
   const startedAt = Date.now()
-  console.log('[regression] 回归开始（任务型用例 + expect 验收 + 失败三分类报告）')
+  console.log(
+    `[regression] 回归开始（任务型用例 + expect 验收 + 失败三分类报告${picked.length ? `；配置=${picked.map((c) => c.name).join('→')}` : ''}）`
+  )
   seedSettings()
+  const savedBase = getSettings()
 
   // 主窗口仅承载页签视图（回归无 UI），浏览器区域给全窗口
   const win = new BrowserWindow({ width: 1280, height: 800, backgroundColor: '#f5f6f8' })
@@ -373,6 +393,8 @@ export async function runRegression(): Promise<void> {
   const noKey = !getSettings().apiKey
   const keySkipReason = '未配置 AI 接口（baseURL/API Key/模型）：任务型用例需 LLM，可设 EASYBOW_API_KEY 等环境变量或复用正式 profile 配置'
 
+  /** v4/P1-3：跑一套完整用例（当前 settings 生效下）。配置切换在外层 applyConfig 完成 */
+  const runAllCases = async () => {
   const runOne = async (def: RegressionCase, source: CaseResult['source']) => {
     console.log(`[regression] ▶ ${def.name}`)
     const r = await runCase({ runner, tabManager, stepSink }, def, source)
@@ -458,9 +480,9 @@ export async function runRegression(): Promise<void> {
   }
 
   // 用例 2/3：真实站点占位（cases.json；未配置/未启用标 skipped）
-  const config = loadConfigCases()
-  const realCases: ConfigCase[] = config.length
-    ? config
+  const configCasesJson = loadConfigCases()
+  const realCases: ConfigCase[] = configCasesJson.length
+    ? configCasesJson
     : [
         { name: '真实站点-占位1', task: '（cases.json 未配置）', expects: [], enabled: false },
         { name: '真实站点-占位2', task: '（cases.json 未配置）', expects: [], enabled: false }
@@ -475,7 +497,7 @@ export async function runRegression(): Promise<void> {
         skipCase(
           c.name,
           'cases.json',
-          config.length
+          configCasesJson.length
             ? '模板用例未启用（enabled=false）：请配置真实站点、人工预热登录态后改为 true'
             : '未找到 cases.json 配置：请在 src/main/regression/cases.json 配置真实站点用例'
         )
@@ -485,13 +507,40 @@ export async function runRegression(): Promise<void> {
     await runOne({ name: c.name, startUrl: c.startUrl, task: c.task, expects: c.expects, timeoutMs: c.timeoutMs }, 'cases.json')
   }
 
-  // 报告落盘 + 收尾退出（失败非零，便于 CI 判定）
+  } // end runAllCases
+
+  // 配置执行：跑分模式逐配置（先应用 patch 再跑全套）；默认单次用当前设置
+  if (picked.length) {
+    for (const cfg of picked) {
+      console.log(`
+[regression] ===== 配置 ${cfg.name} =====`)
+      saveSettings(cfg.patch)
+      results.push(skipCase(`【配置 ${cfg.name}】${Object.entries(cfg.patch).map(([k, v]) => `${k}=${v}`).join(' ')}`, 'fixture', '配置标记行（不计入统计）'))
+      await runAllCases()
+    }
+  } else {
+    await runAllCases()
+  }
+
+  // 报告落盘 + 收尾退出（失败非零，便于 CI 判定）。
+  // 跑分模式（--benchmark/--config）：用例结果按「配置」维度归组（配置组全部用例执行完后输出一组），
+  // 多配置时最终报告为各组结果的顺序拼接，报告头部注明配置名便于横向对照
   const reportPath = writeReport(results, startedAt)
   const passed = results.filter((r) => r.status === 'passed').length
   const failed = results.filter((r) => r.status === 'failed').length
   const skipped = results.filter((r) => r.status === 'skipped').length
-  console.log(`\n========== 回归结果: ${passed} 通过 / ${failed} 失败 / ${skipped} 跳过 ==========`)
+  console.log(`\n========== 回归结果${picked.length ? `（${picked.map((c) => c.name).join(' + ')}）` : ''}: ${passed} 通过 / ${failed} 失败 / ${skipped} 跳过 ==========`)
   console.log(`[regression] 报告已生成: ${reportPath}`)
+  // 跑分配置还原：不污染用户正式设置（临时 userData 下影响有限，但显式还原更稳）
+  try {
+    saveSettings({
+      aiMode: savedBase.aiMode,
+      speed: savedBase.speed,
+      prescreen: savedBase.prescreen,
+      ocrEnhance: savedBase.ocrEnhance,
+      axTree: savedBase.axTree
+    })
+  } catch {}
   srv.close()
   try {
     runner.dispose()

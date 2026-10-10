@@ -1704,8 +1704,10 @@ export class AgentRunner {
     let localCooldown = 0
     let localDisabled = false
     // S6 语义初筛同样有任务级预算：本地小模型单次超预算（机器过慢）时本任务停用，
-    // 宁可多花云端 token 也不再每步空等一次慢推理（推理已在独立进程，这里只保时延）
+    // 宁可多花云端 token 也不再每步空等一次慢推理（推理已在独立进程，这里只保时延）。
+    // P0-4：另有软预算 1.2s 计数熔断（连续 2 次超时即停，见 prescreen 调用处）
     let prescreenDisabled = false
+    let prescreenTimeouts = 0
 
     while (true) {
       // 暂停等待 / 停止判定（返回 false 则任务结束；epoch 失配=已被新运行取代）
@@ -1776,12 +1778,11 @@ export class AgentRunner {
       try {
         const axPromise =
           settings.axTree !== false
-            ? fetchAxTree(tab.cdp)
-                .then((ax) => {
-                  timings.axMs = Date.now() - tExtract0
-                  return ax
-                })
-                .catch(() => null)
+            ? fetchAxTree(tab.cdp, 150).then((ax) => {
+                timings.axMs = Date.now() - tExtract0
+                return ax
+              })
+              .catch(() => null)
             : Promise.resolve(null)
         const shotPromise = shotWanted
           ? tab.cdp
@@ -1800,18 +1801,40 @@ export class AgentRunner {
         extract = ex
         visionShot = shot
         timings.extractMs = Date.now() - tExtract0
+        // P1-1（v4 方案 A3）SoM 编号标注：视觉截图上画出视口内候选的编号圆标，
+        // 模型「看图选编号」而不是脑内对位。标注只发给模型，时间线用原图；
+        // 标注失败静默降级原图。仅视觉步需要（click_xy 兜底步同样受益）
+        if (visionShot && (visionActive || visionForced)) {
+          try {
+            const marks = extract.candidates
+              .slice(0, Math.min(settings.maxElements, 60))
+              .map((c, i) => ({
+                x: Math.round(c.rect.x + c.rect.w / 2),
+                y: Math.round(c.rect.y + c.rect.h / 2),
+                n: i
+              }))
+              .filter((m) => m.x >= 0 && m.y >= 0 && m.x < extract.viewportW && m.y < extract.viewportH)
+            visionShot = await tab.cdp.screenshotWithMarks(70, marks, extract.viewportW, extract.viewportH)
+          } catch {}
+        }
         // S3 AX Tree 并联：浏览器引擎计算的 role/name 叠加进文本线索不足的候选（失败静默降级）
+        // P0-2（v4 方案 S2）：OCR 增强不再串行阻塞——与 AX 叠加/后续准备并行跑，软预算 2.5s 到点放弃；
+        // 产出的是图标候选的文本补充，晚到就不用（下一步自然会再补），绝不拖慢决策链。
+        // 关闭/超时零开销；整页 OCR 兜底（ocrWanted 路径）不受影响
+        const ocrEnhance =
+          settings.ocrEnhance !== false && this.ocrEnhancer
+            ? Promise.race([
+                this.ocrEnhancer(extract, null).catch(() => extract),
+                new Promise<ExtractResult>((r) => setTimeout(() => r(extract), 2500).unref?.())
+              ])
+            : Promise.resolve(extract)
         if (ax) {
           try {
             const axHits = annotateWithAx(extract, ax)
             this.telemetry.log('extract', stepN, { ax: ax.length, axHits })
           } catch {}
         }
-        if (this.ocrEnhancer) {
-          try {
-            extract = await this.ocrEnhancer(extract, null)
-          } catch {}
-        }
+        extract = await ocrEnhance
       } catch (e: any) {
         throw new Error(`页面元素提取失败: ${e?.message || e}（页面可能在加载中，稍后重试）`)
       }
@@ -1942,19 +1965,22 @@ export class AgentRunner {
         this.localGateOk(extract)
       ) {
         try {
+          // P0-1（v4 方案 A1.1）：本地 prompt 只渲染窗口内前 N 个，校验/门控必须用同一窗口——
+          // 此前按全量候选数校验，0.5B 幻觉出窗口外的编号（如 30~89）会通过并点击它没见过的元素
+          const windowN = Math.min(30, settings.maxElements)
           const shot = await this.fastllm.decide(
             LOCAL_SYSTEM_PROMPT,
             buildLocalPrompt({
               task,
               extract,
-              elementLines: this.executor.formatForPrompt(extract, Math.min(30, settings.maxElements)),
+              elementLines: this.executor.formatForPrompt(extract, windowN),
               memory: this.state.memory,
               lastResults: [...this.lastResults]
             })
           )
           if (shot) {
             const p = parseModelJson(shot)
-            const err = validateLocalActions(p, extract.candidates.length)
+            const err = validateLocalActions(p, Math.min(windowN, extract.candidates.length))
             if (p && !err) localParsed = p
             else localCooldown = 10 // 本地决策不可靠：冷却 10 步内全走云端
           } else {
@@ -1989,18 +2015,32 @@ export class AgentRunner {
         // 视觉截图已在元素提取时并行取得；截失败则本步静默走纯文本
         useVision = (visionActive || visionForced) && !!visionShot
         // S6 本地语义初筛：候选过多时让本地小模型挑 Top-K（语义分 Top-3 强制保留防筛掉目标；
-        // 编号保持原始编号——快照解析不受影响；初筛失败自动全量，绝不丢元素）
+        // 编号保持原始编号——快照解析不受影响；初筛失败自动全量，绝不丢元素）。
+        // P0-4（v4 方案 S1）：预算 1.2s 到点放弃 + 连续 2 次超时本任务熔断（对齐 settle 熔断思路）；
+        // 保留数 12→20 + 视口内前 8 个强制保留（云端至少看得到当前屏主要控件，防误筛）
         let keepIdx: number[] | undefined
         if (settings.prescreen !== false && !prescreenDisabled && extract.candidates.length > 20) {
           try {
+            const tPre0 = Date.now()
             const picked = await this.fastllm?.prescreen(
               extract.candidates.map((c) => `${c.role} ${c.text} ${c.extra}`),
               task,
-              12
+              20,
+              1200
             )
+            const spentMs = Date.now() - tPre0
             if ((this.fastllm?.genMs || 0) > 8000) {
               prescreenDisabled = true
               this.telemetry.log('extract', stepN, { prescreenOff: true, genMs: this.fastllm?.genMs })
+            } else if (spentMs > 1200 || !picked) {
+              // 软预算超时/无结果：计数熔断（连续 2 次 → 本任务后续步全量列表，不再交预筛税）
+              prescreenTimeouts++
+              if (prescreenTimeouts >= 2) {
+                prescreenDisabled = true
+                this.telemetry.log('extract', stepN, { prescreenOff: true, reason: 'budget_timeout', spentMs })
+              }
+            } else {
+              prescreenTimeouts = 0
             }
             if (picked?.length) {
               const top3: number[] = []
@@ -2016,7 +2056,12 @@ export class AgentRunner {
                 ).score
                 if (s >= 0.5) top3.push(i)
               }
-              keepIdx = [...new Set([...picked.filter((i) => i < extract.candidates.length), ...top3])]
+              // 视口内前 8 个强制保留（P0-4/A1.2）：预筛只应「补充语义」，不应让当前屏主要控件消失
+              const vpTop: number[] = []
+              for (let i = 0; i < extract.candidates.length && vpTop.length < 8; i++) {
+                if (extract.candidates[i].inViewport) vpTop.push(i)
+              }
+              keepIdx = [...new Set([...picked.filter((i) => i < extract.candidates.length), ...top3, ...vpTop])]
             }
           } catch {}
         }

@@ -455,19 +455,22 @@ export class Executor {
   }
 
   private humanDelay(settings: Settings, signal: AbortSignal): Promise<void> {
-    const ms = settings.speed === 'slow' ? rand(800, 1600) : rand(280, 650)
+    // v4/P0-3 三档：fast（内部系统/调试，近零延迟）/ normal（拟人）/ slow（风控敏感）
+    const ms = settings.speed === 'fast' ? rand(0, 40) : settings.speed === 'slow' ? rand(800, 1600) : rand(280, 650)
     return this.sleep(ms, signal)
   }
 
-  /** R2 拟人键入：humanLike 开启时短文本走逐字符通道（cdp.insertTextHuman），长文本整段 */
+  /** R2 拟人键入：humanLike 开启时短文本走逐字符通道（cdp.insertTextHuman），长文本整段。
+   *  fast 档整段插入（等同 humanLike 关闭） */
   private typeHuman(t: Tab, text: string, ctx: ExecContext): Promise<void> {
-    if (ctx.settings?.humanLike === false) return t.cdp.insertText(text)
+    if (ctx.settings?.humanLike === false || ctx.settings?.speed === 'fast') return t.cdp.insertText(text)
     return t.cdp.insertTextHuman(text)
   }
 
-  /** R2 拟人移动：humanLike 开启时贝塞尔轨迹滑向目标（关闭=直点，回归瞬时操作） */
+  /** R2 拟人移动：humanLike 开启时贝塞尔轨迹滑向目标（关闭=直点，回归瞬时操作）。
+   *  fast 档跳过贝塞尔（点击本身仍会发一次 mouseMoved 事件保证 hover 态正确） */
   private async moveHuman(t: Tab, x: number, y: number, ctx: ExecContext): Promise<void> {
-    if (ctx.settings?.humanLike === false) return
+    if (ctx.settings?.humanLike === false || ctx.settings?.speed === 'fast') return
     try {
       await t.cdp.moveHumanTo(x, y)
     } catch {}
@@ -608,7 +611,9 @@ export class Executor {
     slow: boolean,
     smart = true,
     phase: 'first' | 'action' = 'action',
-    onTiming?: (ms: number) => void
+    onTiming?: (ms: number) => void,
+    /** v4/P0-3：fast 档位标志（极速模式——首屏固定窗口减半） */
+    fast = false
   ): Promise<void> {
     const t0 = Date.now()
     const done = () => {
@@ -623,9 +628,9 @@ export class Executor {
       }
       await this.sleep(200, signal)
     }
-    // 首屏：isLoading 结束 + 固定窗口（分策略——首屏不套 mutation 静默）
+    // 首屏：isLoading 结束 + 固定窗口（分策略——首屏不套 mutation 静默）；fast 档 300ms
     if (phase === 'first' || !smart) {
-      await this.sleep(slow ? 1200 : 600, signal)
+      await this.sleep(slow ? 1200 : fast ? 300 : 600, signal)
       done()
       return
     }
@@ -692,6 +697,12 @@ export class Executor {
     let batchHadNav = false
     try {
       if (needsOverlay && this.overlay && !ctx.signal.aborted) await this.overlay.begin()
+      // v4/A5：批内「硬页面变化」检测基线——点击引发同页签导航（location.href 变化）时，
+      // 后续动作的旧编号必然失效（重定位链也难保列表场景不错行），应立即断批
+      let urlBefore = ''
+      try {
+        urlBefore = this.tabManager.active()?.url || ''
+      } catch {}
       for (let i = 0; i < actions.length && i < 5; i++) {
         if (ctx.signal.aborted) break
         const a = { ...actions[i] }
@@ -708,6 +719,25 @@ export class Executor {
               })
             }
             break
+          }
+          // A5 断批：同页签 URL 变化 = 已发生整页跳转（非 SPA 情景下旧快照全部作废）
+          if (i < actions.length - 1 && !batchHadNav && urlBefore) {
+            const urlNow = (() => {
+              try {
+                return this.tabManager.active()?.url || ''
+              } catch {
+                return ''
+              }
+            })()
+            if (urlNow && urlNow.split('#')[0] !== urlBefore.split('#')[0]) {
+              out.push({
+                name: 'wait',
+                seconds: 0,
+                result: '页面已跳转，本批剩余动作已取消（编号已失效，下一步将提取新页面元素）'
+              })
+              batchHadNav = true // settle 也走首屏策略
+              break
+            }
           }
         } catch (e: any) {
           a.error = String(e?.message || e).slice(0, 200)
@@ -735,7 +765,8 @@ export class Executor {
           batchHadNav ? 'first' : 'action',
           (ms) => {
             if (ctx.timings) ctx.timings.settleMs = (ctx.timings.settleMs || 0) + ms
-          }
+          },
+          ctx.settings.speed === 'fast'
         )
       }
     } finally {
@@ -800,7 +831,7 @@ export class Executor {
           (cand?.role === '复选框' || cand?.role === '单选框' || /switch|checkbox|radio/i.test(cand?.tag || '')) ||
           /switch|toggle/i.test(cand?.role || '')
         const checkedBefore = isToggle ? r.checked : undefined
-        await this.sleep(160, ctx.signal)
+        if (ctx.settings?.speed !== 'fast') await this.sleep(160, ctx.signal)
         if (this.overlay) {
           try {
             await this.overlay.moveTo(r.x!, r.y!)
@@ -909,7 +940,7 @@ export class Executor {
             await this.overlay.moveTo(px, py)
           } catch {}
         }
-        await this.sleep(160, ctx.signal)
+        if (ctx.settings?.speed !== 'fast') await this.sleep(160, ctx.signal)
         await this.moveHuman(t, px, py, ctx)
         await t.cdp.mouseClick(px + rand(-2, 2), py + rand(-2, 2))
         if (this.overlay) {

@@ -32,8 +32,8 @@ export interface Settings {
   testLoginReuse: boolean
   /** 节点复核模式：off 关闭 / fast 快速（本地信号+快速决策模型，默认）/ strict 严格（加云端大模型终审） */
   verifyMode: 'off' | 'fast' | 'strict'
-  /** 拟人化速度：normal 正常 / slow 慢速（风控敏感站点） */
-  speed: 'normal' | 'slow'
+  /** 拟人化速度：fast 极速（无拟人延迟，内部系统/调试）/ normal 正常 / slow 慢速（风控敏感站点） */
+  speed: 'fast' | 'normal' | 'slow'
   /** 支持后台/最小化运行（抑制 Chromium 后台节流；重启应用后生效，默认关=与历史行为一致） */
   bgRun?: boolean
   /** 关闭窗口行为：ask 每次询问（默认）/ tray 最小化到托盘（任务继续跑）/ exit 直接退出 */
@@ -52,6 +52,8 @@ export interface Settings {
   diagnose?: boolean
   /** S3 AX Tree 并联感知（浏览器引擎语义叠加进元素列表） */
   axTree?: boolean
+  /** v4/P0-2：OCR 元素增强（图标类候选补文字标签；并行跑不阻塞决策，软预算 2.5s） */
+  ocrEnhance?: boolean
   /** S4 多候选裁决 + clarify 不确定时升级人工 */
   multiCandidate?: boolean
   /** S5 经验自动沉淀（站点字段映射/失败教训/成功路径） */
@@ -115,6 +117,7 @@ export const DEFAULT_SETTINGS: Settings = {
   boostedExtract: true,
   diagnose: true,
   axTree: true,
+  ocrEnhance: true,
   multiCandidate: true,
   autoExperience: true,
   prescreen: true,

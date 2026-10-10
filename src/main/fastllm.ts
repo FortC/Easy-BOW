@@ -252,9 +252,12 @@ export class FastLlm {
 
   /**
    * S6 语义初筛：从候选里挑出与任务最相关的编号（本地模型推理，0 云端 token）。
-   * 返回原始编号数组；解析失败/未就绪返回 null（调用方保持全量列表，绝不因初筛失败丢元素）。
+   * 返回原始编号数组；解析失败/未就绪/超预算返回 null（调用方保持全量列表，绝不因初筛失败丢元素）。
+   * budgetMs（P0-4）：预筛是每步税负，给软预算——到点未完成即放弃返回 null，
+   * 由调用方计数熔断；与 generate 的硬超时（12s，触发会重建 worker）不同，
+   * 软预算只 Promise.race 放弃结果，不杀 worker（生成完成后自然丢弃）。
    */
-  async prescreen(lines: string[], task: string, topK = 12): Promise<number[] | null> {
+  async prescreen(lines: string[], task: string, topK = 12, budgetMs = 1200): Promise<number[] | null> {
     if (!this.isReady() || !lines.length) return null
     const list = lines
       .slice(0, 60)
@@ -262,7 +265,13 @@ export class FastLlm {
       .join('\n')
     const prompt = `任务：${String(task).slice(0, 150)}\n\n页面元素列表：\n${list}\n\n哪些元素与任务最相关？输出最多 ${topK} 个编号的 JSON 数组，如 [0,3,7]。只输出 JSON 数组：`
     try {
-      const out = await this.generate(prompt, 64)
+      const gen = this.generate(prompt, 64)
+      const out = await (budgetMs > 0
+        ? Promise.race([
+            gen,
+            new Promise<null>((r) => setTimeout(() => r(null), budgetMs).unref?.())
+          ])
+        : gen)
       if (!out) return null
       const m = out.match(/\[[\d\s,，]*\]/)
       if (!m) return null

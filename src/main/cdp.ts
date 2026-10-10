@@ -2,6 +2,60 @@ import { BrowserWindow, dialog, type WebContents } from 'electron'
 import { WAIT_DOM_STABLE_FN } from './domstable'
 
 /**
+ * P1-1 SoM 标注页面侧实现：以截图 dataURL 为底图，在离屏 canvas 上画编号圆标。
+ * 圆标半径按元素尺寸 8~14px 自适应、描边保证任意底色可读；编号与文本列表一致。
+ * 任何异常返回 null（调用方降级用原图）。
+ */
+const SOM_MARK_FN = String(function somMark(
+  dataUrl: string,
+  marks: Array<{ x: number; y: number; n: number }>,
+  vw: number,
+  vh: number
+): Promise<string | null> {
+  return new Promise((resolve) => {
+    try {
+      const img = new Image()
+      img.onload = () => {
+        try {
+          const cv = document.createElement('canvas')
+          cv.width = img.width
+          cv.height = img.height
+          const ctx = cv.getContext('2d')!
+          ctx.drawImage(img, 0, 0)
+          // 截图像素与 CSS 视口的换算（DPR/缩放截图尺寸可能大于视口）
+          const sx = cv.width / vw
+          const sy = cv.height / vh
+          for (const m of marks) {
+            const px = m.x * sx
+            const py = m.y * sy
+            const r = Math.max(8, Math.min(14, Math.round(Math.min(cv.width, cv.height) / 90)))
+            ctx.beginPath()
+            ctx.arc(px, py, r, 0, Math.PI * 2)
+            ctx.fillStyle = 'rgba(255, 106, 0, 0.92)'
+            ctx.fill()
+            ctx.lineWidth = 2
+            ctx.strokeStyle = '#fff'
+            ctx.stroke()
+            ctx.fillStyle = '#fff'
+            ctx.font = `bold ${Math.round(r * 1.15)}px system-ui, sans-serif`
+            ctx.textAlign = 'center'
+            ctx.textBaseline = 'middle'
+            ctx.fillText(String(m.n), px, py + 0.5)
+          }
+          resolve(cv.toDataURL('image/jpeg', 0.82))
+        } catch {
+          resolve(null)
+        }
+      }
+      img.onerror = () => resolve(null)
+      img.src = dataUrl
+    } catch {
+      resolve(null)
+    }
+  })
+})
+
+/**
  * 基于 Electron 内置 webContents.debugger 的 CDP 会话封装。
  * 每个页签的 webContents 独立附加；若用户打开了 DevTools 导致会话脱离，
  * 自动在 1 秒后重连。
@@ -210,6 +264,28 @@ export class Cdp {
   async screenshotPng(): Promise<Buffer | null> {
     const data = await this.captureScreenshot({ format: 'png' })
     return data ? Buffer.from(data, 'base64') : null
+  }
+
+  /**
+   * P1-1（v4 方案 A3）Set-of-Marks 截图标注：截图后把候选编号画在各自 rect 中心——
+   * 视觉模式的模型不再需要「脑内把文本编号贴到图上」，密集页错位率显著下降。
+   * 实现走页面离屏 canvas（截图 dataURL 为底图 + 视口内候选编号圆标），
+   * 只给模型看；时间线/存档仍用原图。任何失败静默返回原图（零风险降级）。
+   */
+  async screenshotWithMarks(
+    quality: number,
+    marks: Array<{ x: number; y: number; n: number }>,
+    viewportW: number,
+    viewportH: number
+  ): Promise<string | null> {
+    const base = await this.screenshotJpeg(quality)
+    if (!base || !marks.length || viewportW <= 0 || viewportH <= 0) return base
+    try {
+      const marked = await this.evaluate<string>(SOM_MARK_FN, [base, marks, viewportW, viewportH])
+      return marked || base
+    } catch {
+      return base
+    }
   }
 
   /** 浏览器级真实鼠标点击（trusted 事件，坐标为页面 CSS 像素） */

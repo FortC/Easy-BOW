@@ -1079,7 +1079,7 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
         `clarify=${SP2.includes('clarify')} 多候选=${SP2.includes('candidates')} 经验区块=${msgExp.includes('# 历史经验')}`
       )
 
-      // 10) AX 树注解（纯函数：偏移探测 + 只补线索不足者；活页面拉取不炸）
+      // 10) AX 树注解（v4/P1-2：名字桥优先 + 几何桥兜底；只补线索不足者；活页面拉取不炸）
       const { annotateWithAx, fetchAxTree } = await import('./axtree')
       const axRes: any = {
         title: '',
@@ -1089,21 +1089,23 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
         viewportW: 100,
         viewportH: 100,
         candidates: [
-          { framePaths: [], path: [], tag: 'DIV', role: 'Generic', text: '', extra: '', rect: { x: 10, y: 10, w: 40, h: 20 }, inViewport: true },
+          // 空文本图标：名字配不上 → 几何桥（中心点落盒）兜底叠加
+          { framePaths: [], path: [], tag: 'DIV', role: 'image', text: '', extra: '', rect: { x: 10, y: 10, w: 40, h: 20 }, inViewport: true },
+          // 有充足文本的按钮：不重复叠加
           { framePaths: [], path: [], tag: 'BUTTON', role: 'button', text: '登录按钮现已就绪', extra: '', rect: { x: 10, y: 50, w: 40, h: 20 }, inViewport: true }
         ],
         totalFound: 2,
         imgCount: 0
       }
       const axItems = [
-        { x: 10, y: 10, w: 40, h: 20, desc: 'textbox 用户名' },
+        { x: 10, y: 10, w: 40, h: 20, desc: 'image 用户名头像' },
         { x: 10, y: 50, w: 40, h: 20, desc: 'button 登录' }
       ]
       const axHits = annotateWithAx(axRes, axItems)
       const axLive = await fetchAxTree(tm.active()!.cdp).catch(() => null)
       check(
-        'v2.0 AX树注解(偏移探测+线索补充)',
-        axHits === 1 && (axRes.candidates[0].extra || '').includes('ax=textbox_用户名') && !(axRes.candidates[1].extra || '').includes('ax=') && axLive !== null,
+        'v2.0 AX树注解(名字+几何双桥)',
+        axHits === 1 && (axRes.candidates[0].extra || '').includes('ax=image_用户名头像') && !(axRes.candidates[1].extra || '').includes('ax=') && axLive !== null,
         `叠加${axHits}条(仅线索不足者) c0=${axRes.candidates[0].extra} c1已有文本不补=${!(axRes.candidates[1].extra || '').includes('ax=')} 活页面AX条目=${axLive?.length ?? '拉取失败'}`
       )
     } catch (e: any) {
