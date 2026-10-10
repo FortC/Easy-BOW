@@ -91,3 +91,48 @@ export const VERIFY_SYSTEM_PROMPT = `你是浏览器操作结果的复核员。�
 2. 预期里的字段名与页面/记忆实际叫法可能不同（如"商品名称"vs"宝贝标题"、"主图"vs 大尺寸图片链接）——按语义对应判断，不要求字面一致
 3. 抓取/搬运类节点：任务记忆里已存对应数据（如图片链接）即视为达成
 4. 预期含糊或证据不足时输出 uncertain，不要猜测`
+
+/**
+ * T9 动态重规划（W8，P0-5）：系统提示与 PLAN_SYSTEM_PROMPT 分离（后者逐字节稳定）。
+ * 输出格式与 parsePlan 兼容；上下文继承由 buildReplanPrompt 拼装。
+ */
+export const REPLAN_SYSTEM_PROMPT = `你是浏览器自动化任务的重规划器。原计划在执行中受阻，需要基于「当前页面真实状态」重排剩余工作。
+只输出纯 JSON，格式与原计划相同：
+{"nodes":[{"intent":"节点意图（10字内）","expected":"可观察的完成标准（一句话）","check":{...可省略}}]}
+
+硬规则：
+1. 以当前页面真实状态为准：已失效的已完成步骤必须重做——把需要重做的节点按执行顺序插回计划（可放在队首），
+   不要假设「之前做过就一定还在」（登录态可能被踢、表单可能被清、页面可能被人工改动）
+2. 上下文里的「已失败方式」是踩过的坑：新计划必须换思路，禁止安排同样的做法
+3. 已确认仍然有效的已完成节点不要重复安排
+4. 2~6 个节点；最后一个节点的 expected 覆盖任务最终交付结果
+5. expected 必须可观察；能用确定性校验表达时给 check（格式同原计划）`
+
+/** T9 重规划上下文拼装（上下文继承，P0-5：防新计划重蹈覆辙） */
+export function buildReplanPrompt(ctx: {
+  task: string
+  doneNodes: Array<{ intent: string; expected: string }>
+  curNode?: { intent: string; expected: string; failReason: string }
+  triedList: string[]
+  snapshotSummary: string
+}): string {
+  const parts: string[] = []
+  parts.push(`# 原任务\n${ctx.task.slice(0, 1500)}`)
+  if (ctx.doneNodes.length) {
+    parts.push(
+      `# 已完成节点（注意：以当前页面真实状态为准，已失效的必须重做，插回新计划）\n` +
+        ctx.doneNodes.map((n, i) => `${i + 1}. 「${n.intent}」预期: ${n.expected}`).join('\n')
+    )
+  }
+  if (ctx.curNode) {
+    parts.push(
+      `# 当前失败节点\n「${ctx.curNode.intent}」预期: ${ctx.curNode.expected}\n失败归因: ${ctx.curNode.failReason}`
+    )
+  }
+  if (ctx.triedList.length) {
+    parts.push(`# 已失败方式（禁止重复这些做法，必须换思路）\n${ctx.triedList.slice(0, 10).join('\n')}`)
+  }
+  parts.push(`# 当前快照摘要\n${ctx.snapshotSummary.slice(0, 800)}`)
+  parts.push(`# 输出\n按硬规则输出重排后的节点 JSON：`)
+  return parts.join('\n\n')
+}

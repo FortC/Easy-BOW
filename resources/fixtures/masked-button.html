@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>遮罩层盖住按钮</title>
+<style>
+  body { font-family: system-ui, sans-serif; padding: 24px; background: #fafafa; color: #222; }
+  h1 { font-size: 20px; }
+  p { color: #555; }
+  .stage { position: relative; width: 320px; height: 120px; background: #fff; border: 1px solid #ddd; border-radius: 8px; }
+  #confirm-btn { position: absolute; left: 100px; top: 40px; min-height: 36px; padding: 6px 18px; font-size: 14px; cursor: pointer; }
+  #mask {
+    position: absolute; inset: 0; z-index: 10;
+    background: rgba(30, 30, 30, 0.35); color: #fff; font-size: 13px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; border-radius: 8px;
+  }
+  #result { margin-top: 16px; padding: 12px 14px; background: #eef6ff; border: 1px solid #8cf; border-radius: 6px; min-height: 24px; }
+</style>
+</head>
+<body>
+<h1>遮罩层盖住按钮</h1>
+<p>半透明遮罩（z-index 高于按钮）盖住「确认」按钮；点击遮罩任意处可关闭遮罩，之后才能点到按钮。</p>
+
+<div class="stage">
+  <button id="confirm-btn" type="button">确认</button>
+  <div id="mask">遮罩层（点击任意处关闭）</div>
+</div>
+
+<div id="result">（结果区）等待操作</div>
+
+<script>
+  // 点遮罩：遮罩消失（按钮恢复可点）
+  document.getElementById('mask').addEventListener('click', () => {
+    document.getElementById('mask').style.display = 'none'
+    document.getElementById('result').textContent = '遮罩已关闭'
+  })
+  // 点确认按钮
+  document.getElementById('confirm-btn').addEventListener('click', () => {
+    document.getElementById('result').textContent = '确认按钮已点击'
+  })
+</script>
+</body>
+</html>

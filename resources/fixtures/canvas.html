@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Canvas 绘制按钮与文字</title>
+<style>
+  body { font-family: system-ui, sans-serif; padding: 24px; background: #fafafa; color: #222; }
+  h1 { font-size: 20px; }
+  p { color: #555; }
+  canvas { background: #fff; border: 1px solid #ddd; border-radius: 8px; display: block; cursor: pointer; }
+  #result { margin-top: 16px; padding: 12px 14px; background: #eef6ff; border: 1px solid #8cf; border-radius: 6px; min-height: 24px; }
+</style>
+</head>
+<body>
+<h1>Canvas 绘制按钮与文字</h1>
+<p>按钮与文字都是 canvas 像素（DOM 里没有对应元素，元素列表应几乎无候选）；点「画布按钮」区域有响应。</p>
+
+<canvas id="cv" width="420" height="220"></canvas>
+
+<div id="result">（结果区）等待操作</div>
+
+<script>
+  var cv = document.getElementById('cv')
+  var ctx = cv.getContext('2d')
+  // 画布按钮区域（坐标即「按钮」）
+  var BTN = { x: 40, y: 80, w: 180, h: 52 }
+
+  function draw() {
+    ctx.clearRect(0, 0, cv.width, cv.height)
+    ctx.fillStyle = '#333'
+    ctx.font = '16px sans-serif'
+    ctx.fillText('画布文字示例：以下按钮是画出来的', 40, 46)
+    // 画一个圆角矩形按钮
+    ctx.fillStyle = '#4a90e2'
+    ctx.beginPath()
+    ctx.moveTo(BTN.x + 8, BTN.y)
+    ctx.arcTo(BTN.x + BTN.w, BTN.y, BTN.x + BTN.w, BTN.y + BTN.h, 8)
+    ctx.arcTo(BTN.x + BTN.w, BTN.y + BTN.h, BTN.x, BTN.y + BTN.h, 8)
+    ctx.arcTo(BTN.x, BTN.y + BTN.h, BTN.x, BTN.y, 8)
+    ctx.arcTo(BTN.x, BTN.y, BTN.x + BTN.w, BTN.y, 8)
+    ctx.closePath()
+    ctx.fill()
+    ctx.fillStyle = '#fff'
+    ctx.font = '18px sans-serif'
+    ctx.fillText('画布按钮', BTN.x + 44, BTN.y + 33)
+  }
+  draw()
+
+  // 点击坐标落在按钮矩形内 = 「按钮」被点
+  cv.addEventListener('click', function (e) {
+    var r = cv.getBoundingClientRect()
+    var x = Math.round(e.clientX - r.left)
+    var y = Math.round(e.clientY - r.top)
+    var hit = x >= BTN.x && x <= BTN.x + BTN.w && y >= BTN.y && y <= BTN.y + BTN.h
+    document.getElementById('result').textContent = hit
+      ? '画布按钮被点击 (' + x + ',' + y + ')'
+      : '画布空白处点击 (' + x + ',' + y + ')'
+  })
+</script>
+</body>
+</html>

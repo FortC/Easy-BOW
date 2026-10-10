@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Shadow DOM 表单</title>
+<style>
+  body { font-family: system-ui, sans-serif; padding: 24px; background: #fafafa; color: #222; }
+  h1 { font-size: 20px; }
+  p { color: #555; }
+  shadow-form { display: block; margin: 16px 0; padding: 16px; background: #fff; border: 1px solid #ddd; border-radius: 8px; max-width: 520px; }
+  button { min-height: 36px; padding: 6px 18px; font-size: 14px; cursor: pointer; }
+  #result { margin-top: 16px; padding: 12px 14px; background: #eef6ff; border: 1px solid #8cf; border-radius: 6px; min-height: 24px; }
+</style>
+</head>
+<body>
+<h1>Shadow DOM 表单（Web Component）</h1>
+<p>输入框与「立即提交」按钮在自定义元素的 shadow root 内；页面上的「提交」按钮读取 shadow 内输入值回显到结果区。</p>
+
+<shadow-form id="sf-host"></shadow-form>
+<button id="page-submit" type="button">提交</button>
+
+<div id="result">（结果区）等待操作</div>
+
+<script>
+  // 自定义元素：表单挂在 shadow DOM 内（常规 CSS 选择器无法直接命中 shadow 内部节点）
+  class ShadowForm extends HTMLElement {
+    connectedCallback() {
+      const root = this.attachShadow({ mode: 'open' })
+      root.innerHTML =
+        '<style>' +
+        '.row { display: flex; gap: 8px; align-items: center; }' +
+        'input { height: 32px; padding: 0 8px; font-size: 14px; border: 1px solid #bbb; border-radius: 4px; width: 220px; }' +
+        'button { min-height: 36px; padding: 6px 16px; cursor: pointer; }' +
+        '.echo { margin-top: 8px; color: #555; min-height: 20px; }' +
+        '</style>' +
+        '<div class="row">' +
+        '<input id="sf-input" type="text" placeholder="订单号（shadow 内输入框）">' +
+        '<button id="sf-btn" type="button">立即提交</button>' +
+        '</div>' +
+        '<div class="echo" id="sf-echo">（shadow 内回显）未提交</div>'
+      const input = root.getElementById('sf-input')
+      const echo = root.getElementById('sf-echo')
+      root.getElementById('sf-btn').addEventListener('click', () => {
+        echo.textContent = 'shadow 内已提交: ' + input.value
+      })
+    }
+  }
+  customElements.define('shadow-form', ShadowForm)
+
+  // 页面「提交」按钮：读取 shadow 内输入值写入结果区
+  document.getElementById('page-submit').addEventListener('click', () => {
+    const root = document.getElementById('sf-host').shadowRoot
+    const val = root ? root.getElementById('sf-input').value : '(无法访问 shadow)'
+    document.getElementById('result').textContent = '已提交: ' + val
+  })
+</script>
+</body>
+</html>

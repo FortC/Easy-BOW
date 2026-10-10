@@ -19,9 +19,17 @@ import {
   buildLocalPrompt,
   type TestScriptContext
 } from './prompts'
-import { PLAN_SYSTEM_PROMPT, parsePlan } from './plan'
+import { PLAN_SYSTEM_PROMPT, REPLAN_SYSTEM_PROMPT, buildReplanPrompt, parsePlan } from './plan'
 import { verifyNode, type Verdict } from './verify'
-import { createProvider, isVisionUnsupportedError, type ContentPart, type LlmProvider } from './llm'
+import {
+  createProvider,
+  createPlannerProvider,
+  hasPlannerConfig,
+  probeStructuredSupport,
+  isVisionUnsupportedError,
+  type ContentPart,
+  type LlmProvider
+} from './llm'
 import { validateLocalActions, type FastLlm } from '../fastllm'
 import { ocrPageText } from '../ocr'
 import { parseTestCase } from '../testcase/parser'
@@ -36,6 +44,7 @@ import type {
   PlanNodeState,
   Settings,
   StepRecord,
+  StepTimings,
   MainEvent,
   TestCase,
   TestAssertion,
@@ -225,6 +234,20 @@ export class AgentRunner {
   /** S5 最近一次注入的人工指导（其后的批全成功 → 沉淀 lesson） */
   private lastGuidanceText = ''
   private lastFailureKind = ''
+  /* —— v3.0 AI 操控升级运行态 —— */
+  /** T8 反思（W7）：失败尝试清单（签名=动作名+目标语义+容器锚文本；每目标最近 3 条、全局封顶 20 条） */
+  private triedList: Array<{ sig: string; method: string; reason: string }> = []
+  /** T9 重规划（W8）：已触发次数（上限 2）与待触发标志 */
+  private replanCount = 0
+  private replanPending = ''
+  /** T9 无节点推进计数（连续 3 步无推进 → 触发重规划） */
+  private noProgressSteps = 0
+  private progressAnchorIdx = 0
+  /** T10 专家重试（W9）：卡住节点单次 planner 调用（每任务 ≤3 次，成功立即回落主模型） */
+  private expertRetriesUsed = 0
+  private expertArmed = false
+  /** T7 动作后核验（W10）：上一批动作（delta 比对输入） */
+  private lastBatchActions: AgentAction[] = []
 
   constructor(tabManager: TabManager, executor: Executor, broadcast: Broadcast) {
     this.tabManager = tabManager
@@ -354,10 +377,27 @@ export class AgentRunner {
     this.frictionWarns = 0
     this.lastGuidanceText = ''
     this.lastFailureKind = ''
+    this.triedList = []
+    this.replanCount = 0
+    this.replanPending = ''
+    this.noProgressSteps = 0
+    this.progressAnchorIdx = 0
+    this.expertRetriesUsed = 0
+    this.expertArmed = false
+    this.lastBatchActions = []
     this.abortCtrl = new AbortController()
     this.pauseRequested = false
     // S0 trace 埋点（设置关闭时完全静默）
     this.telemetry.start(task, settings.telemetry !== false)
+    // T2 智能等待：任务级熔断状态复位（host 记忆保留）+ 熔断遥测接线
+    this.executor.resetWaitState()
+    this.executor.onCircuitBreak = (host) => {
+      this.telemetry.log('circuit_break', this.steps.length + 1, { host })
+    }
+    // T4 结构化输出：会话建立时预检探测（不消耗真实任务请求；结果会话内粘滞）
+    if (settings.structuredOut !== false) {
+      probeStructuredSupport(settings).catch(() => undefined)
+    }
     this.setState({
       state: 'running',
       task,
@@ -678,9 +718,21 @@ export class AgentRunner {
       this.frictionWarns = 0
       this.lastGuidanceText = ''
       this.lastFailureKind = ''
+      this.triedList = []
+      this.replanCount = 0
+      this.replanPending = ''
+      this.noProgressSteps = 0
+      this.progressAnchorIdx = 0
+      this.expertRetriesUsed = 0
+      this.expertArmed = false
+      this.lastBatchActions = []
       this.abortCtrl = new AbortController()
       this.pauseRequested = false
       this.telemetry.start(task, settings.telemetry !== false)
+      this.executor.resetWaitState()
+      this.executor.onCircuitBreak = (host) => {
+        this.telemetry.log('circuit_break', this.steps.length + 1, { host })
+      }
       this.setState({
         state: 'running',
         task,
@@ -1252,6 +1304,10 @@ export class AgentRunner {
     this.nodeReasons[idx] = verdict.reason
     const sameReason = !!verdict.reason && verdict.reason === this.nodeLastFailReason
     this.nodeLastFailReason = verdict.reason
+    // T9 触发条件（P0-5）：节点连续复核失败 2 次 → 待重规划（开关/上限由 loop 统一判）
+    if (this.nodeFails >= 2 && !this.replanPending) {
+      this.replanPending = `节点${idx + 1}「${node.intent}」连续复核失败 ${this.nodeFails} 次`
+    }
     if (this.nodeFails >= 3 || (sameReason && this.nodeFails >= 2)) {
       // 同样的问题反复失败：不再盲目重试，升级人工介入
       this.nodeStatuses[idx] = 'escalated'
@@ -1382,10 +1438,176 @@ export class AgentRunner {
     return lines.join('\n')
   }
 
+  /* —— T8 失败性质二分（P1-10）：方式失败进「禁止重复」清单；业务失败可修正后重试，不进清单 —— */
+  private isMethodFailure(err: string): boolean {
+    // 业务失败：提交后服务端报错 / wait_for 网络 4xx/5xx / 表单校验 —— 换数据换表单可修正
+    if (/接口响应异常|HTTP\s[45]\d\d|校验错误|服务端|提交失败|限流|稍后再试/.test(err)) return false
+    // 方式失败：元素失效/未命中/遮挡/禁用/坐标命中不一致/同方式重复 —— 必须换方式
+    return /已失效|不可见|找不到|无法定位|遮挡|禁用|坐标命中|已两次|换一种/.test(err)
+  }
+
+  /** T8 记录一次失败尝试（每目标最近 3 条、全局封顶 20 条） */
+  private addTried(sig: string, method: string, reason: string): void {
+    this.triedList.push({ sig, method, reason: reason.slice(0, 80) })
+    const mine = this.triedList.filter((t) => t.sig === sig)
+    if (mine.length > 3) {
+      const idx = this.triedList.indexOf(mine[0])
+      this.triedList.splice(idx, 1)
+    }
+    while (this.triedList.length > 20) this.triedList.shift()
+  }
+
+  /** T8 同签名同方式已失败次数（≥2 时执行前拦截第 3 次重复） */
+  private triedCount(sig: string, method: string): number {
+    return this.triedList.filter((t) => t.sig === sig && t.method === method).length
+  }
+
+  /** T8 清单注入行（动态后缀区；本地 0.5B 链路不注入——横切约束 1） */
+  private triedPromptLines(): string[] {
+    return this.triedList.slice(-8).map((t) => `- 目标「${t.sig.split('|')[1] || '?'}」${t.method} 方式失败: ${t.reason}`)
+  }
+
+  /**
+   * T7 动作后核验（W10，P1-8）：delta 比对复用「下一步开头的 extract 快照」与上一步快照（零额外 CDP）。
+   * 结构信号优先（URL/标题/新列表行/弹窗）；仅「导航类/提交类 click + 全零 delta」给强提示，
+   * hover/toggle/toast 类不给「无变化」强提示（防假阴性误报）；候选数 ±30% 只记 telemetry。
+   */
+  private deltaVerify(prevActions: AgentAction[], prev: ExtractResult | null, next: ExtractResult): string | undefined {
+    if (!prev) return undefined
+    const urlChanged = (prev.url || '') !== (next.url || '')
+    const titleChanged = (prev.title || '') !== (next.title || '')
+    const prevTexts = new Set(prev.candidates.map((c) => c.text).filter(Boolean))
+    const newTexts = next.candidates.map((c) => c.text).filter((t) => t && !prevTexts.has(t))
+    const countDelta = next.candidates.length - prev.candidates.length
+    const structural = urlChanged || titleChanged || newTexts.length > 0
+    // 候选数 ±30% 先只记 telemetry，跑一周分布再定阈值（P1-8）
+    if (prev.candidates.length > 0 && Math.abs(countDelta) / prev.candidates.length > 0.3) {
+      this.telemetry.log('action_verify', this.steps.length + 1, {
+        kind: 'count_delta',
+        from: prev.candidates.length,
+        to: next.candidates.length
+      })
+    }
+    if (structural) {
+      this.telemetry.log('action_verify', this.steps.length + 1, {
+        kind: 'change',
+        urlChanged,
+        titleChanged,
+        newTexts: newTexts.length
+      })
+      return undefined // 有结构变化 = 正常，不打扰
+    }
+    // 全零 delta：按上一批动作类型分流（P1-8）
+    const navOrSubmit = prevActions.some(
+      (a) =>
+        a.name === 'goto' ||
+        a.name === 'back' ||
+        a.name === 'forward' ||
+        (a.name === 'click' && /提交|确定|保存|下单|支付|发布|删除|结算|submit|save|delete|pay|order|confirm/i.test(`${a.result || ''}`))
+    )
+    const quietActions = prevActions.every((a) => ['hover', 'wait', 'save', 'recall', 'read_content', 'extract_images'].includes(a.name))
+    this.telemetry.log('action_verify', this.steps.length + 1, {
+      kind: 'no_change',
+      actions: prevActions.map((a) => a.name).join(',')
+    })
+    if (navOrSubmit) {
+      return '上一步的导航/提交操作后页面无任何变化（URL、标题、元素均未变），操作可能未生效或被页面拦截：请先确认页面真实状态再继续，不要当作已成功。'
+    }
+    if (quietActions) return undefined // hover/等待类本来就可能无变化，不给提示（防假阴性误报）
+    return '上一步操作后页面无明显变化，如预期应有变化请检查操作是否生效。'
+  }
+
+  /** T9 快照摘要（重规划上下文继承用） */
+  private snapshotSummary(extract: ExtractResult): string {
+    const tops = extract.candidates
+      .slice(0, 12)
+      .map((c, i) => `[${i}]${c.text || c.extra || c.role}`)
+      .join(' ')
+    return `标题: ${extract.title.slice(0, 60)}\nURL: ${(extract.url || '').slice(0, 100)}\n元素摘要: ${tops}`
+  }
+
+  /**
+   * T9 动态重规划（W8，P0-5 全量修正）：
+   * - 上下文继承：原任务 + 已完成/待验证节点 + 当前失败节点 + 失败归因 + tried 清单 + 快照摘要；
+   * - 已完成节点可标「需重做」：新计划允许把节点插回队首（治登录被踢后冻结死锁）；
+   * - 调用走 planner（T10；未配置回落主模型）；上限 2 次；时间线明示。
+   */
+  private async doReplan(
+    task: string,
+    provider: LlmProvider,
+    plannerProvider: LlmProvider | null,
+    extract: ExtractResult,
+    trigger: string,
+    stepN: number,
+    epoch: number
+  ): Promise<void> {
+    const useProvider = plannerProvider || provider
+    const cur = this.plan[Math.min(this.planIdx, this.plan.length - 1)]
+    const prompt = buildReplanPrompt({
+      task,
+      doneNodes: this.plan.slice(0, this.planIdx).map((n) => ({ intent: n.intent, expected: n.expected })),
+      curNode: cur ? { intent: cur.intent, expected: cur.expected, failReason: this.nodeLastFailReason || trigger } : undefined,
+      triedList: this.triedPromptLines(),
+      snapshotSummary: this.snapshotSummary(extract)
+    })
+    this.setState({ statusText: `第 ${stepN} 步：执行受阻（${trigger}），重规划剩余节点…` })
+    this.telemetry.log('replan', stepN, { trigger, count: this.replanCount + 1, forceL2: true })
+    let nodes: PlanNode[] | null = null
+    for (let attempt = 0; attempt < 2 && !nodes; attempt++) {
+      try {
+        const out = await useProvider.chat(REPLAN_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], this.abortCtrl!.signal)
+        if (epoch !== this.epoch) return
+        nodes = parsePlan(out.text)
+        this.setState({
+          usage: {
+            ...this.state.usage,
+            inputTokens: this.state.usage.inputTokens + out.usage.inputTokens,
+            outputTokens: this.state.usage.outputTokens + out.usage.outputTokens
+          }
+        })
+      } catch (e) {
+        if (this.abortCtrl?.signal.aborted) return
+      }
+    }
+    this.replanCount++
+    if (!nodes || !nodes.length) {
+      this.broadcast({ channel: 'toast', message: `重规划失败（模型输出不可解析），沿用原计划继续`, kind: 'info' })
+      return
+    }
+    // 新计划落地：允许包含「需重做」的已完成节点（插回队首），全部重置为待执行
+    this.plan = nodes
+    this.planIdx = 0
+    this.nodeStatuses = nodes.map((_, i) => (i === 0 ? 'active' : 'pending'))
+    this.nodeReasons = nodes.map(() => undefined)
+    this.nodeFails = 0
+    this.nodeLastFailReason = ''
+    this.doneHeld = 0
+    this.noProgressSteps = 0
+    this.progressAnchorIdx = 0
+    this.replanPending = ''
+    const redoNote = `本计划是第 ${this.replanCount} 次重规划产物（触发: ${trigger}）。必须以当前页面真实状态为准执行——之前完成过的步骤可能已失效，计划中重新出现的节点就是需要重做的，不要跳过。本任务收尾前会经云端 L2 强制复核。`
+    this.lastResults.push(`系统提示: ${redoNote}`)
+    this.broadcast({
+      channel: 'toast',
+      message: `已重规划为 ${nodes.length} 个节点（第 ${this.replanCount} 次；收尾将强制 L2 复核）`,
+      kind: 'info'
+    })
+    this.setState({ plan: this.planStatus(), statusText: `第 ${stepN} 步：重规划完成（${nodes.length} 节点），继续执行` })
+  }
+
   private async loop(task: string, provider: LlmProvider, settings: Settings, epoch: number): Promise<void> {
     let consecutiveParseFail = 0
     let planAttempted = false
     let skipCaptchaCheckOnce = false
+    // T10 planner（W9）：只用于决策点（重规划/strict 复核 L2/专家重试），绝不参与逐步执行
+    let plannerProvider: LlmProvider | null = null
+    if (hasPlannerConfig(settings)) {
+      try {
+        plannerProvider = createPlannerProvider(settings)
+      } catch {
+        plannerProvider = null
+      }
+    }
     // 视觉模式：设置开启且该模型未被确认"不支持图片"；任务内降级标志（模型拒图后本任务不再发图）
     const visionKey = `${settings.baseURL}|${settings.model}`
     let visionDegraded = false
@@ -1454,18 +1676,48 @@ export class AgentRunner {
       if (this.visionFallbackLeft > 0) this.visionFallbackLeft--
       const shotWanted = visionActive || visionForced
 
-      // 1. 提取当前页签元素（视觉模式与截图并行）。
+      // 1. 提取当前页签元素（T3 并行化：extract / 截图 / AX Tree 同一 Promise.all——
+      //    fetchAxTree 与 extract/截图并行，砍掉 AX 的串行往返）。
       //    S1：带 task 做语义重排（语义相关元素提前，重排在快照落盘前完成——编号即最终编号）
       let extract: ExtractResult
       let visionShot: string | null = null
       const wantSemantic = settings.semanticRecall !== false && !!task
+      const timings: StepTimings = {}
+      const tExtract0 = Date.now()
       try {
-        const [ex, shot] = await Promise.all([
+        const axPromise =
+          settings.axTree !== false
+            ? fetchAxTree(tab.cdp)
+                .then((ax) => {
+                  timings.axMs = Date.now() - tExtract0
+                  return ax
+                })
+                .catch(() => null)
+            : Promise.resolve(null)
+        const shotPromise = shotWanted
+          ? tab.cdp
+              .screenshotJpeg(70)
+              .then((s) => {
+                timings.shotMs = Date.now() - tExtract0
+                return s
+              })
+              .catch(() => null)
+          : Promise.resolve(null)
+        const [ex, shot, ax] = await Promise.all([
           this.executor.extract(tab, { task: wantSemantic ? task : undefined }),
-          shotWanted ? tab.cdp.screenshotJpeg(70).catch(() => null) : Promise.resolve(null)
+          shotPromise,
+          axPromise
         ])
         extract = ex
         visionShot = shot
+        timings.extractMs = Date.now() - tExtract0
+        // S3 AX Tree 并联：浏览器引擎计算的 role/name 叠加进文本线索不足的候选（失败静默降级）
+        if (ax) {
+          try {
+            const axHits = annotateWithAx(extract, ax)
+            this.telemetry.log('extract', stepN, { ax: ax.length, axHits })
+          } catch {}
+        }
         if (this.ocrEnhancer) {
           try {
             extract = await this.ocrEnhancer(extract, null)
@@ -1473,15 +1725,6 @@ export class AgentRunner {
         }
       } catch (e: any) {
         throw new Error(`页面元素提取失败: ${e?.message || e}（页面可能在加载中，稍后重试）`)
-      }
-
-      // S3 AX Tree 并联：浏览器引擎计算的 role/name 叠加进文本线索不足的候选（失败静默降级）
-      if (settings.axTree !== false) {
-        try {
-          const ax = await fetchAxTree(tab.cdp)
-          const axHits = annotateWithAx(extract, ax)
-          this.telemetry.log('extract', stepN, { ax: ax.length, axHits })
-        } catch {}
       }
 
       // S1 扩展提取：任务关键词一个都没命中且页面确实被截断 → 提高上限重提一次
@@ -1504,6 +1747,12 @@ export class AgentRunner {
         totalFound: extract.totalFound,
         truncated: extract.totalFound > extract.candidates.length // 关键指标：目标可能被截断
       })
+      // T7 动作后核验（W10）：delta 比对复用本步开头的 extract 快照与上一步快照（零额外 CDP），
+      // 反馈文案注入动态后缀区（横切约束 1）
+      const deltaHint =
+        settings.actionVerify !== false && this.lastBatchActions.length
+          ? this.deltaVerify(this.lastBatchActions, this.prevExtract, extract)
+          : undefined
       this.prevExtract = extract
 
       // DOM 提取稀疏 / 视觉兜底生效但模型看不了图 → OCR 整页识别兜底（图片型页面、Canvas 应用）
@@ -1629,9 +1878,11 @@ export class AgentRunner {
       }
 
       let llmOut: { text: string; usage: { inputTokens: number; outputTokens: number } }
+      const tLlm0 = Date.now()
       let visionRetryUsed = false // 带图调用失败后改用纯文本重试（模型实际没看到截图）
       let localUsed = false
       let useVision = false
+      let usedPlanner = false // T10 token 分列（主/planner）
 
       if (localParsed) {
         // ⚡ 本地直出：跳过云端调用，直接进入动作执行（token 0）
@@ -1697,7 +1948,10 @@ export class AgentRunner {
           kbTips,
           expTips: expTips.length ? expTips : undefined,
           plan: !this.testCtx && this.plan.length ? { nodes: this.plan, current: this.planIdx + 1 } : undefined,
-          test: this.testCtx ? this.buildTestScriptContext() : undefined
+          test: this.testCtx ? this.buildTestScriptContext() : undefined,
+          // v3 动态后缀区注入（横切约束 1：只进缓存断点之后；本地链路/测试模式的反思由门控排除）
+          tried: settings.reflection !== false && !this.testCtx && this.triedList.length ? this.triedPromptLines() : undefined,
+          deltaHint
         })
         this.lastResults = []
         this.setState({
@@ -1724,8 +1978,17 @@ export class AgentRunner {
           (useVision ? SYSTEM_PROMPT + (visionActive ? VISION_ADDON : VISION_FALLBACK_ADDON) : SYSTEM_PROMPT) +
           (this.testCtx ? TEST_MODE_ADDON : '')
 
+        // T10 专家重试（W9）：卡住节点的单次 planner 调用——仅本次调用走 planner，成功立即回落主模型
+        const usePlanner = this.expertArmed && !!plannerProvider
+        const callProvider = usePlanner ? plannerProvider! : provider
+        usedPlanner = usePlanner
+        if (usePlanner) {
+          this.expertArmed = false
+          this.telemetry.log('expert_retry', stepN, { used: this.expertRetriesUsed })
+          this.setState({ statusText: `第 ${stepN} 步：卡住节点，专家重试（planner）…` })
+        }
         try {
-          llmOut = await provider.chat(systemPrompt, [{ role: 'user', content }], this.abortCtrl!.signal)
+          llmOut = await callProvider.chat(systemPrompt, [{ role: 'user', content }], this.abortCtrl!.signal)
         } catch (e: any) {
           const hasImage = Array.isArray(content)
           // 视觉模式下模型拒图（纯文本模型遇到 image 块）：降级并重跑本步（会话内记住，后续任务不再发图）
@@ -1745,7 +2008,7 @@ export class AgentRunner {
           if (hasImage && !this.abortCtrl!.signal.aborted) {
             try {
               visionRetryUsed = true
-              llmOut = await provider.chat(systemPrompt, [{ role: 'user', content: userMsg }], this.abortCtrl!.signal)
+              llmOut = await callProvider.chat(systemPrompt, [{ role: 'user', content: userMsg }], this.abortCtrl!.signal)
               if (useVision) visionDegraded = true // 保险：未命中启发式的拒图也按降级处理
               this.lastResults.push('系统提示: 当前模型不支持图片输入，截图已被忽略，请仅依据文字与元素列表执行。')
             } catch (e2: any) {
@@ -1769,6 +2032,7 @@ export class AgentRunner {
         }
       }
       // 调用成功：已注入的指导正式出队（本地路径 guidance 恒为空，不会到这里带指导）
+      timings.llmMs = Date.now() - tLlm0
       if (guidanceCount > 0 && !localUsed) {
         this.pendingGuidance.splice(0, guidanceCount)
         this.setState({ statusText: `第 ${stepN} 步：模型思考中…` })
@@ -1776,6 +2040,7 @@ export class AgentRunner {
       this.telemetry.log('llm_call', stepN, {
         local: localUsed,
         vision: useVision,
+        planner: usedPlanner,
         input: llmOut.usage.inputTokens,
         output: llmOut.usage.outputTokens
       })
@@ -1798,11 +2063,12 @@ export class AgentRunner {
           { input: llmOut.usage.inputTokens, output: llmOut.usage.outputTokens }
         )
         this.setState({ usage })
+        // T4：解析失败阈值 3→2 + few-shot 示例注入（动态后缀区，引导规范输出）
         this.lastResults.push(
-          `系统提示: 你上一步的输出不是合法 JSON（原始输出前500字: ${llmOut.text.slice(0, 500)}）。请严格按格式输出 {"thought":"...","actions":[...]}`
+          `系统提示: 你上一步的输出不是合法 JSON（原始输出前500字: ${llmOut.text.slice(0, 500)}）。请严格按格式输出，参考示例：\n{"thought":"点击登录按钮","actions":[{"name":"click","index":3}]}\n只输出这一个 JSON 对象，不要 markdown 代码块、不要前后缀文字。`
         )
-        if (consecutiveParseFail >= 3) {
-          throw new Error('模型连续 3 次输出无法解析，请检查模型是否支持 JSON 输出或更换模型')
+        if (consecutiveParseFail >= 2) {
+          throw new Error('模型连续 2 次输出无法解析，请检查模型是否支持 JSON 输出或更换模型')
         }
         continue
       }
@@ -1881,28 +2147,60 @@ export class AgentRunner {
       // 5. 执行动作批（测试模式：test_step_done 是控制信号，进执行器前剥离；protectedSubmit 透传生产保护）
       this.setState({ statusText: `第 ${stepN} 步：执行 ${parsed.actions.length} 个动作…`, usage })
       const stepDoneSignal = !!this.testCtx && parsed.actions.some((x) => x.name === 'test_step_done')
-      const executed = await this.executor.executeBatch(
-        this.testCtx ? parsed.actions.filter((x) => x.name !== 'test_step_done') : parsed.actions,
-        {
-          memory: this.state.memory,
-          signal: this.abortCtrl!.signal,
-          settings: getSettings(),
-          task: this.testCtx ? undefined : task,
-          url: tab.url,
-          prevActions: this.lastExecutedActions,
-          protectedSubmit: this.testCtx?.protectedSubmit,
-          // 测试模式专属执行开关（普通任务恒缺省，executor 分支不进入）
-          softAssert: this.testCtx ? true : undefined,
-          fillPreview: this.testCtx?.fillPreview,
-          softErrors: this.testCtx ? this.testSoftErrors : undefined
-        }
-      )
+      // T8 执行前拦截（P1-10 第 4 条）：同一目标同一方式已失败 ≥2 次 → 拦下第 3 次重复，
+      // 注入「换一种没试过的方式」提示（方式失败进清单；业务失败不拦，可修正后重试）
+      let toRun = this.testCtx ? parsed.actions.filter((x) => x.name !== 'test_step_done') : parsed.actions
+      const blocked: AgentAction[] = []
+      if (settings.reflection !== false && !this.testCtx) {
+        toRun = toRun.filter((act) => {
+          const cand = act.index != null ? extract.candidates[act.index] : undefined
+          const sig = cand
+            ? `${act.name}|${(act.text || cand.text || cand.extra || '').slice(0, 24)}|${(cand.anchor || '').slice(0, 24)}`
+            : ''
+          if (sig && this.triedCount(sig, act.name) >= 2) {
+            act.failSig = sig
+            act.error = `同方式已失败 2 次，禁止第 3 次重复：请换一种没试过的方式（换目标、换动作或换通道）`
+            act.result = '已拦截（反思清单）'
+            blocked.push(act)
+            return false
+          }
+          return true
+        })
+      }
+      const tAct0 = Date.now()
+      const stepHits: Array<{ x: number; y: number; w: number; h: number; label?: string }> = []
+      const batchOut = await this.executor.executeBatch(toRun, {
+        memory: this.state.memory,
+        signal: this.abortCtrl!.signal,
+        settings: getSettings(),
+        task: this.testCtx ? undefined : task,
+        url: tab.url,
+        prevActions: this.lastExecutedActions,
+        protectedSubmit: this.testCtx?.protectedSubmit,
+        // 测试模式专属执行开关（普通任务恒缺省，executor 分支不进入）
+        softAssert: this.testCtx ? true : undefined,
+        fillPreview: this.testCtx?.fillPreview,
+        softErrors: this.testCtx ? this.testSoftErrors : undefined,
+        timings,
+        hits: stepHits
+      })
+      timings.actMs = Math.max(0, Date.now() - tAct0 - (timings.settleMs || 0))
+      const executed = [...blocked, ...batchOut]
       // 只认实际执行成功的 done（暂停/出错打断批次时不应误判完成）
       const doneAction = executed.find((a) => a.name === 'done' && !a.error)
+      // T8 失败尝试记账：方式失败进「禁止重复」清单（每目标最近 3 条、全局 20 条）
+      if (settings.reflection !== false && !this.testCtx) {
+        for (const a of executed) {
+          if (a.error && a.failSig && this.isMethodFailure(a.error)) {
+            this.addTried(a.failSig, a.name, a.error)
+          }
+        }
+      }
       // 供 repeat 重放：剥离大文本字段，只留动作骨架（测试动作 expect/test_step_done 无重放意义，一并排除）
       this.lastExecutedActions = executed
         .filter((a) => a.name !== 'done' && a.name !== 'expect' && a.name !== 'test_step_done')
         .map(({ result: _r, error: _e, ...rest }) => rest)
+      this.lastBatchActions = executed.filter((a) => a.name !== 'wait')
 
       // S2 失败分类学：先维护「同一动作连续失败」计数（loop 判定），再七类归因→分类自愈
       const failNames = executed.filter((a) => a.error).map((a) => a.name)
@@ -2003,12 +2301,49 @@ export class AgentRunner {
         )
       }
 
-      // 6. 记录步骤（含视口截图；视觉模式标记模型确实收到了截图）
-      const screenshot = await tab.cdp.screenshotJpeg()
-      const step = this.recordStep(stepN, parsed.thought, executed, tab, {
-        input: llmOut.usage.inputTokens,
-        output: llmOut.usage.outputTokens
-      }, screenshot || undefined)
+      // 6. 记录步骤（W2 截图分级：常规步缩略图/出错步与完成步高清；视觉模式标记模型确实收到了截图）
+      const shotMode = getSettings().timelineShot ?? 'smart'
+      const isKeyStep = executed.some((a) => a.error) || !!doneAction
+      const tShot0 = Date.now()
+      let screenshot: string | null = null
+      if (shotMode !== 'off') {
+        screenshot =
+          shotMode === 'all' || isKeyStep
+            ? await tab.cdp.screenshotJpeg(70) // 高清：出错步/完成步（诊断与报告用）
+            : await tab.cdp.screenshotJpeg(42, 0.5) // 缩略图：常规步（省编码/传输/内存）
+      }
+      timings.shotMs = (timings.shotMs || 0) + (Date.now() - tShot0)
+      // T0 step 分段计时：时间线 + telemetry（报表 P50/P90 数据源）
+      this.telemetry.log('step_timing', stepN, {
+        extractMs: timings.extractMs,
+        axMs: timings.axMs,
+        llmMs: timings.llmMs,
+        actMs: timings.actMs,
+        settleMs: timings.settleMs,
+        shotMs: timings.shotMs
+      })
+      const step = this.recordStep(
+        stepN,
+        parsed.thought,
+        executed,
+        tab,
+        { input: llmOut.usage.inputTokens, output: llmOut.usage.outputTokens },
+        screenshot || undefined,
+        {
+          timings,
+          // 命中标记归一化 0~1（相对视口）：时间线截图随容器缩放，百分比定位随动
+          hits:
+            stepHits.length && extract.viewportW > 0 && extract.viewportH > 0
+              ? stepHits.map((h) => ({
+                  x: h.x / extract.viewportW,
+                  y: h.y / extract.viewportH,
+                  w: h.w / extract.viewportW,
+                  h: h.h / extract.viewportH,
+                  label: h.label
+                }))
+              : undefined
+        }
+      )
       if (useVision && !visionRetryUsed) step.vision = true
       if (localUsed) step.local = true
       if (this.testCtx) step.testStep = this.testCtx.stepIdx + 1
@@ -2028,12 +2363,25 @@ export class AgentRunner {
           // 复核在动作执行后进行：URL/标题用页签实时值（extract 是本步开始时的旧快照）
           extract: { ...extract, url: tab.url || extract.url, title: tab.title || extract.title },
           settings,
-          provider,
+          // T10：strict 复核 L2 走 planner（决策点升级；未配置回落主模型）
+          provider: plannerProvider || provider,
           fastllm: this.fastllm,
           lastResults: this.lastResults,
           memory: this.state.memory
         })
         nodeGateOpen = this.handleNodeVerdict(verdict, stepN)
+        // T10 专家重试（W9）：节点复核未通过 → 下一次调用单次走 planner（每任务 ≤3 次，成功立即回落）
+        if (
+          !nodeGateOpen &&
+          !verdict.passed &&
+          this.expertRetriesUsed < 3 &&
+          plannerProvider &&
+          settings.replan !== false
+        ) {
+          this.expertArmed = true
+          this.expertRetriesUsed++
+          this.lastResults.push('系统提示: 节点复核未通过，下一次决策将由专家模型（planner）单次接管重试。')
+        }
       }
 
       // done 与节点链仲裁：声称完成但节点链未走完 → 拦下继续推进（最多拦 2 次，之后尊重模型判断收尾）
@@ -2047,11 +2395,58 @@ export class AgentRunner {
               ? `系统提示: 你输出了 done，但节点链还有 ${left} 个节点未完成（当前节点${this.planIdx + 1}「${cur.intent}」预期: ${cur.expected}）。请先推进当前节点；若剩余节点确实无需执行，请在下一步说明理由后再次输出 done。`
               : `系统提示: 你输出了 done，但当前节点${this.planIdx + 1}「${cur.intent}」复核未通过（预期: ${cur.expected}）。请先把当前节点做对再收尾。`
           )
+          // T9 触发条件（P0-5）：done 被拦且模型明确报告页面与预期不符
+          const reported = String(doneAction.result || doneAction.value || '')
+          if (/不符|不一致|不一样|错误|失败|无法/.test(reported)) {
+            this.replanPending = 'done 被拦且模型报告页面与预期不符'
+          }
+          if (this.replanPending && this.replanCount < 2 && settings.replan !== false) {
+            await this.doReplan(task, provider, plannerProvider, extract, this.replanPending, stepN, epoch)
+            if (!(await this.checkpoint(epoch))) return
+          }
           continue
         }
       }
 
       if (doneAction) {
+        // T9 硬门禁（P0-5）：重规划过的任务 done 强制云端 L2 复核——
+        // 不允许本地复核放行、不允许 skip；复核不通过按重规划失败处理（升级人工）
+        if (this.replanCount > 0 && !this.testCtx && this.plan.length) {
+          this.setState({ statusText: `第 ${stepN} 步：重规划任务收尾，强制云端 L2 复核…` })
+          const finalVerdict = await verifyNode({
+            node: this.plan[this.plan.length - 1],
+            cdp: tab.cdp,
+            extract: { ...extract, url: tab.url || extract.url, title: tab.title || extract.title },
+            settings: { verifyMode: 'strict' },
+            provider: plannerProvider || provider,
+            fastllm: undefined,
+            lastResults: this.lastResults,
+            memory: this.state.memory,
+            forceL2: true
+          })
+          this.telemetry.log('verify', stepN, {
+            forceL2: true,
+            passed: finalVerdict.passed,
+            source: finalVerdict.source
+          })
+          if (!finalVerdict.passed) {
+            // 重规划失败处理：升级人工（不自动 skip、不强收尾）
+            this.lastResults.push(
+              `系统提示: 任务收尾的强制 L2 复核未通过（${finalVerdict.reason}）。重规划后的结果未达最终预期，请人工确认/修正后点「继续」。`
+            )
+            this.setState({ state: 'paused', statusText: `收尾 L2 复核未通过：${finalVerdict.reason}，等待人工` })
+            this.broadcast({
+              channel: 'toast',
+              message: `重规划后收尾 L2 复核未通过：${finalVerdict.reason}`,
+              kind: 'captcha'
+            })
+            try {
+              this.tabManager.notifyHuman('收尾复核未通过', finalVerdict.reason)
+            } catch {}
+            this.pauseRequested = true
+            continue
+          }
+        }
         this.telemetry.end({ state: 'success', steps: this.steps.length, tokens: this.state.usage })
         // S5 经验沉淀 C：任务成功 → 成功路径（同站点同类任务下次直接参考）+ 命中经验加分
         if (settings.autoExperience !== false && !this.testCtx) {
@@ -2080,6 +2475,23 @@ export class AgentRunner {
         this.broadcast({ channel: 'toast', message: `任务完成：${(doneAction.result || '').slice(0, 80)}`, kind: 'success' })
         return
       }
+
+      // T9 重规划触发（P0-5）：连续 3 步无任何节点推进（有失败/卡住才算）→ 重排剩余节点（上限 2 次）
+      if (!this.testCtx && this.plan.length && settings.replan !== false && this.replanCount < 2) {
+        if (this.planIdx > this.progressAnchorIdx) {
+          this.progressAnchorIdx = this.planIdx
+          this.noProgressSteps = 0
+        } else if (executed.some((a) => a.error) || this.nodeFails > 0) {
+          this.noProgressSteps++
+          if (this.noProgressSteps >= 3 && !this.replanPending) {
+            this.replanPending = `连续 ${this.noProgressSteps} 步无节点推进`
+          }
+        }
+        if (this.replanPending) {
+          await this.doReplan(task, provider, plannerProvider, extract, this.replanPending, stepN, epoch)
+          if (!(await this.checkpoint(epoch))) return
+        }
+      }
     }
   }
 
@@ -2089,7 +2501,8 @@ export class AgentRunner {
     actions: AgentAction[],
     tab: { id: number; title: string; url: string },
     tokens?: { input: number; output: number },
-    screenshot?: string
+    screenshot?: string,
+    extra?: { timings?: StepTimings; hits?: StepRecord['hits'] }
   ): StepRecord {
     const step: StepRecord = {
       n,
@@ -2102,6 +2515,8 @@ export class AgentRunner {
       nodeIdx: this.plan.length && !this.testCtx ? Math.min(this.planIdx + 1, this.plan.length) : undefined,
       tokens,
       screenshot,
+      timings: extra?.timings,
+      hits: extra?.hits,
       ts: Date.now()
     }
     this.steps.push(step)

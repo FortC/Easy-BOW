@@ -28,7 +28,14 @@ const BOOLEANS: Array<keyof Settings> = [
   'autoExperience',
   'prescreen',
   'humanLike',
-  'persistSession'
+  'persistSession',
+  // v3.0 AI 操控升级
+  'smartWait',
+  'structuredOut',
+  'locatorChain',
+  'reflection',
+  'replan',
+  'actionVerify'
 ]
 
 function optionalEnum<T extends string>(v: unknown, allowed: readonly T[]): T | undefined {
@@ -80,6 +87,8 @@ export function sanitizeSettingsPatch(patch: unknown): Partial<Settings> {
   if (speed) out.speed = speed
   const closeAction = optionalEnum(p.closeAction, ['ask', 'tray', 'exit'] as const)
   if (closeAction) out.closeAction = closeAction
+  const timelineShot = optionalEnum(p.timelineShot, ['all', 'smart', 'off'] as const)
+  if (timelineShot) out.timelineShot = timelineShot
 
   const baseURL = optionalHttpUrl(p.baseURL, 300)
   if (baseURL !== undefined) out.baseURL = baseURL
@@ -97,6 +106,25 @@ export function sanitizeSettingsPatch(patch: unknown): Partial<Settings> {
   for (const k of BOOLEANS) {
     const b = optionalBool(p[k as string])
     if (b !== undefined) (out as Record<string, unknown>)[k] = b
+  }
+
+  // W9 planner 配置块（T10）：逐字段白名单校验；全空对象=清空（跟随主配置）
+  if (p.planner !== undefined) {
+    if (p.planner === null) {
+      out.planner = undefined
+    } else if (typeof p.planner === 'object') {
+      const q = p.planner as Record<string, unknown>
+      const pl: Settings['planner'] = {}
+      const plProvider = optionalEnum(q.provider, ['openai', 'anthropic'] as const)
+      if (plProvider) pl.provider = plProvider
+      const plBase = optionalHttpUrl(q.baseURL, 300)
+      if (plBase !== undefined && plBase) pl.baseURL = plBase
+      const plKey = optionalStr(q.apiKey, 600)
+      if (plKey !== undefined) pl.apiKey = plKey
+      const plModel = optionalStr(q.model, 200)
+      if (plModel !== undefined && plModel) pl.model = plModel
+      out.planner = pl
+    }
   }
   return out
 }
@@ -132,6 +160,10 @@ export function getSettings(): Settings {
       const raw = JSON.parse(readFileSync(settingsPath(), 'utf-8'))
       const merged = { ...DEFAULT_SETTINGS, ...raw }
       if (typeof merged.apiKey === 'string') merged.apiKey = decryptApiKey(merged.apiKey)
+      // planner 块的 apiKey 同样走解密（T10）
+      if (merged.planner && typeof merged.planner.apiKey === 'string') {
+        merged.planner = { ...merged.planner, apiKey: decryptApiKey(merged.planner.apiKey) }
+      }
       cached = merged
     } else {
       cached = { ...DEFAULT_SETTINGS }
@@ -150,8 +182,11 @@ export function settingsReloadAfterReady(): void {
 export function saveSettings(patch: Partial<Settings>): Settings {
   const next = { ...getSettings(), ...patch }
   cached = next
-  // 落盘前把 apiKey 换成密文（内存缓存保留明文供运行时使用）
-  const persist = { ...next, apiKey: encryptApiKey(next.apiKey || '') }
+  // 落盘前把 apiKey 换成密文（内存缓存保留明文供运行时使用）；planner 块同规则
+  const persist: Settings = { ...next, apiKey: encryptApiKey(next.apiKey || '') }
+  if (next.planner) {
+    persist.planner = { ...next.planner, apiKey: encryptApiKey(next.planner.apiKey || '') }
+  }
   try {
     writeJsonAtomic(settingsPath(), persist)
   } catch (e) {

@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>两层同源 iframe 嵌套</title>
+<style>
+  body { font-family: system-ui, sans-serif; padding: 20px; background: #fafafa; color: #222; }
+  h1 { font-size: 20px; }
+  p { color: #555; }
+  .panel { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin: 10px 0; }
+  .lv2 { border-color: #9cf; }
+  .lv3 { border-color: #6c6; }
+  input { height: 32px; padding: 0 8px; font-size: 14px; border: 1px solid #bbb; border-radius: 4px; width: 200px; }
+  button { min-height: 34px; padding: 4px 16px; font-size: 14px; cursor: pointer; }
+  iframe { border: 1px dashed #aaa; border-radius: 6px; display: block; }
+  #result { margin-top: 14px; padding: 12px 14px; background: #eef6ff; border: 1px solid #8cf; border-radius: 6px; min-height: 24px; }
+</style>
+</head>
+<body>
+<script>
+  // 单文件自嵌套：?level=2 中层 / ?level=3 内层表单（同源，仅查询串不同）
+  var level = new URLSearchParams(location.search).get('level') || '1'
+
+  if (level === '3') {
+    document.title = '内层表单'
+    document.body.innerHTML =
+      '<div class="panel lv3"><b>内层 iframe：表单</b><br><br>' +
+      '<input id="deep-input" type="text" placeholder="深层输入框">' +
+      '<button id="deep-btn" type="button">深层提交</button>' +
+      '<div id="deep-out">（内层回显）未提交</div></div>'
+    document.getElementById('deep-btn').addEventListener('click', function () {
+      var v = document.getElementById('deep-input').value
+      document.getElementById('deep-out').textContent = '内层已提交: ' + v
+      try {
+        window.top.document.getElementById('result').textContent = '深层表单已提交: ' + v
+      } catch (e) {}
+    })
+  } else if (level === '2') {
+    document.title = '中层 iframe'
+    document.body.innerHTML =
+      '<div class="panel lv2"><b>中层 iframe</b>（内嵌第三层）' +
+      '<iframe id="frame-3" src="nested-iframe.html?level=3" width="520" height="170"></iframe></div>'
+  } else {
+    document.body.innerHTML =
+      '<h1>两层同源 iframe 嵌套</h1>' +
+      '<p>外层页面 → 中层 iframe → 内层表单，三层同源（仅查询串不同）；最内层是表单。</p>' +
+      '<div class="panel"><b>外层页面</b>' +
+      '<iframe id="frame-2" src="nested-iframe.html?level=2" width="560" height="240"></iframe></div>' +
+      '<div id="result">（结果区）等待操作</div>'
+  }
+</script>
+</body>
+</html>

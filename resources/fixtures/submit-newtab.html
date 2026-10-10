@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>提交打开新标签</title>
+<style>
+  body { font-family: system-ui, sans-serif; padding: 24px; background: #fafafa; color: #222; }
+  h1 { font-size: 20px; }
+  p { color: #555; }
+  .panel { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 16px; max-width: 480px; }
+  button { min-height: 36px; padding: 6px 18px; font-size: 14px; cursor: pointer; }
+  #result { margin-top: 16px; padding: 12px 14px; background: #eef6ff; border: 1px solid #8cf; border-radius: 6px; min-height: 24px; }
+</style>
+</head>
+<body>
+<script>
+  // 带 ?ok=1 打开 = 新标签页（提交成功的落点页）
+  var ok = new URLSearchParams(location.search).get('ok') === '1'
+
+  if (ok) {
+    document.title = '提交成功'
+    document.body.innerHTML =
+      '<h1>提交成功</h1>' +
+      '<div class="panel">新标签页：表单已成功提交。</div>' +
+      '<div id="result">（结果区）提交成功</div>'
+  } else {
+    document.body.innerHTML =
+      '<h1>提交打开新标签</h1>' +
+      '<p>点「提交」后 window.open 打开本文件（带 ?ok=1）的新标签，新页显示「提交成功」。</p>' +
+      '<div class="panel"><button id="newtab-btn" type="button">提交</button></div>' +
+      '<div id="result">（结果区）等待操作</div>'
+    document.getElementById('newtab-btn').addEventListener('click', function () {
+      window.open('submit-newtab.html?ok=1')
+      document.getElementById('result').textContent = '已提交，正在打开新页签'
+    })
+  }
+</script>
+</body>
+</html>

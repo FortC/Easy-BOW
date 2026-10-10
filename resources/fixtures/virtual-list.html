@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>虚拟列表</title>
+<style>
+  body { font-family: system-ui, sans-serif; padding: 24px; background: #fafafa; color: #222; }
+  h1 { font-size: 20px; }
+  p { color: #555; }
+  #vlist {
+    width: 420px; height: 320px; overflow-y: auto;
+    background: #fff; border: 1px solid #ddd; border-radius: 8px;
+    position: relative;
+  }
+  .vrow { display: flex; align-items: center; gap: 10px; height: 32px; padding: 0 12px; box-sizing: border-box; border-bottom: 1px solid #f0f0f0; font-size: 14px; }
+  .vrow .lbl { flex: 1; }
+  .vrow button { min-height: 26px; padding: 2px 12px; font-size: 12px; cursor: pointer; }
+  .vrow.hit { background: #fff7d6; }
+  #result { margin-top: 16px; padding: 12px 14px; background: #eef6ff; border: 1px solid #8cf; border-radius: 6px; min-height: 24px; }
+</style>
+</head>
+<body>
+<h1>虚拟列表（只渲染可视 10 行）</h1>
+<p>固定高度容器共 100 条数据，滚动时回收重建 DOM，只保留可视区行；每行有「选中」按钮。</p>
+
+<div id="vlist"></div>
+
+<div id="result">（结果区）等待操作</div>
+
+<script>
+  var TOTAL = 100
+  var ROW_H = 32
+  var VIEW = 10
+  var box = document.getElementById('vlist')
+  var hitId = 0
+
+  // 按滚动位置只渲染可视 10 行（滚动时回收重建 DOM 节点）
+  function render() {
+    var start = Math.min(TOTAL - VIEW, Math.floor(box.scrollTop / ROW_H))
+    if (start < 0) start = 0
+    var html = '<div style="height:' + start * ROW_H + 'px"></div>'
+    for (var i = start; i < start + VIEW && i < TOTAL; i++) {
+      var n = i + 1
+      html +=
+        '<div class="vrow' + (n === hitId ? ' hit' : '') + '" data-n="' + n + '">' +
+        '<span class="lbl">条目 ' + n + '</span>' +
+        '<button type="button" class="pick">选中</button></div>'
+    }
+    html += '<div style="height:' + Math.max(0, (TOTAL - start - VIEW) * ROW_H) + 'px"></div>'
+    box.innerHTML = html
+  }
+
+  box.addEventListener('scroll', render)
+  // 事件委托：行节点随滚动回收重建，按钮点击仍按 data-n 记录
+  box.addEventListener('click', function (e) {
+    var btn = e.target.closest('button')
+    if (!btn) return
+    var row = btn.closest('.vrow')
+    if (!row) return
+    hitId = parseInt(row.getAttribute('data-n'), 10)
+    render()
+    document.getElementById('result').textContent = '已选中条目 ' + hitId
+  })
+
+  render()
+</script>
+</body>
+</html>

@@ -1,0 +1,37 @@
+{
+  "说明": [
+    "真实站点回归用例（用例 2/3 占位模板）。",
+    "启用方法：把 enabled 改为 true，改 startUrl / task / expects 指向真实站点；没有启用条目时报告中标 skipped。",
+    "登录态人工预热：回归跑在临时 userData（独立 Chromium 会话），不会带正式 profile 的登录态；",
+    "  跑真实站点用例前需人工预热（先在正式应用登录好同站点，或在用例任务里先写登录步骤并提供测试账号）。",
+    "expects.kind 取值：text_visible（页面文本包含 value）/ url_contains（当前 URL 包含 value）/",
+    "  selector_exists（value 为 CSS 选择器，存在即过）/ selector_text（selector 元素文本包含 value）/",
+    "  selector_value（selector 输入框 value 包含 value）；negate=true 取反。",
+    "timeoutMs 可选（单用例超时毫秒，默认 180000）。",
+    "AI 接口配置：优先读环境变量 EASYBOW_API_KEY / EASYBOW_BASE_URL / EASYBOW_MODEL，其次复用正式 profile 的 settings.json。"
+  ],
+  "cases": [
+    {
+      "enabled": false,
+      "name": "模板-后台列表查询",
+      "startUrl": "https://example.com/admin/orders",
+      "task": "在订单号输入框输入 A1024，点击查询按钮，等待列表刷新",
+      "expects": [
+        { "kind": "text_visible", "value": "A1024" },
+        { "kind": "selector_exists", "value": ".order-list" }
+      ],
+      "timeoutMs": 240000
+    },
+    {
+      "enabled": false,
+      "name": "模板-表单提交流程",
+      "startUrl": "https://example.com/form",
+      "task": "填写表单（名称填回归测试），点击提交按钮，等待提交完成",
+      "expects": [
+        { "kind": "text_visible", "value": "提交成功" },
+        { "kind": "url_contains", "value": "/success" }
+      ],
+      "timeoutMs": 240000
+    }
+  ]
+}

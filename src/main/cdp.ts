@@ -1,4 +1,5 @@
 import { BrowserWindow, dialog, type WebContents } from 'electron'
+import { WAIT_DOM_STABLE_FN } from './domstable'
 
 /**
  * 基于 Electron 内置 webContents.debugger 的 CDP 会话封装。
@@ -77,7 +78,7 @@ export class Cdp {
   /** 重连/附加成功后重新开启已启用的域 */
   private rearmDomains(): void {
     if (this.dialogPageEnabled) this.send('Page.enable').catch(() => {})
-    if (this.netCapture) this.send('Network.enable').catch(() => {})
+    if (this.netCapture || this.netQuietWatch) this.send('Network.enable').catch(() => {})
     if (this.stealthApplied) this.applyStealthScript()
   }
 
@@ -174,12 +175,34 @@ export class Cdp {
     return null
   }
 
-  /** 视口截图（jpeg dataURL；quality 越高越清晰，视觉模式发模型用高质量） */
-  async screenshotJpeg(quality = 45): Promise<string | null> {
-    const data = await this.captureScreenshot({
-      format: 'jpeg',
-      quality: Math.max(30, Math.min(95, Math.round(quality)))
-    })
+  /** 视口截图（jpeg dataURL；quality 越高越清晰，视觉模式发模型用高质量；scale<1 出缩略图） */
+  async screenshotJpeg(quality = 45, scale = 1): Promise<string | null> {
+    const q = Math.max(30, Math.min(95, Math.round(quality)))
+    if (scale >= 1) {
+      const data = await this.captureScreenshot({ format: 'jpeg', quality: q })
+      return data ? `data:image/jpeg;base64,${data}` : null
+    }
+    // W2 缩略图：clip.scale 输出降采样图（时间线缩略图省编码/传输/内存）
+    try {
+      const m = await this.send<{ cssVisualViewport?: { clientWidth: number; clientHeight: number } }>(
+        'Page.getLayoutMetrics',
+        {},
+        5000
+      )
+      const vp = m?.cssVisualViewport
+      if (vp && vp.clientWidth > 0 && vp.clientHeight > 0) {
+        const data = await this.captureScreenshot({
+          format: 'jpeg',
+          quality: q,
+          clip: { x: 0, y: 0, width: vp.clientWidth, height: vp.clientHeight, scale },
+          captureBeyondViewport: false
+        })
+        if (data) return `data:image/jpeg;base64,${data}`
+      }
+    } catch {
+      /* 降采样失败回退全尺寸 */
+    }
+    const data = await this.captureScreenshot({ format: 'jpeg', quality: q })
     return data ? `data:image/jpeg;base64,${data}` : null
   }
 
@@ -433,14 +456,30 @@ export class Cdp {
     this.send('Page.handleJavaScriptDialog', { accept }).catch(() => {})
   }
 
-  // —————— 网络捕获（测试模式网络级断言用） ——————
+  // —————— 网络捕获（测试断言） + in-flight 生命周期跟踪（W1 智能等待 / wait_for 未来监听） ——————
 
   private netCapture = false
   private netHandler: ((_e: unknown, method: string, params: any) => void) | null = null
   private netLog: Array<{ requestId: string; url: string; status: number; type: string; ts: number }> = []
+  /** W1 轻量网络活动跟踪：只记时间戳（环形最近 50 条），供「网络静默」判定 */
+  private netActivity: number[] = []
+  /** in-flight 生命周期（P0-3）：只跟白名单 XHR/Fetch/Document——requestWillBeSent 记账、
+   *  loadingFinished/Failed 销账；网络 idle 判定以「白名单在途 = 0」为准（图片/静态资源不卡静默） */
+  private netInflight = new Map<
+    string,
+    { url: string; method: string; type: string; ts: number; status?: number; finished?: boolean }
+  >()
+  /** wait_for network 未来监听（P0-3）：注册后「未来」出现的匹配请求才算等到 */
+  private netWaiters: Array<{
+    urlPart: string
+    method?: string
+    since: number
+    resolve: (r: { status: number; url: string; stale: boolean } | null) => void
+    timer: ReturnType<typeof setTimeout>
+  }> = []
 
   /**
-   * 网络捕获开关（仅测试模式开启）：收集 XHR/Fetch/Document 响应（URL+状态码），
+   * 网络捕获开关（测试模式网络级断言用）：收集 XHR/Fetch/Document 响应（URL+状态码），
    * 响应体按需经 Network.getResponseBody 拉取（缓冲被浏览器回收后会失败，断言如实报错）。
    */
   setNetworkCapture(on: boolean): void {
@@ -448,9 +487,52 @@ export class Cdp {
     this.netCapture = on
     if (on) {
       this.netLog = []
-      if (!this.netHandler) {
-        this.netHandler = (_e, method, params) => {
-          if (method !== 'Network.responseReceived' || !this.netCapture) return
+      this.ensureNetTracking()
+    } else {
+      // 日志保留供断言读取；下次开启时清空。网络活动跟踪不随之关闭（W1 智能等待要用）
+      if (!this.netQuietWatch) this.send('Network.disable', {}).catch(() => {})
+    }
+  }
+
+  /** W1：网络活动跟踪开启标志（智能等待的「网络静默」信号源） */
+  private netQuietWatch = false
+
+  /**
+   * W1 智能等待的网络跟踪：只记「有请求在飞/刚结束」的时间戳与 in-flight 记账，
+   * 开销可忽略（普通任务常开）。CDP 重连后由 rearmDomains 重新下发。
+   */
+  setNetQuietWatch(on: boolean): void {
+    this.netQuietWatch = on
+    if (on) this.ensureNetTracking()
+    else if (!this.netCapture) this.send('Network.disable', {}).catch(() => {})
+  }
+
+  /** 注册网络事件监听并开启 Network 域（幂等） */
+  private ensureNetTracking(): void {
+    if (!this.netHandler) {
+      this.netHandler = (_e, method, params) => {
+        const touch = () => {
+          this.netActivity.push(Date.now())
+          if (this.netActivity.length > 50) this.netActivity.splice(0, this.netActivity.length - 50)
+        }
+        if (method === 'Network.requestWillBeSent') {
+          const t = String(params?.type || '')
+          // in-flight 只记白名单（XHR/Fetch/Document）：图片/样式/字体长连接不卡「网络静默」
+          if (['XHR', 'Fetch', 'Document'].includes(t)) {
+            this.netInflight.set(String(params.requestId), {
+              url: String(params?.request?.url || ''),
+              method: String(params?.request?.method || 'GET'),
+              type: t,
+              ts: Date.now()
+            })
+            touch()
+          }
+          return
+        }
+        if (method === 'Network.responseReceived') {
+          const rec = this.netInflight.get(String(params?.requestId))
+          if (rec) rec.status = Number(params?.response?.status || 0)
+          if (!this.netCapture) return
           const r = params?.response
           if (!r) return
           const t = String(params?.type || r.type || '')
@@ -463,16 +545,130 @@ export class Cdp {
             type: t,
             ts: Date.now()
           })
+          if (this.netLog.length > 200) this.netLog.splice(0, this.netLog.length - 200)
+          return
         }
-        try {
-          this.wc.debugger.on('message', this.netHandler)
-        } catch {}
+        if (method === 'Network.loadingFinished' || method === 'Network.loadingFailed') {
+          const rec = this.netInflight.get(String(params?.requestId))
+          if (rec) {
+            if (method === 'Network.loadingFailed') rec.status = rec.status ?? 0
+            this.netInflight.delete(String(params?.requestId))
+            // wait_for 未来监听：请求「完结」时结账（P0-3：看 loadingFinished 且判 status）
+            this.settleNetWaiters(rec)
+          }
+          touch()
+          return
+        }
       }
-      this.send('Network.enable', {}).catch(() => {})
-    } else {
-      this.send('Network.disable', {}).catch(() => {})
-      // 日志保留供断言读取；下次开启时清空
+      try {
+        this.wc.debugger.on('message', this.netHandler)
+      } catch {}
     }
+    this.send('Network.enable', {}).catch(() => {})
+  }
+
+  /** wait_for 命中判定：URL 片段 + 可选 method（future 请求、已完成） */
+  private settleNetWaiters(rec: {
+    url: string
+    method: string
+    ts: number
+    status?: number
+    type: string
+  }): void {
+    if (!this.netWaiters.length) return
+    const keep: typeof this.netWaiters = []
+    for (const w of this.netWaiters) {
+      if (rec.ts < w.since) {
+        keep.push(w)
+        continue
+      }
+      const methodOk = !w.method || w.method.toUpperCase() === rec.method.toUpperCase()
+      if (methodOk && rec.url.includes(w.urlPart)) {
+        clearTimeout(w.timer)
+        w.resolve({ status: rec.status ?? 0, url: rec.url, stale: false })
+      } else {
+        keep.push(w)
+      }
+    }
+    this.netWaiters = keep
+  }
+
+  /**
+   * wait_for network 未来监听模式（P0-3）：调用时注册 URL 匹配器，等待**未来**出现的
+   * 匹配请求完结（loadingFinished/Failed）并返回其 status——4xx/5xx 由调用方判该步失败。
+   * 超时未出现 → 自动转「查最近 N 条」兜底（stale:true 如实标注兜底来源）；都没有 → null。
+   */
+  async waitForResponse(
+    match: { urlPart: string; method?: string },
+    timeoutMs = 8000
+  ): Promise<{ status: number; url: string; stale: boolean } | null> {
+    this.ensureNetTracking()
+    const since = Date.now()
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.netWaiters = this.netWaiters.filter((w) => w.resolve !== done)
+        // 超时兜底：查最近 N 条历史（请求可能在注册前就发出/完结），如实标 stale
+        const hit = [...this.netLog].reverse().find((e) => e.url.includes(match.urlPart))
+        resolve(hit ? { status: hit.status, url: hit.url, stale: true } : null)
+      }, timeoutMs)
+      const done = (r: { status: number; url: string; stale: boolean } | null) => {
+        clearTimeout(timer)
+        resolve(r)
+      }
+      this.netWaiters.push({ urlPart: match.urlPart, method: match.method, since, resolve: done, timer })
+    })
+  }
+
+  /**
+   * W1 网络静默等待：等「白名单无在途请求 + quietMs 内无网络活动」或超时。
+   * 长轮询/轮询页面（永远有在途请求）自然走满 timeout，与 networkidle 误用不同——
+   * 这里只做「多等一会儿」的加速器，超时不判失败。
+   */
+  async waitNetworkQuiet(quietMs = 300, timeoutMs = 5000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const last = this.netActivity.length ? this.netActivity[this.netActivity.length - 1] : 0
+      if (this.netInflight.size === 0 && Date.now() - last >= quietMs) return true
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    return false
+  }
+
+  /** W1 最近一次网络活动距今毫秒数（无活动 = Infinity） */
+  netQuietMs(): number {
+    const last = this.netActivity.length ? this.netActivity[this.netActivity.length - 1] : 0
+    return last ? Date.now() - last : Infinity
+  }
+
+  /** W1 在途请求数（白名单）：提交后核验与等待策略用 */
+  netInflightCount(): number {
+    return this.netInflight.size
+  }
+
+  /**
+   * 提交类点击后监听「新标签页」（P0-3：预览/支付常见 window.open）：
+   * timeout 内 opener 打开了新窗口/页签 → true（调用方改为等新页 settle）。
+   */
+  awaitNewWindow(timeoutMs = 5000): Promise<boolean> {
+    return new Promise((resolve) => {
+      let done = false
+      const finish = (v: boolean) => {
+        if (done) return
+        done = true
+        try {
+          this.wc.removeListener('did-create-window', onWin)
+        } catch {}
+        clearTimeout(timer)
+        resolve(v)
+      }
+      const onWin = () => finish(true)
+      const timer = setTimeout(() => finish(false), timeoutMs)
+      try {
+        this.wc.on('did-create-window', onWin)
+      } catch {
+        finish(false)
+      }
+    })
   }
 
   getNetworkLog(): Array<{ requestId: string; url: string; status: number; type: string; ts: number }> {
@@ -491,5 +687,30 @@ export class Cdp {
       /* 响应缓冲已被回收（加载了较多后续请求）——状态码断言仍可用 */
     }
     return { status: hit.status, url: hit.url, body }
+  }
+
+  // —————— W1 DOM 稳定等待（替代固定 sleep 的核心信号） ——————
+
+  /**
+   * 等 DOM「结构性变动」静默：探针按统一 mutation 分类表（domstable.ts，W1/W10 共用）
+   * 判定——childList/characterData 结构增删与语义属性（aria-* 、disabled、checked 等）计入，
+   * style/纯动画 class/轮播广告容器/自注入句柄忽略；覆盖穿透的每个 shadow root。
+   * 返回 true=已静默；false=吃满 timeoutMs 仍未静默（动画页/轮询页，调用方走熔断回退）。
+   */
+  async waitDomStable(quietMs = 250, timeoutMs = 8000): Promise<boolean> {
+    try {
+      const quiet = await this.send<boolean>(
+        'Runtime.evaluate',
+        {
+          expression: `(${WAIT_DOM_STABLE_FN})(${Math.round(quietMs)},${Math.round(timeoutMs)})`,
+          awaitPromise: true,
+          returnByValue: true
+        },
+        timeoutMs + 5000
+      ).then((r: any) => (typeof r === 'boolean' ? r : !!r?.result?.value))
+      return quiet
+    } catch {
+      return true // 探针失败按静默处理（调用方有超时上限，不卡死）
+    }
   }
 }

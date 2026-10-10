@@ -30,6 +30,9 @@ export async function verifyNode(opts: {
   lastResults: string[]
   /** 任务记忆（save 存的数据是"抓取/搬运类节点"达成的直接证据） */
   memory: Record<string, string>
+  /** T9 硬门禁（P0-5）：重规划过的任务 done 时强制云端 L2——不允许本地复核放行、不允许 skip，
+   *  复核不确定/调用失败一律按未通过处理 */
+  forceL2?: boolean
 }): Promise<Verdict> {
   // —— L0：结构化预期的确定性校验 ——
   const c = opts.node.check
@@ -87,7 +90,8 @@ export async function verifyNode(opts: {
 
   // —— L1：本地快速决策模型（fast/strict 模式；0 token）——
   // 只把"通过"当定论；"未通过"是弱信号（0.5B 小模型看不到图、易误判），交给 L2 云端确认
-  if (opts.fastllm?.isReady()) {
+  // T9 硬门禁：forceL2 时本地复核不得放行（P0-5），直接跳过 L1
+  if (!opts.forceL2 && opts.fastllm?.isReady()) {
     try {
       const out = await opts.fastllm.decide(VERIFY_SYSTEM_PROMPT, judgePrompt, 24)
       const v = parseJudge(out)
@@ -100,8 +104,9 @@ export async function verifyNode(opts: {
   }
 
   // —— L2：云端大模型终审 ——
-  // 触发条件：strict 模式 / L1 未通过或不确定（fast 模式下 L1 的"未通过"需 L2 确认，防小模型误判阻塞任务）
-  const needL2 = !!opts.provider && (mode === 'strict' || (l1Fail != null && l1Fail.pass !== true))
+  // 触发条件：strict 模式 / forceL2（重规划任务 done 硬门禁）/ L1 未通过或不确定
+  // （fast 模式下 L1 的"未通过"需 L2 确认，防小模型误判阻塞任务）
+  const needL2 = !!opts.provider && (opts.forceL2 || mode === 'strict' || (l1Fail != null && l1Fail.pass !== true))
   if (needL2 && opts.provider) {
     // 云端复核失败先重试一次再降级：接口抖动一次就无条件放行 = 复核形同虚设（复核 P1-12）
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -111,15 +116,24 @@ export async function verifyNode(opts: {
         if (v.pass === true) return { passed: true, source: 'l2', reason: v.reason ? `大模型复核通过（${v.reason}）` : '大模型复核通过' }
         if (v.pass === false)
           return { passed: false, source: 'l2', reason: v.reason ? `大模型复核未通过（${v.reason}）` : '大模型复核未通过' }
+        // T9 硬门禁：不确定不允许放行（P0-5「不允许 skip」）
+        if (opts.forceL2) return { passed: false, source: 'l2', reason: '强制 L2 复核判为不确定，按未通过处理' }
         return { passed: true, source: 'l2', reason: '大模型判为不确定，按通过处理' }
       } catch (e: any) {
         if (attempt === 0) {
           await new Promise((r) => setTimeout(r, 800))
           continue
         }
+        // T9 硬门禁：强制 L2 时调用失败不允许 skip
+        if (opts.forceL2)
+          return { passed: false, source: 'l2', reason: `强制 L2 复核调用失败，按未通过处理: ${String(e?.message || e).slice(0, 60)}` }
         return { passed: true, source: 'skip', reason: `复核调用失败按通过处理: ${String(e?.message || e).slice(0, 60)}` }
       }
     }
+  }
+  // T9 硬门禁：forceL2 必须有云端 provider 兜底判定，缺 provider 不允许本地放行
+  if (opts.forceL2 && !opts.provider) {
+    return { passed: false, source: 'skip', reason: '强制 L2 复核不可用（未配置云端接口），按未通过处理' }
   }
 
   // fast 模式且 L1 无法判定（本地模型不可用/输出不可解析）→ 不阻塞任务（宁可放行也不空转）

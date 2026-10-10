@@ -8,12 +8,13 @@ import { getSettings, saveSettings, sanitizeSettingsPatch, settingsReloadAfterRe
 import { getKB, setKB } from './knowledge'
 import { getExperience, setExperience, flushExperience } from './experience'
 import { getTemplates, saveTemplate, deleteTemplate, resolveTemplateVars } from './templates'
-import { createProvider, isVisionUnsupportedError, TINY_TEST_IMAGE } from './agent/llm'
+import { createProvider, isVisionUnsupportedError, probeStructuredSupport, TINY_TEST_IMAGE } from './agent/llm'
 import { ENHANCE_SYSTEM_PROMPT } from './agent/prompts'
 import { listCCSwitchProviders } from './ccswitch'
 import { recordHistory, touchHistoryTitle, listHistory, removeHistory, clearHistory } from './history'
 import { formatCandidates } from './extractor'
 import { runSelftest } from './selftest'
+import { runRegression } from './regression'
 import { runFastllmTest, isFastllmTest } from './fastllm-test'
 import { tryInitOcr, ocrEnhanceExtract, ocrPageText, disposeOcr } from './ocr'
 import { FastLlm } from './fastllm'
@@ -419,6 +420,16 @@ function registerIpc(): void {
   ipcMain.handle('llm:test', async () => {
     const s = getSettings()
     const provider = createProvider(s)
+    // T4 结构化输出预检（1-token 探测，不消耗真实任务请求；结果会话内粘滞，预检日志可见）
+    const probeNote = async (): Promise<string> => {
+      if (s.structuredOut === false) return '结构化输出: 已关闭'
+      try {
+        const sup = await probeStructuredSupport(s)
+        return `结构化输出: ${sup === 'json_schema' ? 'json_schema ✅' : sup === 'json_object' ? 'json_object（降级）' : '不支持（纯文本 JSON）'}`
+      } catch {
+        return '结构化输出: 探测失败（按纯文本 JSON）'
+      }
+    }
     // 视觉模式开启：附带 1x1 测试图探测模型是否接受图片输入
     if (s.vision) {
       try {
@@ -431,7 +442,11 @@ function registerIpc(): void {
             ]
           }
         ])
-        return { ok: true, message: `连接成功，支持视觉输入 ✅（模型回复: ${r.text.slice(0, 30)}）`, usage: r.usage }
+        return {
+          ok: true,
+          message: `连接成功，支持视觉输入 ✅（模型回复: ${r.text.slice(0, 30)}；${await probeNote()}）`,
+          usage: r.usage
+        }
       } catch (e: any) {
         if (isVisionUnsupportedError(e)) {
           // 纯文本再测一次，确认连接本身可用（运行时视觉模式会自动降级）
@@ -440,7 +455,7 @@ function registerIpc(): void {
           ])
           return {
             ok: true,
-            message: `连接成功，但模型不接受图片输入 ⚠️ 运行时视觉模式将自动降级为元素列表（纯文本回复: ${r2.text.slice(0, 20)}）`,
+            message: `连接成功，但模型不接受图片输入 ⚠️ 运行时视觉模式将自动降级为元素列表（纯文本回复: ${r2.text.slice(0, 20)}；${await probeNote()}）`,
             usage: r2.usage
           }
         }
@@ -450,7 +465,7 @@ function registerIpc(): void {
     const r = await provider.chat('你是连接测试助手。只输出两个字：正常', [
       { role: 'user', content: 'ping' }
     ])
-    return { ok: true, message: `连接成功，模型回复: ${r.text.slice(0, 50)}`, usage: r.usage }
+    return { ok: true, message: `连接成功，模型回复: ${r.text.slice(0, 50)}（${await probeNote()}）`, usage: r.usage }
   })
   // 本地快速决策模型（混合模式）；bundled=模型已内置安装包（免下载）
   ipcMain.handle('fastllm:status', () => ({ ...fastllm.status, bundled: !!FastLlm.bundledModelDir() }))
@@ -623,7 +638,13 @@ if (isSelftest) {
   app.setPath('userData', join(app.getPath('temp'), `easybow-selftest-${Date.now()}`))
 }
 
-const gotLock = isFastllmTest(process.argv) || isSelftest || app.requestSingleInstanceLock()
+// 回归模式（--regression）：同样独立临时 userData + 免单实例锁（跑完出报告即退出）
+const isRegression = process.argv.includes('--regression')
+if (isRegression) {
+  app.setPath('userData', join(app.getPath('temp'), `easybow-regression-${Date.now()}`))
+}
+
+const gotLock = isFastllmTest(process.argv) || isSelftest || isRegression || app.requestSingleInstanceLock()
 if (!gotLock) {
   app.quit()
 } else {
@@ -653,6 +674,10 @@ if (!gotLock) {
         getWin: () => win,
         exit: (code) => app.exit(code)
       })
+      return
+    }
+    if (isRegression) {
+      await runRegression()
       return
     }
     createWindow()

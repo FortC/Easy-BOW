@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>排序 / 插入行后的列表</title>
+<style>
+  body { font-family: system-ui, sans-serif; padding: 24px; background: #fafafa; color: #222; }
+  h1 { font-size: 20px; }
+  p { color: #555; }
+  .ops button { min-height: 34px; padding: 4px 16px; font-size: 14px; cursor: pointer; margin-right: 8px; }
+  #rows { max-width: 520px; margin-top: 12px; background: #fff; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; }
+  .row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid #eee; }
+  .row:last-child { border-bottom: none; }
+  .row .lbl { flex: 1; font-size: 14px; }
+  .row button { min-height: 32px; padding: 4px 14px; font-size: 13px; cursor: pointer; }
+  .row.hit { background: #fff7d6; }
+  #result { margin-top: 16px; padding: 12px 14px; background: #eef6ff; border: 1px solid #8cf; border-radius: 6px; min-height: 24px; }
+</style>
+</head>
+<body>
+<h1>排序 / 插入行后的列表</h1>
+<p>「排序」「插入行」打乱 DOM 顺序，每行同名「处理」按钮；行号是行自身属性（data-id），重排后不变——验证锚点行定位不串行。</p>
+
+<div class="ops">
+  <button id="sort-btn" type="button">排序</button>
+  <button id="insert-btn" type="button">插入行</button>
+</div>
+
+<div id="rows"></div>
+
+<div id="result">（结果区）等待操作</div>
+
+<script>
+  var rowsBox = document.getElementById('rows')
+  var nextId = 20
+
+  function makeRow(id) {
+    var row = document.createElement('div')
+    row.className = 'row'
+    row.setAttribute('data-id', String(id))
+    row.innerHTML =
+      '<span class="lbl">行 ' + id + ' · 订单号 ' + (1000 + id) + '</span>' +
+      '<button type="button" class="handle">处理</button>'
+    return row
+  }
+
+  // 初始 8 行（data-id 11~18）
+  for (var i = 11; i <= 18; i++) rowsBox.appendChild(makeRow(i))
+
+  // 排序：DOM 顺序按 data-id 逆序重排（行身份不变）
+  document.getElementById('sort-btn').addEventListener('click', function () {
+    var arr = Array.prototype.slice.call(rowsBox.querySelectorAll('.row'))
+    arr.sort(function (a, b) {
+      return parseInt(b.getAttribute('data-id'), 10) - parseInt(a.getAttribute('data-id'), 10)
+    })
+    arr.forEach(function (r) { rowsBox.appendChild(r) })
+    document.getElementById('result').textContent = '已排序（DOM 逆序重排）'
+  })
+
+  // 插入行：在中间插入一行新数据（后续行 DOM 位置整体后移）
+  document.getElementById('insert-btn').addEventListener('click', function () {
+    var row = makeRow(nextId++)
+    var all = rowsBox.querySelectorAll('.row')
+    if (all.length > 2) rowsBox.insertBefore(row, all[2])
+    else rowsBox.appendChild(row)
+    document.getElementById('result').textContent = '已插入行 ' + row.getAttribute('data-id')
+  })
+
+  // 事件委托：按行自身的 data-id 记录被点行（不依赖 DOM 顺序）
+  rowsBox.addEventListener('click', function (e) {
+    var btn = e.target.closest('button')
+    if (!btn) return
+    var row = btn.closest('.row')
+    if (!row) return
+    var id = row.getAttribute('data-id')
+    var all = rowsBox.querySelectorAll('.row')
+    for (var k = 0; k < all.length; k++) all[k].classList.remove('hit')
+    row.classList.add('hit')
+    document.getElementById('result').textContent = '已处理行 ' + id
+  })
+</script>
+</body>
+</html>

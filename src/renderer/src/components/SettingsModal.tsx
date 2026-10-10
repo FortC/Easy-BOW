@@ -450,6 +450,108 @@ export default function SettingsModal(props: {
         </div>
 
         <div className="form-row">
+          <label>⚡ v3.0 操控升级（智能等待 / 定位链 / 反思重规划；默认全开，出问题可逐项关闭独立回滚）</label>
+          <div className="field-hint">
+            智能等待用页面静默信号替代固定盲等；定位链在页面改版后按容器锚点/语义键重定位（写操作禁坐标兜底）；
+            反思禁止重复失败方式、卡住自动重规划（重规划后收尾强制 L2 复核）
+          </div>
+        </div>
+        <div className="form-inline">
+          <div className="form-row">
+            <label>智能等待</label>
+            <select value={s.smartWait === false ? '0' : '1'} onChange={(e) => set({ smartWait: e.target.value === '1' })}>
+              <option value="1">开启（默认：DOM/网络静默信号）</option>
+              <option value="0">关闭（固定等待，最保守）</option>
+            </select>
+          </div>
+          <div className="form-row">
+            <label>定位链</label>
+            <select value={s.locatorChain === false ? '0' : '1'} onChange={(e) => set({ locatorChain: e.target.value === '1' })}>
+              <option value="1">开启（默认：锚点/语义/就近重定位）</option>
+              <option value="0">关闭（退回「全等+序号」仲裁）</option>
+            </select>
+          </div>
+          <div className="form-row">
+            <label>时间线截图</label>
+            <select
+              value={s.timelineShot ?? 'smart'}
+              onChange={(e) => set({ timelineShot: e.target.value as 'all' | 'smart' | 'off' })}
+            >
+              <option value="smart">分级（默认：常规缩略/出错与完成高清）</option>
+              <option value="all">全部高清</option>
+              <option value="off">不截图</option>
+            </select>
+          </div>
+        </div>
+        <div className="form-inline">
+          <div className="form-row">
+            <label>反思（失败清单）</label>
+            <select value={s.reflection === false ? '0' : '1'} onChange={(e) => set({ reflection: e.target.value === '1' })}>
+              <option value="1">开启（默认：禁止重复失败方式）</option>
+              <option value="0">关闭</option>
+            </select>
+          </div>
+          <div className="form-row">
+            <label>动态重规划</label>
+            <select value={s.replan === false ? '0' : '1'} onChange={(e) => set({ replan: e.target.value === '1' })}>
+              <option value="1">开启（默认：卡住自动重排节点）</option>
+              <option value="0">关闭</option>
+            </select>
+          </div>
+          <div className="form-row">
+            <label>动作后核验</label>
+            <select value={s.actionVerify === false ? '0' : '1'} onChange={(e) => set({ actionVerify: e.target.value === '1' })}>
+              <option value="1">开启（默认：页面无变化时提示）</option>
+              <option value="0">关闭</option>
+            </select>
+          </div>
+        </div>
+        <div className="form-inline">
+          <div className="form-row">
+            <label>结构化输出</label>
+            <select value={s.structuredOut === false ? '0' : '1'} onChange={(e) => set({ structuredOut: e.target.value === '1' })}>
+              <option value="1">开启（默认：JSON schema 原生输出，自动降级）</option>
+              <option value="0">关闭（纯文本 JSON）</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="form-row">
+          <label>🧭 planner 强推理模型（可选，仅用于重规划 / 严格复核 / 卡住节点专家重试，不参与逐步执行）</label>
+          <div className="field-hint">
+            建议：主模型 = 快速对话模型（逐步执行），planner = 强推理模型（规划/复核/专家重试）。
+            留空 = 跟随主配置（全链路行为不变）。planner 不参与逐步执行。
+          </div>
+        </div>
+        <div className="form-inline">
+          <div className="form-row">
+            <label>planner 接口地址</label>
+            <input
+              placeholder="留空跟随主配置"
+              value={s.planner?.baseURL || ''}
+              onChange={(e) => set({ planner: { ...s.planner, baseURL: e.target.value.trim() } })}
+            />
+          </div>
+          <div className="form-row">
+            <label>planner 模型</label>
+            <input
+              placeholder="留空跟随主配置"
+              value={s.planner?.model || ''}
+              onChange={(e) => set({ planner: { ...s.planner, model: e.target.value.trim() } })}
+            />
+          </div>
+        </div>
+        <div className="form-row">
+          <label>planner API Key</label>
+          <input
+            type="password"
+            placeholder="留空跟随主配置"
+            value={s.planner?.apiKey || ''}
+            onChange={(e) => set({ planner: { ...s.planner, apiKey: e.target.value } })}
+          />
+        </div>
+
+        <div className="form-row">
           <label>
             自动经验库（AI 任务中自动沉淀的站点字段映射/教训/成功路径，注入提示词加速二次执行）
             {expList && expList.length > 0 && (

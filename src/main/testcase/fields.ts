@@ -11,6 +11,7 @@ import type { LlmProvider } from '../agent/llm'
 export interface FormField {
   /** iframe 链路径 + 文档内路径（与 extractor 的定位体系一致） */
   framePaths: number[][]
+  /** 文档内 children 索引路径；-1 哨兵 = 进入当前元素的 shadowRoot（与 extractor 一致） */
   path: number[]
   tag: string
   /** input type（text/password/tel/email/date/number/checkbox/radio/file…） */
@@ -95,21 +96,34 @@ export const FORM_FIELDS_FN = String(function formFields() {
       .map((o) => ({ value: String(o.value), text: norm(o.textContent).slice(0, 24) }))
   }
 
+  /** 文档内 children 索引路径；shadowRoot 直接子级插入 -1 哨兵（进入 host 的 shadowRoot） */
   function pathOf(el: Element, doc: Document): number[] | null {
     const p: number[] = []
     let cur: Element | null = el
     while (cur && cur !== doc.documentElement) {
       const parent: Element | null = cur.parentElement
-      if (!parent) return null
-      p.unshift(Array.prototype.indexOf.call(parent.children, cur))
-      cur = parent
+      if (parent) {
+        p.unshift(Array.prototype.indexOf.call(parent.children, cur))
+        cur = parent
+        continue
+      }
+      // parentElement 为 null 可能是 shadowRoot 直接子级：先推 -1 哨兵再从 host 向上
+      let root: any = null
+      try {
+        root = (cur as any).getRootNode ? (cur as any).getRootNode() : null
+      } catch {}
+      if (!root || !root.host || root.host.nodeType !== 1) return null
+      p.unshift(Array.prototype.indexOf.call(root.children, cur))
+      p.unshift(-1)
+      cur = root.host
     }
     if (!cur || cur !== doc.documentElement) return null
     return p
   }
 
-  function collect(doc: Document, framePaths: number[][]) {
-    const nodes = doc.querySelectorAll('input, select, textarea')
+  /** 扫描根（文档或 shadowRoot）下的表单控件（querySelectorAll 不穿透 shadow 边界） */
+  function scanRoot(root: Document | ShadowRoot, doc: Document, framePaths: number[][]) {
+    const nodes = root.querySelectorAll('input, select, textarea')
     for (const el of Array.from(nodes)) {
       if (out.length >= 40) return
       const tag = el.tagName
@@ -170,6 +184,35 @@ export const FORM_FIELDS_FN = String(function formFields() {
         hint: hintBits.join(' ')
       })
     }
+  }
+
+  function collect(doc: Document, framePaths: number[][]) {
+    scanRoot(doc, doc, framePaths)
+    // shadow DOM 穿透（与 extractor 同一穿透策略：shadow 栈递归 + host 栈去重防环；
+    // shadow 内字段路径由 pathOf 插 -1 哨兵）
+    try {
+      const stack: (Document | ShadowRoot)[] = [doc]
+      const hosts: Element[] = []
+      let visited = 0
+      while (stack.length && visited < 60 && out.length < 40) {
+        const d = stack.pop()!
+        let els: Element[] = []
+        try {
+          els = Array.from(d.querySelectorAll('*'))
+        } catch {
+          continue
+        }
+        for (const el of els) {
+          if (out.length >= 40) break
+          const sr = (el as any).shadowRoot
+          if (!sr || hosts.indexOf(el) !== -1) continue
+          visited++
+          hosts.push(el)
+          scanRoot(sr, doc, framePaths)
+          stack.push(sr)
+        }
+      }
+    } catch {}
     // 同源 iframe 递归（与 extractor 同一穿透策略）
     const frames = doc.querySelectorAll('iframe')
     for (let fi = 0; fi < frames.length && out.length < 40; fi++) {
@@ -203,13 +246,19 @@ export const FORM_SET_FN = String(function formSet(
   check: boolean
 ) {
   function walk(doc: Document, p: number[]): Element | null {
-    let el: Element = doc.documentElement
+    let el: any = doc.documentElement
     for (const i of p) {
+      if (i === -1) {
+        // -1 哨兵：进入当前元素的 shadowRoot（不存在视为定位失败）
+        el = el.shadowRoot
+        if (!el) return null
+        continue
+      }
       const next = el.children[i]
       if (!next) return null
       el = next
     }
-    return el
+    return el as Element
   }
   let doc: Document = document
   for (const fp of framePaths) {

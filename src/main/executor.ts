@@ -18,8 +18,17 @@ import { EXPECT_TEXT_FN, EXPECT_SEL_FN, SOFT_ERR_FN } from './testcase/assertion
 import { FORM_FIELDS_FN, FORM_SET_FN, type FormField } from './testcase/fields'
 import { scoreCandidate, verifyFieldMatch, extractKeywords } from './semantic'
 import { upsertExperience } from './experience'
+import { getSettings } from './settings'
 import { existsSync, statSync } from 'fs'
-import type { AgentAction, Settings } from '@shared/types'
+import type { AgentAction, Settings, StepTimings } from '@shared/types'
+
+/** T7 写操作判定（提交/保存/删除/支付/下单…）：坐标兜底禁用 + 提交后等待（P0-1 硬门禁） */
+const SUBMITISH_RE = /提交|确定|保存|下单|支付|发布|删除|结算|确认|submit|save|delete|remove|pay|order|publish|confirm/i
+
+/** 目标文案是否写操作（禁裸坐标兜底的硬门禁依据） */
+export function isSubmitishLabel(label: string): boolean {
+  return SUBMITISH_RE.test(label || '')
+}
 
 export interface ExecContext {
   memory: Record<string, string>
@@ -39,6 +48,10 @@ export interface ExecContext {
   fillPreview?: boolean
   /** 测试模式跨步骤共享：软断言收集（runner 持有数组，步骤完成时统一判定） */
   softErrors?: string[]
+  /** T0 step 分段计时（runner 传入，executor 回填 settleMs） */
+  timings?: StepTimings
+  /** T3 点击命中记录（点击坐标 + 目标 rect），runner 收进 StepRecord.hits 渲染时间线标记 */
+  hits?: Array<{ x: number; y: number; w: number; h: number; label?: string }>
 }
 
 interface Resolved {
@@ -50,22 +63,50 @@ interface Resolved {
   value?: string
   w?: number
   h?: number
+  /** T5 state 时效：执行前实时属性（快照的 disabled/checked 是时点值，不可信） */
+  disabled?: boolean
+  checked?: boolean
   /** 实际解析命中的候选（重定位后与原快照序号可能不同）：
    *  路径定位/赋值回读/标签判定必须全部消费它——否则点击的是重定位元素、
    *  赋值却落在旧快照序号上，重复文案/空文本控件场景直接「填错字段」（P0-1） */
   cand?: Candidate
 }
 
+/** T5 坐标命中护栏：elementFromPoint 校验最上层元素与目标一致，不一致放弃坐标法（P0-1） */
+const HIT_TEST_FN = String(function hitTest(x: number, y: number, expectTag?: string, expectText?: string) {
+  const el = document.elementFromPoint(x, y) as HTMLElement | null
+  if (!el) return { ok: false, reason: '坐标处无可命中元素' }
+  const tag = el.tagName
+  const norm = (s: unknown): string => String(s || '').replace(/\s+/g, ' ').trim()
+  const text = norm(el.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder'))
+  if (expectTag && tag.toUpperCase() !== expectTag.toUpperCase()) {
+    // shadow/自定义元素场景：目标在命中元素内部也算一致
+    const inner = el.querySelector(expectTag)
+    if (!inner) return { ok: false, tag, text: text.slice(0, 30), reason: `命中 <${tag}> 与目标 <${expectTag}> 不一致` }
+  }
+  if (expectText && text && !text.includes(expectText) && !expectText.includes(text)) {
+    return { ok: false, tag, text: text.slice(0, 30), reason: `命中元素文本 "${text.slice(0, 20)}" 与目标 "${expectText.slice(0, 20)}" 不一致` }
+  }
+  return { ok: true, tag, text: text.slice(0, 30) }
+})
+
 /** 安全设置 input/textarea 的值（走原生 setter，React 受控组件可感知） */
 const SET_VALUE_FN = String(function setValue(framePaths: number[][], path: number[], value: string) {
   function walk(doc: Document, p: number[]): Element | null {
-    let el: Element = doc.documentElement
+    let el: any = doc.documentElement
     for (const i of p) {
+      if (i === -1) {
+        // shadow 边界哨兵（与 extractor path 编码契约一致）：进入当前节点的 shadowRoot
+        const sr = el && el.shadowRoot
+        if (!sr) return null
+        el = sr
+        continue
+      }
       const next = el.children[i]
       if (!next) return null
       el = next
     }
-    return el
+    return el as Element
   }
   let doc: Document = document
   for (const fp of framePaths) {
@@ -99,13 +140,20 @@ const SET_VALUE_FN = String(function setValue(framePaths: number[][], path: numb
 /** 读取目标元素当前值（type 动作输入后验证用） */
 const READ_VALUE_FN = String(function readValue(framePaths: number[][], path: number[]) {
   function walk(doc: Document, p: number[]): Element | null {
-    let el: Element = doc.documentElement
+    let el: any = doc.documentElement
     for (const i of p) {
+      if (i === -1) {
+        // shadow 边界哨兵（与 extractor path 编码契约一致）：进入当前节点的 shadowRoot
+        const sr = el && el.shadowRoot
+        if (!sr) return null
+        el = sr
+        continue
+      }
       const next = el.children[i]
       if (!next) return null
       el = next
     }
-    return el
+    return el as Element
   }
   let doc: Document = document
   for (const fp of framePaths) {
@@ -131,13 +179,20 @@ const READ_VALUE_FN = String(function readValue(framePaths: number[][], path: nu
  */
 const READ_LABEL_FN = String(function readLabel(framePaths: number[][], path: number[]) {
   function walk(doc: Document, p: number[]): Element | null {
-    let el: Element = doc.documentElement
+    let el: any = doc.documentElement
     for (const i of p) {
+      if (i === -1) {
+        // shadow 边界哨兵（与 extractor path 编码契约一致）：进入当前节点的 shadowRoot
+        const sr = el && el.shadowRoot
+        if (!sr) return null
+        el = sr
+        continue
+      }
       const next = el.children[i]
       if (!next) return null
       el = next
     }
-    return el
+    return el as Element
   }
   let doc: Document = document
   for (const fp of framePaths) {
@@ -209,13 +264,20 @@ const SCROLL_FN = String(function scrollTo(where: string) {
 /** upload 动作用：按 framePaths+path 找到元素并返回引用（配合 evaluateRef → DOM.setFileInputFiles） */
 const UPLOAD_FIND_FN = String(function findEl(framePaths: number[][], path: number[]) {
   function walk(doc: Document, p: number[]): Element | null {
-    let el: Element = doc.documentElement
+    let el: any = doc.documentElement
     for (const i of p) {
+      if (i === -1) {
+        // shadow 边界哨兵（与 extractor path 编码契约一致）：进入当前节点的 shadowRoot
+        const sr = el && el.shadowRoot
+        if (!sr) return null
+        el = sr
+        continue
+      }
       const next = el.children[i]
       if (!next) return null
       el = next
     }
-    return el
+    return el as Element
   }
   let doc: Document = document
   for (const fp of framePaths) {
@@ -234,13 +296,20 @@ const UPLOAD_FIND_FN = String(function findEl(framePaths: number[][], path: numb
 /** upload 动作用：回读文件框已选文件数（-1=元素不是 input[type=file]） */
 const UPLOAD_COUNT_FN = String(function countFiles(framePaths: number[][], path: number[]) {
   function walk(doc: Document, p: number[]): Element | null {
-    let el: Element = doc.documentElement
+    let el: any = doc.documentElement
     for (const i of p) {
+      if (i === -1) {
+        // shadow 边界哨兵（与 extractor path 编码契约一致）：进入当前节点的 shadowRoot
+        const sr = el && el.shadowRoot
+        if (!sr) return null
+        el = sr
+        continue
+      }
       const next = el.children[i]
       if (!next) return null
       el = next
     }
-    return el
+    return el as Element
   }
   let doc: Document = document
   for (const fp of framePaths) {
@@ -289,6 +358,8 @@ export class Executor {
   overlay: Overlay | null = null
   /** 可选：read_content 文本过少时的整页 OCR 兜底 */
   ocrPageFallback?: () => Promise<string | null>
+  /** T2 熔断触发回调（runner 注入 telemetry circuit_break 事件） */
+  onCircuitBreak?: (host: string) => void
   /** 可选：fill_form 智能填充规划器（LLM 字段映射；index.ts 注入 provider，自测可替换为桩） */
   formFillPlanner?: (
     fields: FormField[],
@@ -401,38 +472,140 @@ export class Executor {
     } catch {}
   }
 
+  /**
+   * T5 定位链（W4，P0-1 全量修正）：
+   * path 直达 → 容器锚点联合消歧（role+tag ∧ 锚文本，列表行操作不串行）→ text/tag 中心点最近
+   * （仅非列表场景，同名重复 >2 个不启用）→ 同 role 就近（同上）→ 坐标兜底（命中护栏 + 写操作禁用）。
+   * 虚拟列表（同名重复 >2 = 列表场景）只走语义定位级——位置级就近必点错行。
+   * 全部失败时写操作直接报错（错行 = 0 硬线），不猜。
+   */
   private async resolveIndex(t: Tab, index: number): Promise<Resolved> {
     const snap = this.snapshots.get(t.id)
     if (!snap || index < 0 || index >= snap.candidates.length) return { found: false }
     const cand = snap.candidates[index]
     const r = await t.cdp.evaluate<Resolved>(RESOLVE_FN, [cand.framePaths, cand.path, cand.tag])
     if (r.found) return { ...r, cand }
-    // DOM 变动（SPA 重渲染/虚拟滚动/懒加载占位）：重新提取一次并重定位。
-    // 重定位仲裁（编号契约 C1）：重复文案（「确定/下一页」、列表同名项）按 tag+text
-    // 取首个会错位——在全等候选里选「中心点距原元素最近」的一个；全没有才回退同序号
+    const chainOn = getSettings().locatorChain !== false
+    // DOM 变动（SPA 重渲染/虚拟滚动/懒加载占位/节点回收）：重新提取并按定位链重定位
     const fresh = await this.extract(t)
-    let c2: Candidate | undefined
-    if (cand.text) {
-      const cx = cand.rect.x + cand.rect.w / 2
-      const cy = cand.rect.y + cand.rect.h / 2
-      let best = Infinity
+    const cx = cand.rect.x + cand.rect.w / 2
+    const cy = cand.rect.y + cand.rect.h / 2
+    const dist2 = (c: Candidate) => (c.rect.x + c.rect.w / 2 - cx) ** 2 + (c.rect.y + c.rect.h / 2 - cy) ** 2
+    const pickNearest = (filter: (c: Candidate) => boolean): Candidate | undefined => {
+      let best: Candidate | undefined
+      let bestD = Infinity
       for (const c of fresh.candidates) {
-        if (c.tag !== cand.tag || c.text !== cand.text) continue
-        const d = (c.rect.x + c.rect.w / 2 - cx) ** 2 + (c.rect.y + c.rect.h / 2 - cy) ** 2
-        if (d < best) {
-          best = d
-          c2 = c
+        if (!filter(c)) continue
+        const d = dist2(c)
+        if (d < bestD) {
+          bestD = d
+          best = c
         }
       }
+      return best
     }
-    c2 ??= fresh.candidates[index]
-    if (!c2) return { found: false }
-    const r2 = await t.cdp.evaluate<Resolved>(RESOLVE_FN, [c2.framePaths, c2.path, c2.tag])
-    return r2.found ? { ...r2, cand: c2 } : { found: false }
+    // 列表场景判定：同 tag 同文本（或同 role 同文本）候选 >2 个 = 同名重复长列表/虚拟列表
+    const sameNameCount = fresh.candidates.filter(
+      (c) => c.text && c.text === cand.text && (c.tag === cand.tag || c.role === cand.role)
+    ).length
+    const listScenario = sameNameCount > 2
+    // 写操作（提交/保存/删除/支付/下单…）：禁裸坐标兜底（P0-1 硬门禁，不可配置绕过）
+    const label = `${cand.text || ''} ${cand.extra || ''} ${cand.anchor || ''}`.trim()
+    const submitish = isSubmitishLabel(label)
+
+    let c2: Candidate | undefined
+    // ② 容器锚点联合消歧（role+tag ∧ 锚文本）：列表行操作的唯一安全级——
+    //    排序/插新行后按锚文本锁定原行（Playwright filter({hasText}) 思路）
+    if (chainOn && cand.anchor) {
+      c2 = pickNearest(
+        (c) =>
+          (c.tag === cand.tag || c.role === cand.role) &&
+          !!c.anchor &&
+          c.anchor === cand.anchor &&
+          (!cand.text || !c.text || c.text === cand.text || listScenario)
+      )
+    }
+    if (!c2 && !listScenario) {
+      // ① tag + 可见文本全等（最抗改版的语义键），中心点最近仲裁
+      if (cand.text) {
+        c2 = pickNearest((c) => c.tag === cand.tag && c.text === cand.text)
+      }
+      // ②' 文本线索匹配（label/placeholder/name/aria 任一线索全等即认，同 tag/role 优先）
+      if (!c2 && chainOn) {
+        const hints = (cand.extra || '')
+          .split(/[\s=]/)
+          .map((s) => s.trim())
+          .filter((s) => s.length >= 2)
+        const candExtra = cand.extra || ''
+        if (hints.length) {
+          c2 = pickNearest(
+            (c) =>
+              c.extra !== undefined &&
+              (c.tag === cand.tag || c.role === cand.role) &&
+              (hints.some((h) => (c.extra || '').includes(h)) || (!!candExtra && (c.extra || '') === candExtra))
+          )
+        }
+      }
+      // ③ 同 role+tag 就近（页面整体平移/重排，文本也变了时的结构锚；列表场景已禁用）
+      if (!c2 && chainOn) {
+        c2 = pickNearest((c) => c.role === cand.role && c.tag === cand.tag)
+      }
+    }
+    if (c2) {
+      const r2 = await t.cdp.evaluate<Resolved>(RESOLVE_FN, [c2.framePaths, c2.path, c2.tag])
+      return r2.found ? { ...r2, cand: c2 } : { found: false }
+    }
+    // ④ 坐标兜底（命中护栏 + 写操作禁用）：目标大概率仍在原坐标处——
+    //    elementFromPoint 校验最上层元素 tag/text 与目标一致才允许，不一致放弃坐标法
+    if (chainOn && !submitish && !listScenario) {
+      const hit = await t.cdp
+        .evaluate<{ ok: boolean; tag?: string; text?: string; reason?: string }>(HIT_TEST_FN, [
+          Math.round(cx),
+          Math.round(cy),
+          cand.tag,
+          cand.text || undefined
+        ])
+        .catch(() => null)
+      if (hit?.ok) {
+        return { found: true, x: cx, y: cy, tag: hit.tag, w: cand.rect.w, h: cand.rect.h, cand }
+      }
+      return { found: false }
+    }
+    return { found: false }
   }
 
-  /** 等待页面加载 settle（导航后的稳定窗口） */
-  private async waitSettle(t: Tab, signal: AbortSignal, slow: boolean): Promise<void> {
+  /* —— T2/W1 自适应熔断（P0-2）：连续 2 次吃满 settle 上限 → 该任务回退固定等待；
+     同 host 记忆（风险表：熔断按站点记忆，同 host 二次任务直接回退） —— */
+  private settleCapStreak = 0
+  private circuitBroken = false
+  private static circuitBrokenHosts = new Set<string>()
+
+  /** 清任务级等待熔断状态（新任务开始时重置；host 记忆保留） */
+  resetWaitState(): void {
+    this.settleCapStreak = 0
+    this.circuitBroken = false
+  }
+
+  /**
+   * 等待页面 settle（P0-2 全量修正版）。
+   * - first_screen（首屏导航）：isLoading 结束 + 固定窗口为准——首屏渲染噪声大，不套 mutation 静默；
+   * - action（动作批后）：网络静默（in-flight 生命周期） + DOM 结构静默（统一分类表），
+   *   慢速模式公式：实际等待 = max(拟人下限, min(信号等待, 上限))；正常模式无拟人下限。
+   * - 自适应熔断：同一任务连续 2 次吃满上限 → 回退固定 600/1200ms（telemetry circuit_break）。
+   * - 保底固定 sleep 已删除（W1 信号即收敛依据；慢速模式的拟人下限保留）。
+   */
+  private async waitSettle(
+    t: Tab,
+    signal: AbortSignal,
+    slow: boolean,
+    smart = true,
+    phase: 'first' | 'action' = 'action',
+    onTiming?: (ms: number) => void
+  ): Promise<void> {
+    const t0 = Date.now()
+    const done = () => {
+      if (onTiming) onTiming(Date.now() - t0)
+    }
     const deadline = Date.now() + 10000
     while (Date.now() < deadline && !signal.aborted) {
       try {
@@ -442,7 +615,45 @@ export class Executor {
       }
       await this.sleep(200, signal)
     }
-    await this.sleep(slow ? 1200 : 600, signal)
+    // 首屏：isLoading 结束 + 固定窗口（分策略——首屏不套 mutation 静默）
+    if (phase === 'first' || !smart || slow) {
+      await this.sleep(slow ? 1200 : 600, signal)
+      done()
+      return
+    }
+    // 熔断回退（任务级 / host 级记忆）：固定等待，不再吃信号上限
+    let host = ''
+    try {
+      host = new URL(t.url).host
+    } catch {}
+    if (this.circuitBroken || (host && Executor.circuitBrokenHosts.has(host))) {
+      await this.sleep(600, signal)
+      done()
+      return
+    }
+    // 信号等待：网络 in-flight 静默（上限 4s） // DOM 结构静默（上限 5s），并行收敛取较慢者
+    let ateCap = false
+    if (!signal.aborted) {
+      const [netQuiet, domQuiet] = await Promise.all([
+        t.cdp.waitNetworkQuiet(300, 4000),
+        t.cdp.waitDomStable(250, 5000)
+      ])
+      ateCap = !netQuiet || !domQuiet
+    }
+    // 自适应熔断：连续 2 次吃满上限 → 该任务（与该 host 的后续任务）回退固定等待
+    if (ateCap) {
+      this.settleCapStreak++
+      if (this.settleCapStreak >= 2 && !this.circuitBroken) {
+        this.circuitBroken = true
+        if (host) Executor.circuitBrokenHosts.add(host)
+        try {
+          this.onCircuitBreak?.(host)
+        } catch {}
+      }
+    } else {
+      this.settleCapStreak = 0
+    }
+    done()
   }
 
   /**
@@ -456,11 +667,14 @@ export class Executor {
       actions.some((a) =>
         ['click', 'click_xy', 'type', 'scroll', 'drag', 'paste_rich', 'paste_image'].includes(a.name)
       )
+    // 批内发生导航（goto/back/forward）→ 批后 settle 走首屏策略
+    let batchHadNav = false
     try {
       if (needsOverlay && this.overlay && !ctx.signal.aborted) await this.overlay.begin()
       for (let i = 0; i < actions.length && i < 5; i++) {
         if (ctx.signal.aborted) break
         const a = { ...actions[i] }
+        if (a.name === 'goto' || a.name === 'back' || a.name === 'forward') batchHadNav = true
         try {
           const tabChanged = await this.executeOne(a, ctx)
           out.push(a)
@@ -476,14 +690,31 @@ export class Executor {
           }
         } catch (e: any) {
           a.error = String(e?.message || e).slice(0, 200)
+          // T8 反思签名（方式失败才有意义）：动作名 + 目标语义 + 容器锚文本
+          if (!a.failSig) {
+            const snap = this.snapshots.get(this.tabManager.active()?.id ?? -1)
+            const cand = a.index != null ? snap?.candidates[a.index] : undefined
+            a.failSig = `${a.name}|${(a.text || cand?.text || cand?.extra || '').slice(0, 24)}|${(cand?.anchor || '').slice(0, 24)}`
+          }
           out.push(a)
           break // 出错即停止本批，下一步让模型看到错误并自行调整
         }
         if (i < actions.length - 1) await this.humanDelay(ctx.settings, ctx.signal)
       }
-      // 批后等页面稳定
+      // 批后等页面稳定（T2：分策略 + settleMs 计时回填）
       const t = this.tabManager.active()
-      if (t && !ctx.signal.aborted) await this.waitSettle(t, ctx.signal, ctx.settings.speed === 'slow')
+      if (t && !ctx.signal.aborted) {
+        await this.waitSettle(
+          t,
+          ctx.signal,
+          ctx.settings.speed === 'slow',
+          ctx.settings.smartWait !== false,
+          batchHadNav ? 'first' : 'action',
+          (ms) => {
+            if (ctx.timings) ctx.timings.settleMs = (ctx.timings.settleMs || 0) + ms
+          }
+        )
+      }
     } finally {
       this.overlay?.end()
     }
@@ -499,12 +730,19 @@ export class Executor {
         if (!t) throw new Error('没有可用页签')
         if (a.index == null) throw new Error('click 需要 index')
         const r = await this.resolveIndex(t, a.index)
-        if (!r.found) throw new Error(`元素[${a.index}]已失效（页面可能已变化）`)
+        if (!r.found) {
+          const snap = this.snapshots.get(t.id)
+          const c0 = snap?.candidates[a.index]
+          a.failSig = `click|${(c0?.text || c0?.extra || '').slice(0, 24)}|${(c0?.anchor || '').slice(0, 24)}`
+          throw new Error(`元素[${a.index}]已失效（页面可能已变化）`)
+        }
         if (r.w === 0 || r.h === 0) throw new Error(`元素[${a.index}]不可见`)
-        // submitish 判定用实际命中候选（重定位后文案可能已不同）
+        // T5 state 时效：快照的 disabled 是时点值，执行前实时属性再判一次（禁用类误判归零）
+        if (r.disabled) throw new Error(`元素[${a.index}]当前为禁用状态，不可点击`)
+        // submitish 判定用实际命中候选（重定位后文案可能已不同）+ 容器锚文本
         const cand = r.cand
         const label = `${cand?.text || ''} ${cand?.extra || ''}`.trim()
-        const submitish = /提交|确定|保存|下单|支付|发布|删除|结算/.test(label)
+        const submitish = isSubmitishLabel(label)
         // 测试模式生产保护：提交/删除类点击需人工确认（普通任务 protectedSubmit 恒缺省，零影响）
         if (ctx.protectedSubmit && submitish) {
           const choice = await dialog.showMessageBox({
@@ -521,6 +759,21 @@ export class Executor {
             return false
           }
         }
+        // T3 零成本命中记录（点击坐标 + 目标 rect）：时间线叠加标记，定位诊断主手段
+        if (ctx.hits) {
+          ctx.hits.push({
+            x: Math.round(r.x!),
+            y: Math.round(r.y!),
+            w: Math.round(r.w || 0),
+            h: Math.round(r.h || 0),
+            label: (cand?.text || label).slice(0, 20) || undefined
+          })
+        }
+        // toggle 类目标（checkbox/switch/单选）：点击前记下语义状态，点击后回读（T7 按动作类型分流）
+        const isToggle =
+          (cand?.role === '复选框' || cand?.role === '单选框' || /switch|checkbox|radio/i.test(cand?.tag || '')) ||
+          /switch|toggle/i.test(cand?.role || '')
+        const checkedBefore = isToggle ? r.checked : undefined
         await this.sleep(160, ctx.signal)
         if (this.overlay) {
           try {
@@ -535,10 +788,50 @@ export class Executor {
           } catch {}
         }
         a.result = `点击(${Math.round(r.x!)},${Math.round(r.y!)})`
-        // 测试模式软断言：提交类点击后 1.2s 检查「可见的」表单校验错误提示——
+        // T7 toggle 语义回读：勾选/开关状态比对（hover/toast 类不给「无变化」强提示的规则在 runner 侧）
+        if (isToggle && r.cand) {
+          try {
+            const r2 = await t.cdp.evaluate<Resolved>(RESOLVE_FN, [
+              r.cand.framePaths,
+              r.cand.path,
+              r.cand.tag
+            ])
+            if (r2.found) {
+              a.result = `${a.result}（当前${r2.checked ? '已勾选' : '未勾选'}${
+                checkedBefore !== undefined && r2.checked === checkedBefore ? '，状态未变化' : ''
+              }）`
+            }
+          } catch {}
+        }
+        // P0-3 提交类点击：监听「打开新标签」（预览/支付常见）——新页出现则改等新页 settle，
+        // 不等旧页静默（旧页可能永不静默）。窗口通常在静默等待期间就触发；静默完成后只留 600ms 宽限
+        let openedNewWindow = false
+        if (submitish) {
+          const winFlag = t.cdp.awaitNewWindow(5000)
+          const quietDone = (async () => {
+            if (ctx.settings?.smartWait !== false && ctx.settings?.speed !== 'slow') {
+              await Promise.all([t.cdp.waitNetworkQuiet(300, 3000), t.cdp.waitDomStable(250, 2500)])
+            } else {
+              await this.sleep(1200, ctx.signal)
+            }
+          })()
+          openedNewWindow = await Promise.race([
+            winFlag,
+            quietDone.then(() => Promise.race([winFlag, this.sleep(600, ctx.signal).then(() => false)]))
+          ])
+          if (openedNewWindow) {
+            a.result = `${a.result}（已打开新标签，将在新页继续）`
+            return true // 与切换页签同语义：本批剩余动作跳过，下一步提取新页元素
+          }
+        }
+        // 测试模式软断言：提交类点击后检查「可见的」表单校验错误提示——
         // 用例没写这类断言时也能兜住「提交失败但静默通过」（普通任务 softAssert 恒缺省）
         if (ctx.softAssert && submitish && !a.error) {
-          await this.sleep(1200, ctx.signal)
+          if (ctx.settings?.smartWait === false || ctx.settings?.speed === 'slow') {
+            await this.sleep(1200, ctx.signal)
+          } else {
+            await this.sleep(300, ctx.signal) // 信号等待已覆盖，补一小拍让错误提示渲染完
+          }
           const soft = await t.cdp
             .evaluate<{ hit: boolean; sel?: string; text?: string }>(SOFT_ERR_FN, [])
             .catch(() => ({ hit: false }) as { hit: boolean; sel?: string; text?: string })
@@ -564,6 +857,19 @@ export class Executor {
         const H = vp?.h || 720
         const px = Math.round(nx * W)
         const py = Math.round(ny * H)
+        // T5 坐标命中护栏（诊断信息）：记录最上层命中元素，时间线命中标记 + 点错时可归因
+        const hitInfo = await t.cdp
+          .evaluate<{ ok: boolean; tag?: string; text?: string }>(HIT_TEST_FN, [px, py])
+          .catch(() => null)
+        if (ctx.hits) {
+          ctx.hits.push({
+            x: px,
+            y: py,
+            w: 0,
+            h: 0,
+            label: hitInfo?.tag ? `<${hitInfo.tag}> ${(hitInfo?.text || '').slice(0, 12)}` : '坐标点击'
+          })
+        }
         if (this.overlay) {
           try {
             await this.overlay.moveTo(px, py)
@@ -853,6 +1159,67 @@ export class Executor {
         a.result = `等待 ${s}s`
         return false
       }
+      case 'wait_for': {
+        // W1 智能等待原语：等业务信号出现再继续（比 wait 盲等快且稳）
+        const t = tm.active()
+        if (!t) throw new Error('没有可用页签')
+        const kind = String(a.kind || 'text_visible')
+        const val = String(a.value ?? a.text ?? '')
+          .replace(/\{\{([^}]+)\}\}/g, (_m, k) => ctx.memory[String(k).trim()] ?? _m)
+          .trim()
+        if (!val) throw new Error('wait_for 需要 value（等待的文字/选择器/URL 片段）')
+        const budget = Math.min(Math.max(a.seconds ?? 8, 1), 30) * 1000
+        // P0-3 未来监听模式：network 类注册 URL 匹配器，等**未来**出现的匹配请求完结并判 status——
+        // 查历史缓冲会被后续请求冲刷，只作超时后的兜底（如实标注来源）
+        if (kind === 'network') {
+          t.cdp.setNetQuietWatch(true) // 确保网络跟踪已开（smartWait 关闭时也有效）
+          const hit = await t.cdp.waitForResponse({ urlPart: val, method: a.method }, budget)
+          if (!hit) {
+            a.result = `等待超时(${Math.round(budget / 1000)}s)未见 URL 含 "${val.slice(0, 40)}" 的接口响应，请检查请求是否发出`
+            a.error = a.result
+          } else if (hit.status >= 400) {
+            // 4xx/5xx 判该步失败（业务失败：可修正后重试，T8 不进禁止清单）
+            a.result = `接口响应异常: HTTP ${hit.status}（${hit.url.slice(0, 60)}${hit.stale ? '，兜底:历史缓冲命中' : ''}）`
+            a.error = a.result
+          } else {
+            a.result = `已等到接口响应 HTTP ${hit.status}（${hit.url.slice(0, 50)}${hit.stale ? '，兜底:历史缓冲命中' : ''}）`
+          }
+          return false
+        }
+        const deadline = Date.now() + budget
+        let ok = false
+        let detail = ''
+        while (!ok && Date.now() < deadline && !ctx.signal.aborted) {
+          try {
+            if (kind === 'text_visible') {
+              const r = await t.cdp.evaluate<{ found: boolean; snippet: string }>(EXPECT_TEXT_FN, [val])
+              ok = !!r?.found
+              detail = r?.snippet || ''
+            } else if (kind === 'selector_exists') {
+              const r = await t.cdp.evaluate<{ ok: boolean; count?: number }>(EXPECT_SEL_FN, [val, 'exists'])
+              ok = (r?.count || 0) > 0
+              detail = `匹配 ${r?.count || 0} 个`
+            } else if (kind === 'url_contains') {
+              const u = t.view.webContents.getURL()
+              ok = u.includes(val)
+              detail = u.slice(0, 60)
+            } else {
+              throw new Error(`未知 wait_for 类型 ${kind}（可用: text_visible/selector_exists/url_contains/network）`)
+            }
+          } catch (e: any) {
+            if (String(e?.message || e).includes('未知 wait_for')) throw e
+            detail = String(e?.message || e).slice(0, 60)
+          }
+          if (!ok) await this.sleep(400, ctx.signal)
+        }
+        if (ok) {
+          a.result = `已等到 ${kind}="${val.slice(0, 40)}"${detail ? `（${detail.slice(0, 40)}）` : ''}`
+        } else {
+          a.result = `等待超时(${Math.round(budget / 1000)}s)未出现 ${kind}="${val.slice(0, 40)}"，请检查页面状态后决定重试还是换条件`
+          a.error = a.result
+        }
+        return false
+      }
       case 'repeat': {
         // 重放上一批动作（翻页/批量同类操作提速）：页面模式稳定才有意义，动作出错自动停
         const times = Math.min(Math.max(a.amount ?? 2, 1), 10)
@@ -908,9 +1275,9 @@ export class Executor {
           }
         }
         a.result = text.slice(0, 6200)
-        // R2 阅读停顿：真人读完才动——按内容长度追加 400-1500ms（humanLike 可关）
+        // R2 阅读停顿：真人读完才动——按内容长度追加 400-900ms（humanLike 可关）
         if (ctx.settings?.humanLike !== false) {
-          await this.sleep(Math.min(1500, 400 + a.result.length / 8), ctx.signal)
+          await this.sleep(Math.min(900, 400 + a.result.length / 8), ctx.signal)
         }
         return false
       }

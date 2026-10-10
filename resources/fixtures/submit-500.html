@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>提交返回 500</title>
+<style>
+  body { font-family: system-ui, sans-serif; padding: 24px; background: #fafafa; color: #222; }
+  h1 { font-size: 20px; }
+  p { color: #555; }
+  form { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 16px; max-width: 480px; }
+  label { display: block; margin-bottom: 8px; font-size: 14px; }
+  input { height: 32px; padding: 0 8px; font-size: 14px; border: 1px solid #bbb; border-radius: 4px; width: 220px; }
+  button { min-height: 36px; padding: 6px 18px; font-size: 14px; cursor: pointer; margin-top: 10px; }
+  #result { margin-top: 16px; padding: 12px 14px; background: #fff0f0; border: 1px solid #e88; border-radius: 6px; min-height: 24px; }
+</style>
+</head>
+<body>
+<h1>表单提交返回 HTTP 500</h1>
+<p>点「提交」后请求同目录不存在的接口（静态页无法真返 500，页面固定回显服务端错误文案）。</p>
+
+<form id="f" onsubmit="return false">
+  <label>备注 <input id="s5-input" type="text" placeholder="备注信息"></label>
+  <button id="s5-btn" type="button">提交</button>
+</form>
+
+<div id="result">（结果区）等待操作</div>
+
+<script>
+  document.getElementById('s5-btn').addEventListener('click', function () {
+    // 请求不存在的接口制造失败请求；静态托管下返回 404/失败均模拟为服务端 500
+    fetch('no-such-api-' + Date.now() + '.json', { cache: 'no-store' })
+      .catch(function () {})
+      .then(function () {
+        document.getElementById('result').textContent = '提交失败 HTTP 500'
+      })
+  })
+</script>
+</body>
+</html>

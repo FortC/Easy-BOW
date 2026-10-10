@@ -1,6 +1,6 @@
 {
   "name": "easybow",
-  "version": "2.0.1",
+  "version": "3.0.0",
   "description": "EasyBow — AI 浏览器：内置大模型自动操作 + 跨页签数据搬运 + 本地免费 OCR",
   "main": "out/main/index.js",
   "author": "clb <lamthebest@foxmail.com>",
@@ -18,7 +18,9 @@
     "dist": "node scripts/sync-ocr-web.mjs && node scripts/fetch-fastmodel.mjs && electron-vite build && electron-builder --win nsis portable",
     "dist:dir": "node scripts/sync-ocr-web.mjs && node scripts/fetch-fastmodel.mjs && electron-vite build && electron-builder --win --dir",
     "selftest:prod": "node scripts/sync-ocr-web.mjs && electron-vite build && node scripts/run-app.mjs out/main/index.js --selftest",
-    "fastllm:test": "node scripts/run-app.mjs out/main/index.js --fastllm-test"
+    "fastllm:test": "node scripts/run-app.mjs out/main/index.js --fastllm-test",
+    "regression": "electron-vite build && node scripts/run-app.mjs out/main/index.js --regression",
+    "analyze-traces": "node scripts/analyze-traces.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0",

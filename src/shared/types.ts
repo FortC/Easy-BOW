@@ -62,6 +62,32 @@ export interface Settings {
   humanLike?: boolean
   /** R3 持久化会话（登录态跨启动保留；默认开=历史行为） */
   persistSession?: boolean
+  /* —— v3.0 AI 操控升级开关（全部默认开启；出问题可逐层关闭独立回滚） —— */
+  /** W1 智能等待：DOM 静默/网络静默信号替代固定 sleep（慢速模式始终保留原节奏） */
+  smartWait?: boolean
+  /** W2 时间线截图分级：smart=常规低清/出错与完成高清；all=全部高清；off=不截图 */
+  timelineShot?: 'all' | 'smart' | 'off'
+  /** W3 结构化输出：JSON schema/json_object 原生输出（探测式启用，失败自动降级） */
+  structuredOut?: boolean
+  /** W4 定位链：元素失效后按定位键/文本/坐标就近重定位（关闭退回旧「全等+序号」仲裁） */
+  locatorChain?: boolean
+  /** W7 反思：失败尝试清单注入 + 禁止第 3 次重复同一失败方式 */
+  reflection?: boolean
+  /** W8 动态重规划：节点连续复核失败时重排剩余节点 */
+  replan?: boolean
+  /** W10 动作后核验：批后页面无变化时显式提示（防止模型脑补成功） */
+  actionVerify?: boolean
+  /** W9 模型分级：planner 强推理模型（仅用于重规划/strict 复核/卡住节点专家重试，
+   *  不参与逐步执行；缺省=跟随主配置） */
+  planner?: PlannerSettings
+}
+
+/** T10 planner 配置块（缺省字段跟随主配置；独立 baseURL/apiKey/model 可指向强推理模型） */
+export interface PlannerSettings {
+  provider?: Protocol
+  baseURL?: string
+  apiKey?: string
+  model?: string
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -91,7 +117,15 @@ export const DEFAULT_SETTINGS: Settings = {
   autoExperience: true,
   prescreen: true,
   humanLike: true,
-  persistSession: true
+  persistSession: true,
+  // v3.0 AI 操控升级：全部默认开启（独立开关可逐层回滚）
+  smartWait: true,
+  timelineShot: 'smart',
+  structuredOut: true,
+  locatorChain: true,
+  reflection: true,
+  replan: true,
+  actionVerify: true
 }
 
 export const MAX_TABS = 5
@@ -183,6 +217,8 @@ export type ActionName =
   | 'back'
   | 'forward'
   | 'wait'
+  // W1 智能等待：等业务信号出现/接口响应后再继续（比 wait 盲等更稳）
+  | 'wait_for'
   | 'read_content'
   | 'extract_images'
   | 'save'
@@ -225,8 +261,10 @@ export interface AgentAction {
   direction?: 'up' | 'down' | 'left' | 'right' | 'top' | 'bottom'
   amount?: number
   seconds?: number
-  /** expect：断言类型 */
-  kind?: ExpectKind
+  /** expect：断言类型；wait_for：等待类型（多一个 network=等接口响应） */
+  kind?: ExpectKind | 'network'
+  /** wait_for network：可选 HTTP method 过滤（GET/POST…，缺省不限） */
+  method?: string
   /** expect：selector_* 类断言的 CSS 选择器 */
   selector?: string
   /** expect：api_* 类断言的 URL 片段（匹配最近一次请求） */
@@ -249,10 +287,23 @@ export interface AgentAction {
   uncertain?: number
   /** clarify：要向人工提出的问题 */
   query?: string
+  /** T8 反思签名（主进程回填）：动作名+目标语义+容器锚文本——失败尝试清单按它去重 */
+  failSig?: string
   /** 执行结果摘要（主进程回填） */
   result?: string
   /** 执行错误（主进程回填） */
   error?: string
+}
+
+/** T0 step 分段计时（毫秒）：extract=元素提取 / ax=AX Tree / llm=模型调用 / act=动作执行 /
+ *  settle=批后等待 / shot=时间线截图。telemetry step_timing 与验收表 P50/P90 的数据源 */
+export interface StepTimings {
+  extractMs?: number
+  axMs?: number
+  llmMs?: number
+  actMs?: number
+  settleMs?: number
+  shotMs?: number
 }
 
 export interface StepRecord {
@@ -273,6 +324,10 @@ export interface StepRecord {
   local?: boolean
   tokens?: { input: number; output: number }
   ts: number
+  /** T0 step 分段计时（毫秒）：报表 P50/P90 数据源；缺省=未采集 */
+  timings?: StepTimings
+  /** T3 每步点击命中记录（坐标+目标 rect，已归一化 0~1 相对视口）：时间线叠加标记，定位诊断主手段 */
+  hits?: Array<{ x: number; y: number; w: number; h: number; label?: string }>
   /** 用户人工指导（暂停/运行中发的消息），时间线里渲染为用户气泡 */
   userGuidance?: boolean
   /** 测试模式：本模型步属于测试用例的第几步（时间线分组标记） */

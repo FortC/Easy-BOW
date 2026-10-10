@@ -62,6 +62,9 @@ extraResources:
   # 本地快速决策模型内置（用户免下载；由 scripts/fetch-fastmodel.mjs 在构建前拉取）
   - from: resources/fastmodel
     to: fastmodel
+  # 回归 fixtures（--regression 本地用例页；打包后回归也能跑）
+  - from: resources/fixtures
+    to: fixtures
 win:
   target:
     - nsis

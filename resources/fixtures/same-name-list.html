@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>同名按钮长列表</title>
+<style>
+  body { font-family: system-ui, sans-serif; padding: 24px; background: #fafafa; color: #222; }
+  h1 { font-size: 20px; }
+  p { color: #555; }
+  #list { max-width: 560px; background: #fff; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; }
+  .row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid #eee; }
+  .row:last-child { border-bottom: none; }
+  .row .no { width: 64px; color: #888; font-size: 13px; }
+  .row .order { flex: 1; font-size: 14px; }
+  .row button { min-height: 32px; padding: 4px 14px; font-size: 13px; cursor: pointer; }
+  .row.hit { background: #fff7d6; }
+  #result { margin-top: 16px; padding: 12px 14px; background: #eef6ff; border: 1px solid #8cf; border-radius: 6px; min-height: 24px; }
+</style>
+</head>
+<body>
+<h1>同名按钮长列表（30 行）</h1>
+<p>每行「订单号 + 查看/删除」按钮，按钮文本全部同名；点击后该行高亮，结果区显示被点行号。</p>
+
+<div id="list"></div>
+
+<div id="result">（结果区）等待操作</div>
+
+<script>
+  // 30 行订单列表：每行两个同名按钮（查看/删除）
+  var list = document.getElementById('list')
+  for (var i = 1; i <= 30; i++) {
+    var row = document.createElement('div')
+    row.className = 'row'
+    row.setAttribute('data-row', String(i))
+    row.innerHTML =
+      '<span class="no">第 ' + i + ' 行</span>' +
+      '<span class="order">订单号 10' + (i < 10 ? '0' + i : i) + '</span>' +
+      '<button type="button" class="view">查看</button>' +
+      '<button type="button" class="del">删除</button>'
+    list.appendChild(row)
+  }
+  // 事件委托：命中哪行就高亮哪行，并把行号写进结果区
+  list.addEventListener('click', (e) => {
+    var btn = e.target.closest('button')
+    if (!btn) return
+    var row = btn.closest('.row')
+    var n = row.getAttribute('data-row')
+    var kind = btn.classList.contains('view') ? '查看' : '删除'
+    var rows = list.querySelectorAll('.row')
+    for (var k = 0; k < rows.length; k++) rows[k].classList.remove('hit')
+    row.classList.add('hit')
+    document.getElementById('result').textContent = '已点击第 ' + n + ' 行「' + kind + '」'
+  })
+</script>
+</body>
+</html>

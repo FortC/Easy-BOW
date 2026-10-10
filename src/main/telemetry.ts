@@ -18,6 +18,19 @@ export type TraceEventType =
   | 'failure'
   | 'human'
   | 'friction'
+  /** T0 step 分段计时（extractMs/axMs/llmMs/actMs/settleMs/shotMs）：报表 P50/P90 数据源 */
+  | 'step_timing'
+  /** T2 自适应熔断触发（circuit_break）：连续吃满 settle 上限后回退固定等待 */
+  | 'circuit_break'
+  /** T7 动作后核验 delta（change/no_change + 信号明细） */
+  | 'action_verify'
+  /** T9 动态重规划事件（trigger/次数/是否强制 L2） */
+  | 'replan'
+  /** T10 专家重试（planner 执行级单次调用） */
+  | 'expert_retry'
+
+/** 失败三分类（横切约束 3）：agent 失败计入成功率；infra 环境失败单列不计入；product 产品 bug 建 issue */
+export type FailureTriage = 'agent' | 'infra' | 'product'
 
 export interface TraceEvent {
   ts: number
@@ -58,8 +71,14 @@ export class Telemetry {
     } catch {}
   }
 
-  /** 任务收尾（幂等）：task_end 带最终状态与累计指标 */
-  end(summary: { state: string; steps?: number; tokens?: { inputTokens: number; outputTokens: number } }): void {
+  /** 任务收尾（幂等）：task_end 带最终状态与累计指标；triage=失败三分类（成功任务可缺省） */
+  end(summary: {
+    state: string
+    steps?: number
+    tokens?: { inputTokens: number; outputTokens: number }
+    triage?: FailureTriage
+    triageReason?: string
+  }): void {
     if (!this.active || this.ended) return
     this.ended = true
     try {
@@ -72,7 +91,9 @@ export class Telemetry {
           state: summary.state,
           steps: summary.steps,
           tokensIn: summary.tokens?.inputTokens,
-          tokensOut: summary.tokens?.outputTokens
+          tokensOut: summary.tokens?.outputTokens,
+          triage: summary.triage,
+          triageReason: summary.triageReason?.slice(0, 200)
         }
       })
     } catch {}

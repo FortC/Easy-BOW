@@ -1,22 +1,25 @@
 /**
  * DOM 元素提取器 —— browser-use 核心技术的 TS 实现。
- * 注入页面执行：遍历可交互元素（递归穿透同源 iframe），做可见性检查与
+ * 注入页面执行：遍历可交互元素（递归穿透同源 iframe 与 open shadowRoot），做可见性检查与
  * 视口优先排序，输出精简编号列表。模型只看这个列表，不看 HTML。
  */
 import { scoreCandidate } from './semantic'
 
 export interface Candidate {
-  /** iframe 链上每一层的索引路径（从 documentElement 起） */
+  /** iframe 链上每一层的索引路径（从 documentElement 起；-1 哨兵语义同 path） */
   framePaths: number[][]
-  /** 本文档内从 documentElement 到元素的 children 索引路径 */
+  /** 本文档内从 documentElement 到元素的 children 索引路径；
+   *  -1 哨兵 = 进入当前元素的 shadowRoot（如 [2,-1,0,5] = documentElement.children[2].shadowRoot.children[0].children[5]） */
   path: number[]
   tag: string
   role: string
   text: string
   extra: string
-  /** 视口绝对坐标（iframe 内元素已逐层累加祖先 iframe 偏移，与顶层截图对齐） */
+  /** 视口绝对坐标（iframe 内元素已逐层累加祖先 iframe 偏移，与顶层截图对齐；shadow 内元素坐标本身是视口坐标，不偏移） */
   rect: { x: number; y: number; w: number; h: number }
   inViewport: boolean
+  /** T5 容器锚点：最近稳定容器里的消歧短文本（≤24 字，不含元素自身文本）；无合适容器时省略该字段 */
+  anchor?: string
 }
 
 export interface ExtractResult {
@@ -189,19 +192,137 @@ export const EXTRACT_FN = String(function extract(maxElements: number) {
     return ''
   }
 
+  /**
+   * T5 容器锚点：从 el 向上找最近的稳定容器（tr/li/role=row·listitem/fieldset/卡片类），
+   * 取与元素自身无关的首个非空短文本（≤24 字）——同名按钮靠行内订单号等上下文消歧。
+   * 只取文本不取输入值；找不到合适容器返回 ''（调用方省略 anchor 字段，不落空串）。
+   */
+  function anchorOf(el: Element): string {
+    const elText = normText((el as HTMLElement).innerText || el.textContent || '')
+    // 合格文本：短（≤24）、去空白折叠后不含元素自身文本（单字标签防误杀只做等值剔除）
+    const good = (t: string): boolean =>
+      !!t && t.length <= 24 && t !== elText && (elText.length < 2 || t.indexOf(elText) === -1)
+    // 来源剔除：候选块在元素子树内、或反过来包住元素（块级文本会混入自身文案）
+    const tangled = (src: Element): boolean => src === el || el.contains(src) || src.contains(el)
+    // 行容器：单元格短文本，非输入格与首/尾格优先（同行订单号是同名按钮的关键消歧信息）
+    const rowText = (row: Element): string => {
+      const cells = Array.from(row.children).filter(
+        (c) =>
+          /^(TD|TH)$/.test(c.tagName) ||
+          /^(cell|gridcell|rowheader|columnheader)$/.test(c.getAttribute('role') || '')
+      )
+      const list = cells.length ? cells : Array.from(row.children)
+      const rank = (c: Element): number =>
+        (c.querySelector('input,select,textarea') ? 2 : 0) + (c === list[0] || c === list[list.length - 1] ? 0 : 1)
+      const ranked = list.slice().sort((a, b) => rank(a) - rank(b)) // 稳定排序：同级保持左→右
+      for (const c of ranked) {
+        if (tangled(c)) continue
+        const t = normText(c.textContent)
+        if (good(t)) return t
+      }
+      return ''
+    }
+    // 卡片/列表类容器：首个标题性短文本（h1-h6/strong/标题 div）
+    const headText = (box: Element): string => {
+      const hs = box.querySelectorAll(
+        'h1,h2,h3,h4,h5,h6,strong,[class*="title" i],[class*="heading" i],[class*="header" i]'
+      )
+      for (const h of Array.from(hs).slice(0, 12)) {
+        if (tangled(h)) continue
+        const t = normText(h.textContent)
+        if (good(t)) return t
+      }
+      return ''
+    }
+    // 文本节点级首个短文本（li 等无标题结构的容器）；控件自身/兄弟控件的文案不算容器锚
+    const firstText = (box: Element): string => {
+      let w: TreeWalker
+      try {
+        w = document.createTreeWalker(box, NodeFilter.SHOW_TEXT)
+      } catch {
+        return ''
+      }
+      let n: Node | null = w.nextNode()
+      let seen = 0
+      while (n && seen < 40) {
+        seen++
+        const p: Element | null = (n as any).parentElement
+        const skip =
+          !p ||
+          el.contains(p) ||
+          /^(SCRIPT|STYLE|OPTION|BUTTON|SELECT|TEXTAREA|SUMMARY)$/.test(p.tagName) ||
+          !!p.closest('script,style,button,select,textarea,summary')
+        if (!skip) {
+          const t = normText(n.textContent)
+          if (good(t)) return t
+        }
+        n = w.nextNode()
+      }
+      return ''
+    }
+    let cur: Element | null = parentOf(el)
+    while (cur) {
+      const tag = cur.tagName
+      const role = (cur.getAttribute('role') || '').toLowerCase()
+      const cls = typeof cur.className === 'string' ? cur.className : ''
+      let t = ''
+      if (tag === 'TR' || role === 'row') t = rowText(cur)
+      else if (tag === 'FIELDSET') {
+        const lg = cur.querySelector('legend')
+        if (lg && !tangled(lg)) {
+          const lt = normText(lg.textContent)
+          if (good(lt)) t = lt
+        }
+      } else if (tag === 'LI' || role === 'listitem') t = headText(cur) || firstText(cur)
+      else if (/card|item/i.test(cls)) t = headText(cur)
+      if (t) return t
+      cur = parentOf(cur)
+    }
+    return ''
+  }
+
+  /** 父元素（parentElement 不跨 shadow 边界：shadowRoot 直接子级经 getRootNode().host 向上） */
+  function parentOf(el: Element): Element | null {
+    const p = el.parentElement
+    if (p) return p
+    let root: any = null
+    try {
+      root = (el as any).getRootNode ? (el as any).getRootNode() : null
+    } catch {}
+    return root && root.host && root.host.nodeType === 1 ? root.host : null
+  }
+
+  /** el 在 root 元素子级中的序号（与 RESOLVE_FN 的 el.children[i] 对应） */
+  function childIndexOf(root: any, el: Element): number {
+    let idx = 0
+    for (const c of Array.from(root.children)) {
+      if (c === el) break
+      idx++
+    }
+    return idx
+  }
+
+  /** 本文档内 children 索引路径；shadowRoot 直接子级处插入 -1 哨兵（进入 host 的 shadowRoot） */
   function indexPath(el: Element): number[] {
     const path: number[] = []
     let cur: Element | null = el
     while (cur && cur !== document.documentElement) {
       const parent: Element | null = cur.parentElement
-      if (!parent) break
-      let idx = 0
-      for (const c of Array.from(parent.children)) {
-        if (c === cur) break
-        idx++
+      if (parent) {
+        path.push(childIndexOf(parent, cur))
+        cur = parent
+        continue
       }
-      path.push(idx)
-      cur = parent
+      // parentElement 为 null 可能是 shadowRoot 直接子级：先推 shadowRoot 内索引、
+      // 再推 -1 哨兵，然后从 host 继续向上（getRootNode() 判定）
+      let root: any = null
+      try {
+        root = (cur as any).getRootNode ? (cur as any).getRootNode() : null
+      } catch {}
+      if (!root || !root.host || root.host.nodeType !== 1) break
+      path.push(childIndexOf(root, cur))
+      path.push(-1)
+      cur = root.host
     }
     return path.reverse()
   }
@@ -230,10 +351,11 @@ export const EXTRACT_FN = String(function extract(maxElements: number) {
     return { rect, ok, inVp, occluded }
   }
 
-  function collect(doc: Document, framePaths: number[][], depth: number, offX: number, offY: number): void {
+  /** 扫描根（文档或 shadowRoot）的可交互元素（querySelectorAll 不穿透 shadow 边界） */
+  function scanRoot(root: Document | ShadowRoot, framePaths: number[][], offX: number, offY: number): void {
     let list: Element[]
     try {
-      list = Array.from(doc.querySelectorAll(SEL))
+      list = Array.from(root.querySelectorAll(SEL))
     } catch {
       return
     }
@@ -268,7 +390,8 @@ export const EXTRACT_FN = String(function extract(maxElements: number) {
       else score += 5
       score += Math.min(text.length, 40) / 4
       if (v.occluded) score -= 60
-      out.push({
+      const anchor = anchorOf(el)
+      const item: any = {
         framePaths,
         path: indexPath(el),
         tag: el.tagName,
@@ -283,8 +406,41 @@ export const EXTRACT_FN = String(function extract(maxElements: number) {
         },
         inViewport: v.inVp,
         _score: score
-      })
+      }
+      // T5 容器锚点：有锚容器才带字段（不落空串）；不进提示词，只供重定位链消歧用
+      if (anchor) item.anchor = anchor
+      out.push(item)
     }
+  }
+
+  function collect(doc: Document, framePaths: number[][], depth: number, offX: number, offY: number): void {
+    scanRoot(doc, framePaths, offX, offY)
+    // T6 shadow DOM 穿透（复用 EXTRACT_IMAGES_FN 的 shadow 栈递归模式）：
+    // querySelectorAll 看不见 shadowRoot 内元素；shadow 内元素的 getBoundingClientRect
+    // 已是视口坐标，不累加偏移；深度与 iframe 合计 ≤4 层，host 栈去重防环
+    try {
+      const stack: { root: Document | ShadowRoot; d: number; hosts: Element[] }[] = [
+        { root: doc, d: depth, hosts: [] }
+      ]
+      let visited = 0
+      while (stack.length && visited < 60) {
+        const top = stack.pop()!
+        let els: Element[] = []
+        try {
+          els = Array.from(top.root.querySelectorAll('*'))
+        } catch {
+          continue
+        }
+        for (const el of els) {
+          const sr = (el as any).shadowRoot
+          if (!sr || top.hosts.indexOf(el) !== -1) continue
+          visited++
+          if (top.d >= 3) continue // 合计深度到顶：只收不下沉
+          scanRoot(sr, framePaths, offX, offY)
+          stack.push({ root: sr, d: top.d + 1, hosts: top.hosts.concat(el) })
+        }
+      }
+    } catch {}
     // 递归穿透同源 iframe（聚水潭等老式布局必需），最多三层（支付/滑块/广告常在第三层）
     if (depth < 3) {
       let iframes: Element[]
@@ -399,13 +555,19 @@ function matchedViaOf(c: Candidate, task: string): string[] {
 /** 在页面上下文中按 framePaths+path 定位元素，返回页面绝对坐标（供 CDP 点击） */
 export const RESOLVE_FN = String(function resolve(framePaths: number[][], path: number[], expectTag?: string) {
   function walk(doc: Document, p: number[]): Element | null {
-    let el: Element = doc.documentElement
+    let el: any = doc.documentElement
     for (const i of p) {
+      if (i === -1) {
+        // -1 哨兵：进入当前元素的 shadowRoot（不存在视为定位失败）
+        el = el.shadowRoot
+        if (!el) return null
+        continue
+      }
       const next = el.children[i]
       if (!next) return null
       el = next
     }
-    return el
+    return el as Element
   }
   let doc: Document = document
   const chain: { iframe: Element; doc: Document }[] = []
@@ -444,6 +606,13 @@ export const RESOLVE_FN = String(function resolve(framePaths: number[][], path: 
     tag === 'INPUT' || tag === 'TEXTAREA' || el.getAttribute('contenteditable') === 'true'
   const value =
     tag === 'INPUT' || tag === 'TEXTAREA' ? String((el as any).value || '') : ''
+  // 执行前实时属性复核：重读 disabled / checked（aria 兜底，供执行侧拦截禁用态/复核勾选态）
+  const any = el as any
+  const disabled = any.disabled === true || el.getAttribute('aria-disabled') === 'true'
+  const ariaChecked = el.getAttribute('aria-checked')
+  let checked: boolean | undefined
+  if (any.checked !== undefined && any.checked !== null) checked = any.checked === true
+  else if (ariaChecked !== null) checked = ariaChecked === 'true'
   return {
     found: true,
     x: Math.round(x * 100) / 100,
@@ -452,7 +621,9 @@ export const RESOLVE_FN = String(function resolve(framePaths: number[][], path: 
     editable,
     value: value.slice(0, 100),
     w: Math.round(r.width),
-    h: Math.round(r.height)
+    h: Math.round(r.height),
+    disabled,
+    checked
   }
 })
 

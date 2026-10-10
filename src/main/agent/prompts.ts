@@ -162,6 +162,12 @@ export interface StepContext {
   plan?: { nodes: PlanNode[]; current: number }
   /** 测试模式：测试脚本上下文（仅测试运行时存在；缺省时提示词与普通任务逐字节一致） */
   test?: TestScriptContext
+  /** T8 反思：失败尝试清单（W7；注入动态后缀区，守 prompt cache 布局；缺省不拼入） */
+  tried?: string[]
+  /** T7 动作后核验反馈（W10；注入动态后缀区；缺省不拼入） */
+  deltaHint?: string
+  /** T9 重规划说明（W8；注入动态后缀区；缺省不拼入） */
+  replanNote?: string
 }
 
 /** 测试模式注入的脚本上下文（runner 构造；含当前步骤与其断言的确切 expect 动作） */
@@ -303,6 +309,24 @@ export function buildStepMessage(ctx: StepContext): string {
       .slice(0, 6500)
     parts.push(`# 上一步动作结果\n${r}`)
   }
+
+  // —— 以下为 v3 动态后缀区（反思/核验/重规划注入；全部只放这里，缓存断点之后） ——
+
+  // T7 动作后核验（W10）：delta 反馈文案
+  if (ctx.deltaHint) parts.push(`# 操作核验\n${ctx.deltaHint.slice(0, 600)}`)
+
+  // T8 反思（W7）：失败尝试清单 + 禁止重复同一失败方式（执行前拦截的依据）
+  if (ctx.tried?.length) {
+    parts.push(
+      `# 失败尝试清单（以下是已失败的做法；同一目标同一方式已失败 2 次的，禁止再重复，必须换一种没试过的方式）\n${ctx.tried
+        .slice(0, 10)
+        .join('\n')
+        .slice(0, 1200)}`
+    )
+  }
+
+  // T9 重规划（W8）：本次为重规划后的新计划说明
+  if (ctx.replanNote) parts.push(`# 重规划说明\n${ctx.replanNote.slice(0, 600)}`)
 
   // 用户人工指导：放在消息末尾的高优位置（模型对末尾内容注意力最强）
   if (ctx.guidance?.length) {

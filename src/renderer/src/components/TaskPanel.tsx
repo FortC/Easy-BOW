@@ -930,7 +930,25 @@ export default function TaskPanel(props: {
                       <pre>{a.result}</pre>
                     </details>
                   ))}
-                {s.screenshot && <img className="shot" src={s.screenshot} alt="步骤截图" onClick={() => props.onShotClick(s.screenshot!)} />}
+                {s.screenshot && (
+                  <div className="shot-wrap" onClick={() => props.onShotClick(s.screenshot!)} title="点击查看大图">
+                    <img className="shot" src={s.screenshot} alt="步骤截图" />
+                    {/* T3 命中标记：点击坐标+目标 rect 叠加（归一化 0~1），定位诊断主手段 */}
+                    {s.hits?.map((h, i) => (
+                      <span
+                        key={'h' + i}
+                        className="hit-marker"
+                        title={h.label ? `命中: ${h.label}` : '点击命中位置'}
+                        style={{
+                          left: `${h.x * 100}%`,
+                          top: `${h.y * 100}%`,
+                          width: h.w > 0 ? `${h.w * 100}%` : undefined,
+                          height: h.h > 0 ? `${h.h * 100}%` : undefined
+                        }}
+                      />
+                    ))}
+                  </div>
+                )}
               </div>
             )
           )}

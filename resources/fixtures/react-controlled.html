@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>模拟 React 受控组件</title>
+<style>
+  body { font-family: system-ui, sans-serif; padding: 24px; background: #fafafa; color: #222; }
+  h1 { font-size: 20px; }
+  p { color: #555; }
+  .panel { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 16px; max-width: 560px; }
+  input { height: 32px; padding: 0 8px; font-size: 14px; border: 1px solid #bbb; border-radius: 4px; width: 240px; }
+  button { min-height: 34px; padding: 4px 16px; font-size: 14px; cursor: pointer; }
+  .state-line { margin-top: 10px; color: #555; }
+  #result { margin-top: 16px; padding: 12px 14px; background: #eef6ff; border: 1px solid #8cf; border-radius: 6px; min-height: 24px; }
+</style>
+</head>
+<body>
+<h1>模拟 React 受控组件</h1>
+<p>input 的 value 由 JS 状态托管：直接赋值会被框架重渲染复原；只有「原生 setter + input 事件」链路才能写进状态。</p>
+
+<div class="panel">
+  <input id="rc-input" type="text" placeholder="受控输入框">
+  <button id="rc-btn" type="button">读取当前值</button>
+  <div class="state-line">框架状态 state.value = <b id="rc-state">(空)</b></div>
+</div>
+
+<div id="result">（结果区）等待操作</div>
+
+<script>
+  // 模拟受控组件：state 是唯一数据源，渲染时用原生 setter 回写 DOM
+  var state = { value: '' }
+  var input = document.getElementById('rc-input')
+  var desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')
+  var nativeGet = desc.get
+  var nativeSet = desc.set
+
+  function render() {
+    nativeSet.call(input, state.value) // 框架渲染：原生 setter 回写
+    document.getElementById('rc-state').textContent = state.value || '(空)'
+    document.getElementById('result').textContent = '当前值: ' + (state.value || '(空)')
+  }
+
+  // 拦截实例上的 value 直接赋值：外部写入被忽略，框架重渲染复原
+  Object.defineProperty(input, 'value', {
+    configurable: true,
+    get: function () { return state.value },
+    set: function () { render() }
+  })
+
+  // 「原生 setter + input 事件」链路：事件里用原生 getter 读真实键入值进 state
+  input.addEventListener('input', function () {
+    state.value = nativeGet.call(input)
+    render()
+  })
+
+  document.getElementById('rc-btn').addEventListener('click', function () {
+    document.getElementById('result').textContent = '当前值: ' + (state.value || '(空)')
+  })
+
+  render()
+  // 模拟框架周期性重渲染：绕过 input 事件的写入会被复原
+  setInterval(render, 500)
+</script>
+</body>
+</html>
