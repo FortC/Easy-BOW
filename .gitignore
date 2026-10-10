@@ -27,3 +27,4 @@ resources/fastmodel/
 !build/
 build/*
 !build/icon.ico
+reports/

@@ -20,6 +20,9 @@ export interface Candidate {
   inViewport: boolean
   /** T5 容器锚点：最近稳定容器里的消歧短文本（≤24 字，不含元素自身文本）；无合适容器时省略该字段 */
   anchor?: string
+  /** W4 语义状态（disabled/已勾选/已展开 等）：进元素列表行内——模型可据此避免点死按钮；
+   *  来源＝DOM/AX 实时判定（快照时点值，执行前 executor 会实时复核） */
+  state?: string
 }
 
 export interface ExtractResult {
@@ -32,6 +35,12 @@ export interface ExtractResult {
   candidates: Candidate[]
   totalFound: number
   imgCount: number
+  /** W5 一期「探测 + 告知」：跨域 iframe（contentDocument 不可读）的 src 列表，
+   *  formatCandidates 尾部注明「其中元素暂不可见，可尝试视觉模式」 */
+  blockedFrames?: string[]
+  /** canvas 编辑器检测：正文由 canvas 渲染（WPS/金山文档/腾讯文档等）——DOM 提取对正文全盲。
+   *  命中时 formatCodes 尾部注入专用指南（paste_rich 写入 + click_xy 光标），runner 放行坐标点击 */
+  canvasEditor?: boolean
   /** S1 语义重排产物：与任务语义相关的 Top 命中项（formatCandidates 末尾渲染成提示段） */
   semanticHints?: SemanticHint[]
 }
@@ -44,14 +53,15 @@ export interface SemanticHint {
   score: number
 }
 
-/** 在页面上下文中运行（自包含，序列化注入） */
-export const EXTRACT_FN = String(function extract(maxElements: number) {
+/** 在页面上下文中运行（自包含，序列化注入）；shadow=false 时关闭 shadow DOM 穿透（W5 开关回滚用） */
+export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: boolean) {
   const SEL =
     'a[href], button, input, select, textarea, summary, [role], [contenteditable="true"], [onclick], img[onclick], label[for], [tabindex]:not([tabindex="-1"])'
   const INTERACTIVE_TAGS = new Set(['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'SUMMARY'])
 
   const out: any[] = []
   let total = 0
+  const blocked: string[] = []
 
   function normText(s: unknown): string {
     if (!s) return ''
@@ -372,8 +382,9 @@ export const EXTRACT_FN = String(function extract(maxElements: number) {
       }
       if (nested) continue
       if (el.getAttribute('aria-hidden') === 'true' || el.hasAttribute('hidden')) continue
-      const dis = (el as HTMLButtonElement).disabled
-      if (dis) continue
+      // W4：禁用元素不再静默过滤——带 (disabled) 状态入列，模型看得见才能绕开/等它恢复；
+      // 执行层仍有实时禁用复核兜底（点了会明确报错）。排名适度降权（可交互优先）
+      const dis = (el as HTMLButtonElement).disabled || el.getAttribute('aria-disabled') === 'true'
       const v = visible(el, offX, offY)
       if (!v.ok) continue
       // 视口下方太远的元素不进列表（可滚动后再提取），按顶层绝对坐标判断；
@@ -390,6 +401,7 @@ export const EXTRACT_FN = String(function extract(maxElements: number) {
       else score += 5
       score += Math.min(text.length, 40) / 4
       if (v.occluded) score -= 60
+      if (dis) score -= 20
       const anchor = anchorOf(el)
       const item: any = {
         framePaths,
@@ -409,6 +421,8 @@ export const EXTRACT_FN = String(function extract(maxElements: number) {
       }
       // T5 容器锚点：有锚容器才带字段（不落空串）；不进提示词，只供重定位链消歧用
       if (anchor) item.anchor = anchor
+      // W4 state 行内：禁用态从 DOM 实时判定（AX 树的 checked/expanded 由 annotateWithAx 补写）
+      if (dis) item.state = 'disabled'
       out.push(item)
     }
   }
@@ -417,30 +431,33 @@ export const EXTRACT_FN = String(function extract(maxElements: number) {
     scanRoot(doc, framePaths, offX, offY)
     // T6 shadow DOM 穿透（复用 EXTRACT_IMAGES_FN 的 shadow 栈递归模式）：
     // querySelectorAll 看不见 shadowRoot 内元素；shadow 内元素的 getBoundingClientRect
-    // 已是视口坐标，不累加偏移；深度与 iframe 合计 ≤4 层，host 栈去重防环
-    try {
-      const stack: { root: Document | ShadowRoot; d: number; hosts: Element[] }[] = [
-        { root: doc, d: depth, hosts: [] }
-      ]
-      let visited = 0
-      while (stack.length && visited < 60) {
-        const top = stack.pop()!
-        let els: Element[] = []
-        try {
-          els = Array.from(top.root.querySelectorAll('*'))
-        } catch {
-          continue
+    // 已是视口坐标，不累加偏移；深度与 iframe 合计 ≤4 层，host 栈去重防环。
+    // shadowDom=false（W5 回滚开关）时整体跳过
+    if (shadow !== false) {
+      try {
+        const stack: { root: Document | ShadowRoot; d: number; hosts: Element[] }[] = [
+          { root: doc, d: depth, hosts: [] }
+        ]
+        let visited = 0
+        while (stack.length && visited < 60) {
+          const top = stack.pop()!
+          let els: Element[] = []
+          try {
+            els = Array.from(top.root.querySelectorAll('*'))
+          } catch {
+            continue
+          }
+          for (const el of els) {
+            const sr = (el as any).shadowRoot
+            if (!sr || top.hosts.indexOf(el) !== -1) continue
+            visited++
+            if (top.d >= 3) continue // 合计深度到顶：只收不下沉
+            scanRoot(sr, framePaths, offX, offY)
+            stack.push({ root: sr, d: top.d + 1, hosts: top.hosts.concat(el) })
+          }
         }
-        for (const el of els) {
-          const sr = (el as any).shadowRoot
-          if (!sr || top.hosts.indexOf(el) !== -1) continue
-          visited++
-          if (top.d >= 3) continue // 合计深度到顶：只收不下沉
-          scanRoot(sr, framePaths, offX, offY)
-          stack.push({ root: sr, d: top.d + 1, hosts: top.hosts.concat(el) })
-        }
-      }
-    } catch {}
+      } catch {}
+    }
     // 递归穿透同源 iframe（聚水潭等老式布局必需），最多三层（支付/滑块/广告常在第三层）
     if (depth < 3) {
       let iframes: Element[]
@@ -456,7 +473,13 @@ export const EXTRACT_FN = String(function extract(maxElements: number) {
         } catch {
           cd = null
         }
-        if (!cd || !cd.body) continue
+        if (!cd || !cd.body) {
+          // W5 一期「探测 + 告知」（OOPIF/跨域）：contentDocument 不可读 = 跨域挡住，
+          // 记录 src 供元素列表尾部注明（完整穿透需 CDP Target.setAutoAttach，列 v3.4+）
+          const src = f.getAttribute('src') || ''
+          if (src && blocked.length < 5) blocked.push(src.slice(0, 100))
+          continue
+        }
         // iframe 内元素的坐标逐层累加，换算为顶层视口绝对坐标（与截图对齐）
         const fr = f.getBoundingClientRect()
         collect(cd, [...framePaths, indexPath(f)], depth + 1, offX + fr.left, offY + fr.top)
@@ -465,6 +488,16 @@ export const EXTRACT_FN = String(function extract(maxElements: number) {
   }
 
   collect(document, [], 0, 0, 0)
+  // canvas 编辑器检测（改进 WPS 写入任务根因 1）：大尺寸 canvas 覆盖视口 ≥25% 视为 canvas 文档编辑器——
+  // 正文与光标不在 DOM 里（提取恒只见工具栏），需要专用写入通道（paste_rich）与坐标点击
+  let canvasArea = 0
+  try {
+    for (const cv of Array.from(document.querySelectorAll('canvas'))) {
+      const r = cv.getBoundingClientRect()
+      if (r.width > 100 && r.height > 100) canvasArea += r.width * r.height
+    }
+  } catch {}
+  const canvasEditor = canvasArea >= window.innerWidth * window.innerHeight * 0.25
   out.sort((a: any, b: any) => b._score - a._score)
   const top = out.slice(0, maxElements).map(({ _score, ...rest }: any) => rest)
   return {
@@ -476,7 +509,9 @@ export const EXTRACT_FN = String(function extract(maxElements: number) {
     viewportH: window.innerHeight,
     candidates: top,
     totalFound: total,
-    imgCount: document.images ? document.images.length : 0
+    imgCount: document.images ? document.images.length : 0,
+    blockedFrames: blocked,
+    canvasEditor
   }
 })
 
@@ -497,6 +532,8 @@ export function formatCandidates(res: ExtractResult, withCoords = false, keepIdx
     const parts = [`[${i}] <${c.role}>`]
     if (c.text) parts.push(`"${c.text}"`)
     if (c.extra) parts.push(`(${c.extra})`)
+    // W4 state 行内（如 `(disabled)`）：模型可据此避免点死按钮/识别展开态（编号与文案格式不变，纯后缀）
+    if (c.state) parts.push(`(${c.state})`)
     if (withCoords && c.inViewport && vw > 0 && vh > 0) {
       const nx = Math.round(((c.rect.x + c.rect.w / 2) / vw) * 1000)
       const ny = Math.round(((c.rect.y + c.rect.h / 2) / vh) * 1000)
@@ -505,6 +542,21 @@ export function formatCandidates(res: ExtractResult, withCoords = false, keepIdx
     if (!c.inViewport) parts.push('(需滚动到)')
     lines.push(parts.join(' '))
   })
+  // W5 一期「探测 + 告知」：跨域 iframe 内元素不可见——明确告知模型与用户，别盲目找
+  if (res.blockedFrames?.length) {
+    lines.push(
+      `⚠ 检测到 ${res.blockedFrames.length} 个跨域 iframe（${res.blockedFrames.slice(0, 3).join('、')}${res.blockedFrames.length > 3 ? '…' : ''}），其中元素暂不可见；如需操作其中内容请开启视觉模式（截图看图定位）或人工处理`
+    )
+  }
+  // canvas 文档编辑器指南（WPS 写入任务根因修复）：正文/光标不在元素列表，给出唯一可行的写入与定位通道
+  if (res.canvasEditor) {
+    lines.push(
+      'ℹ 本页正文为 canvas 渲染的文档编辑器（WPS/金山文档/腾讯文档等）：上面的元素列表只有工具栏等页面控件，文档正文与光标【不在列表里，也永远搜不到】。正确做法：\n' +
+        '  - 写入正文：用 {"name":"paste_rich","text":"Markdown内容"}（在当前光标处粘贴，无需 index，支持标题/列表/加粗）或 {"name":"paste_image","url":"…"}（嵌入图片，无需 index）\n' +
+        '  - 移动光标/点击正文：用 {"name":"click_xy","x":…,"y":…}（本页允许坐标点击，x/y 为视口归一化 0~1000，点正文区域约 x:300~700,y:200~600）\n' +
+        '  - 禁止对正文使用 type/点击工具栏按钮找正文；粘贴前若不确定光标位置，先 click_xy 点正文再粘贴'
+    )
+  }
   // S1 语义匹配提示段：rerankByTask 命中项及理由（缺省不渲染——输出与历史逐字节一致）
   if (res.semanticHints?.length) {
     const hintLines = res.semanticHints

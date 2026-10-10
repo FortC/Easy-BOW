@@ -359,7 +359,7 @@ export class Executor {
   /** 可选：read_content 文本过少时的整页 OCR 兜底 */
   ocrPageFallback?: () => Promise<string | null>
   /** T2 熔断触发回调（runner 注入 telemetry circuit_break 事件） */
-  onCircuitBreak?: (host: string) => void
+  onCircuitBreak?: (host: string, url: string) => void
   /** 可选：fill_form 智能填充规划器（LLM 字段映射；index.ts 注入 provider，自测可替换为桩） */
   formFillPlanner?: (
     fields: FormField[],
@@ -379,7 +379,8 @@ export class Executor {
     const t = tab || this.tabManager.active()
     if (!t) throw new Error('没有可用页签')
     const cap = opts?.limit ? Math.max(20, Math.min(200, opts.limit)) : this.snapshotLimit()
-    let res = await t.cdp.evaluate<ExtractResult>(EXTRACT_FN, [cap])
+    // W5 shadowDom 开关：false 时关闭 shadow DOM 穿透（独立回滚；缺省开启）
+    let res = await t.cdp.evaluate<ExtractResult>(EXTRACT_FN, [cap, getSettings().shadowDom !== false])
     if (!res || !Array.isArray(res.candidates)) {
       throw new Error('页面提取结果为空（页面可能还在加载或为特殊页面）')
     }
@@ -580,10 +581,17 @@ export class Executor {
   private circuitBroken = false
   private static circuitBrokenHosts = new Set<string>()
 
-  /** 清任务级等待熔断状态（新任务开始时重置；host 记忆保留） */
+  /** 清任务级等待熔断状态（新任务开始时重置；host 记忆保留）。
+   *  同时为已开页签预热网络追踪（P0-3 修复）：避免首个动作批的 settle 才懒开启、
+   *  漏掉开启前已在飞请求的记账（waitNetworkQuiet 内部仍有懒开启兜底，覆盖任务中新建的页签） */
   resetWaitState(): void {
     this.settleCapStreak = 0
     this.circuitBroken = false
+    try {
+      if (getSettings().smartWait !== false) {
+        for (const t of this.tabManager.all()) t.cdp.setNetQuietWatch(true)
+      }
+    } catch {}
   }
 
   /**
@@ -616,8 +624,20 @@ export class Executor {
       await this.sleep(200, signal)
     }
     // 首屏：isLoading 结束 + 固定窗口（分策略——首屏不套 mutation 静默）
-    if (phase === 'first' || !smart || slow) {
+    if (phase === 'first' || !smart) {
       await this.sleep(slow ? 1200 : 600, signal)
+      done()
+      return
+    }
+    // 慢速模式公式（P0-2 修订）：实际等待 = max(拟人下限 1200, min(信号等待, 上限 2500))——
+    // 信号只可能延长等待（页面确实还在动），绝不缩短拟人节奏（风控敏感站点保留原节奏）
+    if (slow) {
+      const slow0 = Date.now()
+      if (!signal.aborted) {
+        await Promise.all([t.cdp.waitNetworkQuiet(300, 2000), t.cdp.waitDomStable(250, 2500)])
+      }
+      const waited = Date.now() - slow0
+      if (waited < 1200 && !signal.aborted) await this.sleep(1200 - waited, signal)
       done()
       return
     }
@@ -647,7 +667,8 @@ export class Executor {
         this.circuitBroken = true
         if (host) Executor.circuitBrokenHosts.add(host)
         try {
-          this.onCircuitBreak?.(host)
+          // 带上完整 URL（P0-2「页面特征」）：host 只能定位站点，path 能区分同站点的不同页面形态
+          this.onCircuitBreak?.(host, t.url)
         } catch {}
       }
     } else {
@@ -690,11 +711,13 @@ export class Executor {
           }
         } catch (e: any) {
           a.error = String(e?.message || e).slice(0, 200)
-          // T8 反思签名（方式失败才有意义）：动作名 + 目标语义 + 容器锚文本
+          // T8 反思签名（方式失败才有意义）：动作名 + 目标语义 + 容器锚文本。
+          // 目标语义以候选文本/extra 优先（act.text 对 type 是「被输入的值」，放最前会让
+          // 同一输入框换值重试永远不累计——填表死循环拦截被削弱，P1-10 修订）
           if (!a.failSig) {
             const snap = this.snapshots.get(this.tabManager.active()?.id ?? -1)
             const cand = a.index != null ? snap?.candidates[a.index] : undefined
-            a.failSig = `${a.name}|${(a.text || cand?.text || cand?.extra || '').slice(0, 24)}|${(cand?.anchor || '').slice(0, 24)}`
+            a.failSig = `${a.name}|${(cand?.text || cand?.extra || a.text || '').slice(0, 24)}|${(cand?.anchor || '').slice(0, 24)}`
           }
           out.push(a)
           break // 出错即停止本批，下一步让模型看到错误并自行调整
@@ -743,6 +766,9 @@ export class Executor {
         const cand = r.cand
         const label = `${cand?.text || ''} ${cand?.extra || ''}`.trim()
         const submitish = isSubmitishLabel(label)
+        // W10 delta 核验按动作类型分流（P1-8）：回填标志位，runner 侧据此给「提交后全零变化」强提示
+        // （此前 runner 对 a.result='点击(x,y)' 做正则，提交类强提示永远不可达）
+        if (submitish) a.submitish = true
         // 测试模式生产保护：提交/删除类点击需人工确认（普通任务 protectedSubmit 恒缺省，零影响）
         if (ctx.protectedSubmit && submitish) {
           const choice = await dialog.showMessageBox({
@@ -861,6 +887,14 @@ export class Executor {
         const hitInfo = await t.cdp
           .evaluate<{ ok: boolean; tag?: string; text?: string }>(HIT_TEST_FN, [px, py])
           .catch(() => null)
+        // P0-1 写操作禁裸坐标（硬门禁·残留通道封堵）：click_xy 是视觉兜底通道，但坐标处
+        // 最上层元素若是提交/保存/删除/支付类，禁止坐标点击——错点不可逆，只允许语义定位。
+        // hitInfo 拿不到（canvas 等无 DOM 命中）时无从判定，不拦（视觉通道是唯一手段）
+        if (hitInfo?.text && isSubmitishLabel(hitInfo.text)) {
+          throw new Error(
+            `坐标点击命中提交类元素「${hitInfo.text.slice(0, 20)}」，已按「写操作禁用裸坐标」拦截：请改用元素列表 index 语义点击；列表里没有该元素时先滚动/展开使其出现`
+          )
+        }
         if (ctx.hits) {
           ctx.hits.push({
             x: px,
@@ -964,9 +998,16 @@ export class Executor {
             }
           }
         } else if (vr.ok) {
-          // 实际值与目标不一致：如实报告给模型，便于下一步自纠错
+          // 实际值与目标不一致：如实报告给模型，便于下一步自纠错。
+          // canvas 文档编辑器（WPS 等）场景追加通道引导——正文没有输入元素，type 必然失败，
+          // 不指路模型会在「重试 type / 乱点工具栏」里空转几十步（trace 实证）
           const actual = (vr.value || '').slice(0, 30)
-          a.result = actual ? `输入不完整(${how})，实际为"${actual}"，目标"${text.slice(0, 30)}"` : `输入未生效(${how})，输入框仍为空`
+          const canvasHint = this.snapshots.get(t.id)?.canvasEditor
+            ? '。本页正文是 canvas 渲染的文档编辑器（无输入元素）：写正文请改用 {"name":"paste_rich","text":"…"} 在光标处粘贴（无需 index），移动光标用 click_xy'
+            : ''
+          a.result = actual
+            ? `输入不完整(${how})，实际为"${actual}"，目标"${text.slice(0, 30)}"${canvasHint}`
+            : `输入未生效(${how})，输入框仍为空${canvasHint}`
           a.error = a.result
         } else {
           // 回读失败（元素已从 DOM 消失/iframe 卸载）：效果无法证实，按失败上报，
@@ -1177,9 +1218,17 @@ export class Executor {
           if (!hit) {
             a.result = `等待超时(${Math.round(budget / 1000)}s)未见 URL 含 "${val.slice(0, 40)}" 的接口响应，请检查请求是否发出`
             a.error = a.result
+          } else if (hit.failed) {
+            // loadingFailed（网络层中断，status=0）：不得报「已等到」（P0-3 status 门槛）
+            a.result = `接口请求失败（加载中断/网络层错误）: ${hit.url.slice(0, 60)}${hit.stale ? '，兜底:历史缓冲命中' : ''}`
+            a.error = a.result
           } else if (hit.status >= 400) {
             // 4xx/5xx 判该步失败（业务失败：可修正后重试，T8 不进禁止清单）
             a.result = `接口响应异常: HTTP ${hit.status}（${hit.url.slice(0, 60)}${hit.stale ? '，兜底:历史缓冲命中' : ''}）`
+            a.error = a.result
+          } else if (hit.status >= 300) {
+            // 3xx 对 XHR/Fetch 属异常（重定向通常被透明跟随，裸 3xx 说明请求没到预期终点）
+            a.result = `接口响应异常: HTTP ${hit.status} 重定向（预期 2xx）: ${hit.url.slice(0, 60)}`
             a.error = a.result
           } else {
             a.result = `已等到接口响应 HTTP ${hit.status}（${hit.url.slice(0, 50)}${hit.stale ? '，兜底:历史缓冲命中' : ''}）`

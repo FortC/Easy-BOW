@@ -14,6 +14,7 @@ import {
   SYSTEM_PROMPT,
   VISION_ADDON,
   VISION_FALLBACK_ADDON,
+  CANVAS_EDITOR_ADDON,
   TEST_MODE_ADDON,
   LOCAL_SYSTEM_PROMPT,
   buildLocalPrompt,
@@ -97,9 +98,44 @@ function assertionToAction(asrt: TestAssertion): AgentAction {
   }
 }
 
+/**
+ * 动作必填参数校验（参数契约前置拦截）：缺参动作不进执行批，直接标错误给模型——
+ * 此前「click 无 index」要走到执行器才报错，每次白烧一步模型调用（WPS 任务 trace：6 次）。
+ * 返回缺失字段名（无可选字段冲突时给主字段名），完整返回 null。
+ */
+function missingActionParam(a: AgentAction): string | null {
+  const has = (v: unknown) => v !== undefined && v !== null && v !== ''
+  switch (a.name) {
+    case 'click':
+    case 'drag':
+    case 'upload':
+    case 'switch_tab':
+    case 'close_tab':
+      return has(a.index) ? null : 'index'
+    case 'type':
+      return has(a.index) ? (has(a.text) ? null : 'text') : 'index'
+    case 'goto':
+      return has(a.url) ? null : 'url'
+    case 'save':
+    case 'recall':
+      return has(a.key) ? null : 'key'
+    case 'wait_for':
+      return has(a.value) || has(a.text) ? null : 'value'
+    case 'click_xy':
+      return has(a.x) ? (has(a.y) ? null : 'y') : 'x'
+    case 'clarify':
+      return has(a.query) || has(a.text) ? null : 'query'
+    case 'paste_rich':
+      return has(a.text) ? null : 'text'
+    case 'paste_image':
+      return has(a.url) ? null : 'url'
+    default:
+      return null
+  }
+}
+
 /** 宽松解析模型输出的 JSON（容忍 markdown 围栏、前后杂文） */
-function parseModelJson(text: string): { thought: string; actions: AgentAction[]; nodeDone?: boolean } | null {
-  let t = text.trim()
+function parseModelJson(text: string): { thought: string; actions: AgentAction[]; nodeDone?: boolean } | null {  let t = text.trim()
   t = t.replace(/```(?:json)?/gi, '')
   const start = t.indexOf('{')
   const end = t.lastIndexOf('}')
@@ -246,6 +282,8 @@ export class AgentRunner {
   /** T10 专家重试（W9）：卡住节点单次 planner 调用（每任务 ≤3 次，成功立即回落主模型） */
   private expertRetriesUsed = 0
   private expertArmed = false
+  /** T10 planner 用量分列（重规划/专家重试消耗的 token；UI usage-bar 分列显示） */
+  private plannerUsage = { inputTokens: 0, outputTokens: 0 }
   /** T7 动作后核验（W10）：上一批动作（delta 比对输入） */
   private lastBatchActions: AgentAction[] = []
 
@@ -384,6 +422,7 @@ export class AgentRunner {
     this.progressAnchorIdx = 0
     this.expertRetriesUsed = 0
     this.expertArmed = false
+    this.plannerUsage = { inputTokens: 0, outputTokens: 0 }
     this.lastBatchActions = []
     this.abortCtrl = new AbortController()
     this.pauseRequested = false
@@ -391,8 +430,9 @@ export class AgentRunner {
     this.telemetry.start(task, settings.telemetry !== false)
     // T2 智能等待：任务级熔断状态复位（host 记忆保留）+ 熔断遥测接线
     this.executor.resetWaitState()
-    this.executor.onCircuitBreak = (host) => {
-      this.telemetry.log('circuit_break', this.steps.length + 1, { host })
+    this.executor.onCircuitBreak = (host, url) => {
+      // P0-2：host 定位站点 + url 区分同站点页面形态（页面特征）
+      this.telemetry.log('circuit_break', this.steps.length + 1, { host, url: (url || '').slice(0, 200) })
     }
     // T4 结构化输出：会话建立时预检探测（不消耗真实任务请求；结果会话内粘滞）
     if (settings.structuredOut !== false) {
@@ -414,10 +454,28 @@ export class AgentRunner {
     Cdp.defaultDialogPolicy = 'accept'
     for (const t of this.tabManager.all()) t.cdp.setDialogPolicy('accept')
     const p = this.loop(task, provider, settings, epoch)
-      .catch((e) => {
+      .catch(async (e) => {
         if (epoch !== this.epoch) return // 已被新运行取代：异常归旧循环，不影响当前状态
-        this.setState({ state: 'error', statusText: `任务异常: ${e?.message || e}` })
-        this.broadcast({ channel: 'toast', message: `任务异常: ${e?.message || e}`, kind: 'error' })
+        const msg = String(e?.message || e)
+        // P1-11 错误帧兜底：渲染进程崩溃/CDP 挂死等异常收尾时，smart 模式该步无任何帧——
+        // 尽力补拍一帧（失败也不阻塞收尾），时间线可回溯「最后一刻页面长什么样」
+        try {
+          const tab = this.tabManager.active()
+          if (tab) {
+            const shot = await tab.cdp.screenshotJpeg(60).catch(() => null)
+            const ds = this.recordStep(
+              this.steps.length + 1,
+              `任务异常: ${msg.slice(0, 120)}`,
+              [{ name: 'wait', result: '任务异常收尾（错误帧兜底）', error: msg.slice(0, 200) }],
+              tab,
+              undefined,
+              shot || undefined
+            )
+            this.broadcast({ channel: 'step', step: ds })
+          }
+        } catch {}
+        this.setState({ state: 'error', statusText: `任务异常: ${msg}` })
+        this.broadcast({ channel: 'toast', message: `任务异常: ${msg}`, kind: 'error' })
         // 经验负反馈（P1-12）：异常收尾也是「命中经验但没跑成」，相关经验降分才可被淘汰
         try {
           feedbackExperience(this.tabManager.active()?.url || '', task, false)
@@ -730,8 +788,9 @@ export class AgentRunner {
       this.pauseRequested = false
       this.telemetry.start(task, settings.telemetry !== false)
       this.executor.resetWaitState()
-      this.executor.onCircuitBreak = (host) => {
-        this.telemetry.log('circuit_break', this.steps.length + 1, { host })
+      this.executor.onCircuitBreak = (host, url) => {
+        // P0-2：host 定位站点 + url 区分同站点页面形态（页面特征）
+        this.telemetry.log('circuit_break', this.steps.length + 1, { host, url: (url || '').slice(0, 200) })
       }
       this.setState({
         state: 'running',
@@ -1474,6 +1533,9 @@ export class AgentRunner {
    */
   private deltaVerify(prevActions: AgentAction[], prev: ExtractResult | null, next: ExtractResult): string | undefined {
     if (!prev) return undefined
+    // canvas 文档编辑器（WPS 等）：正文变化不反映到 DOM/候选列表——「无变化」提示系统性误报，
+    // 会诱导模型重复写入（截图里的商品名称写两遍即此根因）。视觉模式看截图自核，文本 delta 全部抑制
+    if (next.canvasEditor) return undefined
     const urlChanged = (prev.url || '') !== (next.url || '')
     const titleChanged = (prev.title || '') !== (next.title || '')
     const prevTexts = new Set(prev.candidates.map((c) => c.text).filter(Boolean))
@@ -1497,13 +1559,14 @@ export class AgentRunner {
       })
       return undefined // 有结构变化 = 正常，不打扰
     }
-    // 全零 delta：按上一批动作类型分流（P1-8）
+    // 全零 delta：按上一批动作类型分流（P1-8）。
+    // 提交类 click 用 executor 回填的 submitish 标志判定（回读 a.result 文案恒不含提交关键词，正则不可达）
     const navOrSubmit = prevActions.some(
       (a) =>
         a.name === 'goto' ||
         a.name === 'back' ||
         a.name === 'forward' ||
-        (a.name === 'click' && /提交|确定|保存|下单|支付|发布|删除|结算|submit|save|delete|pay|order|confirm/i.test(`${a.result || ''}`))
+        ((a.name === 'click' || a.name === 'click_xy') && a.submitish === true)
     )
     const quietActions = prevActions.every((a) => ['hover', 'wait', 'save', 'recall', 'read_content', 'extract_images'].includes(a.name))
     this.telemetry.log('action_verify', this.steps.length + 1, {
@@ -1558,6 +1621,19 @@ export class AgentRunner {
         const out = await useProvider.chat(REPLAN_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], this.abortCtrl!.signal)
         if (epoch !== this.epoch) return
         nodes = parsePlan(out.text)
+        // T10 token 分列：配置了独立 planner 时，重规划调用归入 planner 用量（telemetry + UI 分列）
+        if (plannerProvider) {
+          this.plannerUsage.inputTokens += out.usage.inputTokens
+          this.plannerUsage.outputTokens += out.usage.outputTokens
+          this.telemetry.log('llm_call', stepN, {
+            local: false,
+            vision: false,
+            planner: true,
+            kind: 'replan',
+            input: out.usage.inputTokens,
+            output: out.usage.outputTokens
+          })
+        }
         this.setState({
           usage: {
             ...this.state.usage,
@@ -1592,6 +1668,19 @@ export class AgentRunner {
       message: `已重规划为 ${nodes.length} 个节点（第 ${this.replanCount} 次；收尾将强制 L2 复核）`,
       kind: 'info'
     })
+    // 时间线持久条目：重规划是任务关键事件，toast 会消失、steps 里应可回溯（P1 复核修订）
+    try {
+      const t = this.tabManager.active()
+      if (t) {
+        const ds = this.recordStep(
+          stepN,
+          `🔄 已重规划为 ${nodes.length} 个节点（第 ${this.replanCount} 次；触发: ${trigger}；收尾将强制云端 L2 复核）`,
+          [{ name: 'wait', result: '重规划完成，按新计划继续执行' }],
+          t
+        )
+        this.broadcast({ channel: 'step', step: ds })
+      }
+    } catch {}
     this.setState({ plan: this.planStatus(), statusText: `第 ${stepN} 步：重规划完成（${nodes.length} 节点），继续执行` })
   }
 
@@ -1877,7 +1966,7 @@ export class AgentRunner {
         }
       }
 
-      let llmOut: { text: string; usage: { inputTokens: number; outputTokens: number } }
+      let llmOut: { text: string; usage: { inputTokens: number; outputTokens: number }; structured?: string }
       const tLlm0 = Date.now()
       let visionRetryUsed = false // 带图调用失败后改用纯文本重试（模型实际没看到截图）
       let localUsed = false
@@ -1974,8 +2063,10 @@ export class AgentRunner {
             : userMsg
         // 测试模式追加测试规则段（普通任务追加空串，提示词逐字节不变）
         // 视觉兜底步用 FALLBACK 段：额外放行「按截图坐标点击」，解决元素列表里根本没有目标的情况
+        // canvas 编辑器（WPS 等）：豁免视觉模式「禁止坐标点击」禁令——正文不在元素列表，坐标是唯一通道
         const systemPrompt =
           (useVision ? SYSTEM_PROMPT + (visionActive ? VISION_ADDON : VISION_FALLBACK_ADDON) : SYSTEM_PROMPT) +
+          (extract.canvasEditor ? CANVAS_EDITOR_ADDON : '') +
           (this.testCtx ? TEST_MODE_ADDON : '')
 
         // T10 专家重试（W9）：卡住节点的单次 planner 调用——仅本次调用走 planner，成功立即回落主模型
@@ -2037,10 +2128,18 @@ export class AgentRunner {
         this.pendingGuidance.splice(0, guidanceCount)
         this.setState({ statusText: `第 ${stepN} 步：模型思考中…` })
       }
+      // T10 token 分列：专家重试那一步的用量归入 planner（llm_call 埋点已带 planner 标志）
+      if (usedPlanner) {
+        this.plannerUsage.inputTokens += llmOut.usage.inputTokens
+        this.plannerUsage.outputTokens += llmOut.usage.outputTokens
+      }
       this.telemetry.log('llm_call', stepN, {
         local: localUsed,
         vision: useVision,
         planner: usedPlanner,
+        // T4 结构化档位（W3 度量）：本次调用实际生效的 response_format 档——
+        // 与上一次不同的低档位即代表运行时降级发生（json_schema→json_object→none）
+        structured: llmOut.structured || 'none',
         input: llmOut.usage.inputTokens,
         output: llmOut.usage.outputTokens
       })
@@ -2048,13 +2147,22 @@ export class AgentRunner {
       const usage = {
         inputTokens: this.state.usage.inputTokens + llmOut.usage.inputTokens,
         outputTokens: this.state.usage.outputTokens + llmOut.usage.outputTokens,
-        steps: stepN
+        steps: stepN,
+        // T10 分列：planner 累计用量（>0 时 UI usage-bar 分列显示；未配置 planner 恒 0）
+        plannerInputTokens: this.plannerUsage.inputTokens,
+        plannerOutputTokens: this.plannerUsage.outputTokens
       }
 
       // 4. 解析模型输出
       const parsed = parseModelJson(llmOut.text)
       if (!parsed) {
         consecutiveParseFail++
+        // T4 度量（W3）：解析失败进 telemetry——「解析失败步占比 <0.5%」验收的数据源
+        this.telemetry.log('parse_fail', stepN, {
+          attempt: consecutiveParseFail,
+          structured: llmOut.structured || 'none',
+          raw: llmOut.text.slice(0, 120)
+        })
         this.recordStep(
           stepN,
           '（模型输出解析失败）',
@@ -2065,7 +2173,7 @@ export class AgentRunner {
         this.setState({ usage })
         // T4：解析失败阈值 3→2 + few-shot 示例注入（动态后缀区，引导规范输出）
         this.lastResults.push(
-          `系统提示: 你上一步的输出不是合法 JSON（原始输出前500字: ${llmOut.text.slice(0, 500)}）。请严格按格式输出，参考示例：\n{"thought":"点击登录按钮","actions":[{"name":"click","index":3}]}\n只输出这一个 JSON 对象，不要 markdown 代码块、不要前后缀文字。`
+          `系统提示: 你上一步的输出不是合法 JSON（原始输出前500字: ${llmOut.text.slice(0, 500)}）。请严格按格式输出，参考示例：\n{"thought":"点击登录按钮","actions":[{"name":"click","index":3}]}\n只输出这一个 JSON 对象，不要 markdown 代码块、不要前后缀文字。常见错误：JSON 字符串内部出现未转义的英文双引号会直接导致解析失败——引用页面文字时请用中文引号「」代替英文引号。`
         )
         if (consecutiveParseFail >= 2) {
           throw new Error('模型连续 2 次输出无法解析，请检查模型是否支持 JSON 输出或更换模型')
@@ -2147,15 +2255,28 @@ export class AgentRunner {
       // 5. 执行动作批（测试模式：test_step_done 是控制信号，进执行器前剥离；protectedSubmit 透传生产保护）
       this.setState({ statusText: `第 ${stepN} 步：执行 ${parsed.actions.length} 个动作…`, usage })
       const stepDoneSignal = !!this.testCtx && parsed.actions.some((x) => x.name === 'test_step_done')
-      // T8 执行前拦截（P1-10 第 4 条）：同一目标同一方式已失败 ≥2 次 → 拦下第 3 次重复，
-      // 注入「换一种没试过的方式」提示（方式失败进清单；业务失败不拦，可修正后重试）
       let toRun = this.testCtx ? parsed.actions.filter((x) => x.name !== 'test_step_done') : parsed.actions
       const blocked: AgentAction[] = []
+      // 参数契约前置拦截（WPS 任务根因 4）：缺必填参数的动作不进执行批，直接标错误反馈模型——
+      // 省一次「执行器报错→下一步」的模型往返；错误文案指明补参方式
+      toRun = toRun.filter((act) => {
+        const miss = missingActionParam(act)
+        if (miss) {
+          act.error = `动作 ${act.name} 缺少必需参数 ${miss}，已拦截未执行：元素类动作必须带 index（元素列表编号）；canvas 文档编辑器写正文用 paste_rich（无需 index）`
+          act.result = '已拦截（参数缺失）'
+          blocked.push(act)
+          return false
+        }
+        return true
+      })
+      // T8 执行前拦截（P1-10 第 4 条）：同一目标同一方式已失败 ≥2 次 → 拦下第 3 次重复，
+      // 注入「换一种没试过的方式」提示（方式失败进清单；业务失败不拦，可修正后重试）
       if (settings.reflection !== false && !this.testCtx) {
         toRun = toRun.filter((act) => {
           const cand = act.index != null ? extract.candidates[act.index] : undefined
+          // 目标语义以候选优先（P1-10 修订：type 的 act.text 是被输入的值，放最前会削弱死循环拦截）
           const sig = cand
-            ? `${act.name}|${(act.text || cand.text || cand.extra || '').slice(0, 24)}|${(cand.anchor || '').slice(0, 24)}`
+            ? `${act.name}|${(cand.text || cand.extra || act.text || '').slice(0, 24)}|${(cand.anchor || '').slice(0, 24)}`
             : ''
           if (sig && this.triedCount(sig, act.name) >= 2) {
             act.failSig = sig
@@ -2307,10 +2428,14 @@ export class AgentRunner {
       const tShot0 = Date.now()
       let screenshot: string | null = null
       if (shotMode !== 'off') {
-        screenshot =
-          shotMode === 'all' || isKeyStep
-            ? await tab.cdp.screenshotJpeg(70) // 高清：出错步/完成步（诊断与报告用）
-            : await tab.cdp.screenshotJpeg(42, 0.5) // 缩略图：常规步（省编码/传输/内存）
+        if (shotMode === 'all' || isKeyStep) {
+          screenshot = await tab.cdp.screenshotJpeg(70) // 高清：出错步/完成步（诊断与报告用）
+        } else if (visionShot) {
+          // W2/P1-11：视觉模式步复用步首已拍的高清截图，不再重拍（省一次 CDP 截图往返）
+          screenshot = visionShot
+        } else {
+          screenshot = await tab.cdp.screenshotJpeg(42, 0.5) // 缩略图：常规步（省编码/传输/内存）
+        }
       }
       timings.shotMs = (timings.shotMs || 0) + (Date.now() - tShot0)
       // T0 step 分段计时：时间线 + telemetry（报表 P50/P90 数据源）
@@ -2476,12 +2601,14 @@ export class AgentRunner {
         return
       }
 
-      // T9 重规划触发（P0-5）：连续 3 步无任何节点推进（有失败/卡住才算）→ 重排剩余节点（上限 2 次）
+      // T9 重规划触发（P0-5）：连续 3 步无任何节点推进 → 重排剩余节点（上限 2 次）。
+      // 「无推进」按计划原文口径：只要有实际动作执行而 planIdx 未动就计数——
+      // 纯原地空转（反复滚动/读页不带错误）同样是卡住信号，不应只盯显式失败
       if (!this.testCtx && this.plan.length && settings.replan !== false && this.replanCount < 2) {
         if (this.planIdx > this.progressAnchorIdx) {
           this.progressAnchorIdx = this.planIdx
           this.noProgressSteps = 0
-        } else if (executed.some((a) => a.error) || this.nodeFails > 0) {
+        } else if (executed.length > 0) {
           this.noProgressSteps++
           if (this.noProgressSteps >= 3 && !this.replanPending) {
             this.replanPending = `连续 ${this.noProgressSteps} 步无节点推进`

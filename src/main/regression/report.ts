@@ -1,11 +1,20 @@
 /**
  * 回归报告（T1）：Markdown 落盘 reports/regression/<yyyyMMdd-HHmmss>.md（仓库根目录，便于 CI 收集）。
- * 内容：成功率（agent 口径）/ 失败三分类列示 / 每用例步数 / P50-P90 步耗时 / token 消耗 / 失败原因摘要。
+ * 内容：成功率（agent 口径）/ 对比上次 / 失败三分类列示 / 每用例步数 / P50-P90 步耗时 / token 消耗 / 失败原因摘要。
+ * 对比数据源：同目录 last-summary.json（每次运行后回写，供下次对比）。
  */
-import { mkdirSync, writeFileSync } from 'fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import type { CaseResult } from './types'
 import type { FailureTriage } from '../telemetry'
+
+/** 上次运行摘要（last-summary.json；P0-6「对比上次 delta」验收的数据源） */
+export interface PrevSummary {
+  at: number
+  passed: number
+  agentTotal: number
+  rate: number
+}
 
 /** 最近秩百分位（P50/P90）；空数组返回 0 */
 export function percentile(sortedAsc: number[], p: number): number {
@@ -30,7 +39,7 @@ function fmtMin(ms: number): string {
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`
 }
 
-export function buildReportMarkdown(results: CaseResult[], startedAt: number): string {
+export function buildReportMarkdown(results: CaseResult[], startedAt: number, prev?: PrevSummary | null): string {
   const passed = results.filter((r) => r.status === 'passed')
   const failed = results.filter((r) => r.status === 'failed')
   const skipped = results.filter((r) => r.status === 'skipped')
@@ -38,7 +47,7 @@ export function buildReportMarkdown(results: CaseResult[], startedAt: number): s
   const byTriage = (t: FailureTriage) => failed.filter((r) => r.triage === t)
   const agentFailed = byTriage('agent')
   const agentTotal = passed.length + agentFailed.length
-  const rate = agentTotal ? ((passed.length / agentTotal) * 100).toFixed(1) : '—'
+  const rate = agentTotal ? Number(((passed.length / agentTotal) * 100).toFixed(1)) : null
   const stepMs = collectStepMs(results)
   const tokensIn = results.reduce((s, r) => s + r.tokens.input, 0)
   const tokensOut = results.reduce((s, r) => s + r.tokens.output, 0)
@@ -48,7 +57,17 @@ export function buildReportMarkdown(results: CaseResult[], startedAt: number): s
   L.push(`# EasyBow 回归报告`)
   L.push('')
   L.push(`- **时间**: ${new Date(startedAt).toLocaleString('zh-CN', { hour12: false })}`)
-  L.push(`- **成功率（agent 口径）**: ${passed.length}/${agentTotal}（${rate}%）—— 通过/(通过+agent 失败)，infra/product 不计入`)
+  L.push(`- **成功率（agent 口径）**: ${passed.length}/${agentTotal}${rate != null ? `（${rate}%）` : ''} —— 通过/(通过+agent 失败)，infra/product 不计入`)
+  // 对比上次（P0-6）：成功率变化 +0.0 为持平；首次运行无上次数据
+  if (prev && prev.agentTotal > 0 && rate != null) {
+    const delta = Number((rate - prev.rate).toFixed(1))
+    const trend = delta > 0 ? '↑' : delta < 0 ? '↓' : '→'
+    L.push(
+      `- **对比上次**: 成功率 ${prev.rate}% → ${rate}%（${trend}${delta > 0 ? '+' : ''}${delta}pt；上次 ${new Date(prev.at).toLocaleString('zh-CN', { hour12: false })}，${prev.passed}/${prev.agentTotal}）`
+    )
+  } else {
+    L.push(`- **对比上次**: —（首次运行或上次无有效数据）`)
+  }
   L.push(`- **失败三分类**: agent ${byTriage('agent').length} · infra ${byTriage('infra').length} · product ${byTriage('product').length}`)
   L.push(`- **用例**: 共 ${results.length}，通过 ${passed.length}，失败 ${failed.length}，跳过 ${skipped.length}`)
   L.push(`- **步数合计**: ${totalSteps}`)
@@ -115,7 +134,8 @@ export function buildReportMarkdown(results: CaseResult[], startedAt: number): s
   return L.join('\n')
 }
 
-/** 报告落盘 reports/regression/<yyyyMMdd-HHmmss>.md，返回绝对路径 */
+/** 报告落盘 reports/regression/<yyyyMMdd-HHmmss>.md（带「对比上次」），返回绝对路径。
+ *  同时回写 last-summary.json 供下次运行对比（P0-6「对比上次 delta」）。 */
 export function writeReport(results: CaseResult[], startedAt: number): string {
   const ts = new Date(startedAt)
   const pad = (n: number) => String(n).padStart(2, '0')
@@ -124,7 +144,27 @@ export function writeReport(results: CaseResult[], startedAt: number): string {
     `${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}`
   const dir = join(process.cwd(), 'reports', 'regression')
   mkdirSync(dir, { recursive: true })
+  const summaryPath = join(dir, 'last-summary.json')
+  let prev: PrevSummary | null = null
+  try {
+    prev = JSON.parse(readFileSync(summaryPath, 'utf-8')) as PrevSummary
+  } catch {
+    prev = null
+  }
   const file = join(dir, `${stamp}.md`)
-  writeFileSync(file, buildReportMarkdown(results, startedAt), 'utf-8')
+  writeFileSync(file, buildReportMarkdown(results, startedAt, prev), 'utf-8')
+  // 回写本次摘要（agent 口径），供下次对比
+  try {
+    const passed = results.filter((r) => r.status === 'passed').length
+    const agentFailed = results.filter((r) => r.status === 'failed' && r.triage === 'agent').length
+    const agentTotal = passed + agentFailed
+    const summary: PrevSummary = {
+      at: startedAt,
+      passed,
+      agentTotal,
+      rate: agentTotal ? Number(((passed / agentTotal) * 100).toFixed(1)) : 0
+    }
+    writeFileSync(summaryPath, JSON.stringify(summary), 'utf-8')
+  } catch {}
   return file
 }

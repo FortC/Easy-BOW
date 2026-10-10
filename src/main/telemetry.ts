@@ -28,6 +28,8 @@ export type TraceEventType =
   | 'replan'
   /** T10 专家重试（planner 执行级单次调用） */
   | 'expert_retry'
+  /** T4 模型输出解析失败（W3 度量：解析失败步占比 <0.5% 的数据源；attempt=本任务内连续失败次数） */
+  | 'parse_fail'
 
 /** 失败三分类（横切约束 3）：agent 失败计入成功率；infra 环境失败单列不计入；product 产品 bug 建 issue */
 export type FailureTriage = 'agent' | 'infra' | 'product'

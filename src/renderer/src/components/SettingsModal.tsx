@@ -472,6 +472,13 @@ export default function SettingsModal(props: {
             </select>
           </div>
           <div className="form-row">
+            <label>Shadow DOM</label>
+            <select value={s.shadowDom === false ? '0' : '1'} onChange={(e) => set({ shadowDom: e.target.value === '1' })}>
+              <option value="1">穿透（默认：组件库表单可见可操作）</option>
+              <option value="0">关闭（回滚 v2.x：shadow 内元素不可见）</option>
+            </select>
+          </div>
+          <div className="form-row">
             <label>时间线截图</label>
             <select
               value={s.timelineShot ?? 'smart'}

@@ -467,14 +467,14 @@ export class Cdp {
    *  loadingFinished/Failed 销账；网络 idle 判定以「白名单在途 = 0」为准（图片/静态资源不卡静默） */
   private netInflight = new Map<
     string,
-    { url: string; method: string; type: string; ts: number; status?: number; finished?: boolean }
+    { url: string; method: string; type: string; ts: number; status?: number; failed?: boolean }
   >()
   /** wait_for network 未来监听（P0-3）：注册后「未来」出现的匹配请求才算等到 */
   private netWaiters: Array<{
     urlPart: string
     method?: string
     since: number
-    resolve: (r: { status: number; url: string; stale: boolean } | null) => void
+    resolve: (r: { status: number; url: string; stale: boolean; failed: boolean } | null) => void
     timer: ReturnType<typeof setTimeout>
   }> = []
 
@@ -551,7 +551,12 @@ export class Cdp {
         if (method === 'Network.loadingFinished' || method === 'Network.loadingFailed') {
           const rec = this.netInflight.get(String(params?.requestId))
           if (rec) {
-            if (method === 'Network.loadingFailed') rec.status = rec.status ?? 0
+            // loadingFailed（网络层中断，status 常为 0）必须与 loadingFinished 区分：
+            // P0-3 要求「loadingFinished 且 2xx」才算等到——failed 由调用方判该步失败
+            if (method === 'Network.loadingFailed') {
+              rec.failed = true
+              rec.status = rec.status ?? 0
+            }
             this.netInflight.delete(String(params?.requestId))
             // wait_for 未来监听：请求「完结」时结账（P0-3：看 loadingFinished 且判 status）
             this.settleNetWaiters(rec)
@@ -573,6 +578,7 @@ export class Cdp {
     method: string
     ts: number
     status?: number
+    failed?: boolean
     type: string
   }): void {
     if (!this.netWaiters.length) return
@@ -585,7 +591,7 @@ export class Cdp {
       const methodOk = !w.method || w.method.toUpperCase() === rec.method.toUpperCase()
       if (methodOk && rec.url.includes(w.urlPart)) {
         clearTimeout(w.timer)
-        w.resolve({ status: rec.status ?? 0, url: rec.url, stale: false })
+        w.resolve({ status: rec.status ?? 0, url: rec.url, stale: false, failed: !!rec.failed })
       } else {
         keep.push(w)
       }
@@ -595,23 +601,26 @@ export class Cdp {
 
   /**
    * wait_for network 未来监听模式（P0-3）：调用时注册 URL 匹配器，等待**未来**出现的
-   * 匹配请求完结（loadingFinished/Failed）并返回其 status——4xx/5xx 由调用方判该步失败。
-   * 超时未出现 → 自动转「查最近 N 条」兜底（stale:true 如实标注兜底来源）；都没有 → null。
+   * 匹配请求完结（loadingFinished/Failed）并返回其 status——非 2xx / 加载失败由调用方判该步失败。
+   * 超时未出现 → 自动转「查最近 N 条」兜底（仅 120s 内的新鲜记录，如实标 stale；
+   * 更早的历史命中与本次动作无关，不算等到）；都没有 → null。
    */
   async waitForResponse(
     match: { urlPart: string; method?: string },
     timeoutMs = 8000
-  ): Promise<{ status: number; url: string; stale: boolean } | null> {
+  ): Promise<{ status: number; url: string; stale: boolean; failed: boolean } | null> {
     this.ensureNetTracking()
     const since = Date.now()
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.netWaiters = this.netWaiters.filter((w) => w.resolve !== done)
-        // 超时兜底：查最近 N 条历史（请求可能在注册前就发出/完结），如实标 stale
-        const hit = [...this.netLog].reverse().find((e) => e.url.includes(match.urlPart))
-        resolve(hit ? { status: hit.status, url: hit.url, stale: true } : null)
+        // 超时兜底：查最近历史（请求可能在注册前就发出/完结），只认 120s 内的新鲜记录，如实标 stale
+        const hit = [...this.netLog]
+          .reverse()
+          .find((e) => e.ts >= since - 120_000 && e.url.includes(match.urlPart))
+        resolve(hit ? { status: hit.status, url: hit.url, stale: true, failed: false } : null)
       }, timeoutMs)
-      const done = (r: { status: number; url: string; stale: boolean } | null) => {
+      const done = (r: { status: number; url: string; stale: boolean; failed: boolean } | null) => {
         clearTimeout(timer)
         resolve(r)
       }
@@ -625,6 +634,10 @@ export class Cdp {
    * 这里只做「多等一会儿」的加速器，超时不判失败。
    */
   async waitNetworkQuiet(quietMs = 300, timeoutMs = 5000): Promise<boolean> {
+    // P0-3 修复：智能等待的网络信号必须可用——此前只有 wait_for network 会开追踪，
+    // 普通任务批后 settle 里本函数因无数据恒立即返回 true（网络静默信号形同虚设）。
+    // 懒开启的盲区仅限「开启前已在飞的请求」（其 requestWillBeSent 未入账），后续批次全量可见
+    this.ensureNetTracking()
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
       const last = this.netActivity.length ? this.netActivity[this.netActivity.length - 1] : 0

@@ -2,7 +2,8 @@
  * 回归模式（--regression）：顺序跑任务型用例（自然语言任务交 AgentRunner）+ 末尾 expect 验收，
  * 失败按 agent/infra/product 三分类出 Markdown 报告（T1 骨架 + T11 fixture 用例）。
  * 运行：npm run regression（构建由 package.json 脚本负责）。
- * 用例 1 = 本地 fixture（同名按钮列表）；用例 2/3 = cases.json 真实站点占位（未配置标 skipped）。
+ * 本地 fixture 用例 9 个（T11：同名列表/遮罩/Shadow 表单/受控组件/虚拟列表/排序重排/懒加载 reflow/提交开新标签/提交 500）；
+ * 真实站点用例走 cases.json（未配置标 skipped）。每例独立页签、例后清场（页签隔离）。
  */
 import { app, BrowserWindow } from 'electron'
 import { copyFileSync, existsSync, readFileSync, readdirSync } from 'fs'
@@ -246,7 +247,10 @@ async function runCase(
   }
 
   if (def.startUrl) {
-    if (!tabManager.active()) tabManager.newTab('about:blank')
+    // 页签隔离（P2-1 修订）：每例新开独立页签，不复用上一例的活动页签——
+    // 用例可能残留新开页签/滚动位置/登录跳转，复用会让下一例从错误落点开始
+    const nt = tabManager.newTab('about:blank')
+    await tabManager.switchTab(nt.activeTabId)
     await tabManager.navigate(def.startUrl)
     await sleep(1500)
   }
@@ -333,6 +337,13 @@ async function runCase(
     result.reason = failReasons.join('；')
     result.triage = captcha ? 'infra' : classifyFailure(result.reason, pageUrl, pageText).triage
   }
+  // 页签隔离（P2-1）：本例结束清场——用例可能新开了页签（submit-newtab 等），
+  // 残留会挤占 MAX_TABS 并污染下一例的起始状态；closeTab 自带「至少保留一个」兜底
+  for (const t of tabManager.all()) {
+    try {
+      tabManager.closeTab(t.id)
+    } catch {}
+  }
   return result
 }
 
@@ -370,15 +381,81 @@ export async function runRegression(): Promise<void> {
     await sleep(1000)
   }
 
-  // 用例 1：本地 fixture（同名按钮列表 → 第 3 行查看）
-  const fixtureCase: RegressionCase = {
-    name: 'fixture-同名按钮列表(第3行查看)',
-    startUrl: `${srv.baseUrl}/same-name-list.html`,
-    task: '点击第 3 行的查看按钮',
-    expects: [{ kind: 'selector_text', selector: '#result', value: '第 3 行' }]
+  // 本地 fixture 用例（T11）：每例一个验收维度，确定性断言，可无人值守；
+  // 未配置 AI 接口时全部标 skipped（任务型用例依赖 LLM）。
+  // 9 例覆盖：同名列表/遮挡/Shadow 表单/受控组件/虚拟列表/排序重排/懒加载 reflow/提交开新标签/提交 500
+  const fixtureCases: RegressionCase[] = [
+    {
+      // P0-1 同名按钮列表：行锚点定位不串行
+      name: 'fixture-同名按钮列表(第3行查看)',
+      startUrl: `${srv.baseUrl}/same-name-list.html`,
+      task: '点击第 3 行的查看按钮',
+      expects: [{ kind: 'selector_text', selector: '#result', value: '第 3 行' }]
+    },
+    {
+      // P1-8 遮挡按钮：首次点击被遮罩吃掉（关遮罩副作用），第二次才生效
+      name: 'fixture-遮罩按钮(确认)',
+      startUrl: `${srv.baseUrl}/masked-button.html`,
+      task: '点击「确认」按钮完成确认（若被遮罩挡住，先想办法处理遮罩再点）',
+      expects: [{ kind: 'selector_text', selector: '#result', value: '确认按钮已点击' }]
+    },
+    {
+      // W5 Shadow DOM：输入框/按钮在 shadow root 内，页面级「提交」读 shadow 值回显
+      name: 'fixture-Shadow表单(输入并提交)',
+      startUrl: `${srv.baseUrl}/shadow-form.html`,
+      task: '在自定义元素表单的订单号输入框输入 TEST-001，然后点击页面上的「提交」按钮',
+      expects: [{ kind: 'selector_text', selector: '#result', value: 'TEST-001' }]
+    },
+    {
+      // 受控组件：直接赋值会被框架复原，必须走原生 setter + input 事件链路
+      name: 'fixture-React受控组件(输入读取)',
+      startUrl: `${srv.baseUrl}/react-controlled.html`,
+      task: '在受控输入框输入 hello-react，然后点击「读取当前值」按钮',
+      expects: [{ kind: 'selector_text', selector: '#result', value: 'hello-react' }]
+    },
+    {
+      // P0-1 虚拟列表：滚动后 DOM 回收重建，行 50 只在滚动后出现
+      name: 'fixture-虚拟列表(选中条目50)',
+      startUrl: `${srv.baseUrl}/virtual-list.html`,
+      task: '在虚拟列表中滚动找到「条目 50」这一行，点击它的「选中」按钮',
+      expects: [{ kind: 'selector_text', selector: '#result', value: '已选中条目 50' }]
+    },
+    {
+      // P0-1 排序重排：先点「排序」打乱 DOM，再点指定行的处理按钮（锚点不串行）
+      name: 'fixture-排序重排(行13处理)',
+      startUrl: `${srv.baseUrl}/list-reorder.html`,
+      task: '先点击「排序」按钮把列表逆序重排，然后点击「行 13」所在行的「处理」按钮',
+      expects: [{ kind: 'selector_text', selector: '#result', value: '已处理行 13' }]
+    },
+    {
+      // P0-1 懒加载 reflow：图片延迟撑高整行，快照后坐标整体漂移——锚文本行操作不串行
+      name: 'fixture-懒加载reflow(G-104购买)',
+      startUrl: `${srv.baseUrl}/lazy-reflow.html`,
+      task: '等页面图片加载稳定后，点击「商品 G-104」所在行的「购买」按钮',
+      expects: [{ kind: 'selector_text', selector: '#result', value: '已购买商品行 4' }]
+    },
+    {
+      // P0-3 提交打开新标签：提交后应在新页签确认结果，而非在旧页误判完成
+      name: 'fixture-提交开新标签(新页确认)',
+      startUrl: `${srv.baseUrl}/submit-newtab.html`,
+      task: '点击「提交」按钮（会打开新标签页），在新打开的页面确认提交成功后结束任务',
+      expects: [
+        { kind: 'url_contains', value: 'ok=1' },
+        { kind: 'text_visible', value: '提交成功' }
+      ]
+    },
+    {
+      // 提交返回 500：模型应如实报告失败，不得脑补成功
+      name: 'fixture-提交500(如实失败)',
+      startUrl: `${srv.baseUrl}/submit-500.html`,
+      task: '在备注输入框填 abc，点击「提交」按钮，然后如实报告提交结果是成功还是失败',
+      expects: [{ kind: 'selector_text', selector: '#result', value: '提交失败' }]
+    }
+  ]
+  for (const c of fixtureCases) {
+    if (noKey) results.push(skipCase(c.name, 'fixture', keySkipReason))
+    else await runOne(c, 'fixture')
   }
-  if (noKey) results.push(skipCase(fixtureCase.name, 'fixture', keySkipReason))
-  else await runOne(fixtureCase, 'fixture')
 
   // 用例 2/3：真实站点占位（cases.json；未配置/未启用标 skipped）
   const config = loadConfigCases()

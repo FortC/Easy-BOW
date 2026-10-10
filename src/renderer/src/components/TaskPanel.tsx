@@ -961,8 +961,23 @@ export default function TaskPanel(props: {
         <span>
           输出 <b>{fmtTok(status.usage.outputTokens)}</b>
         </span>
+        {(status.usage.plannerInputTokens || 0) + (status.usage.plannerOutputTokens || 0) > 0 && (
+          <span title="planner 强推理模型累计消耗（重规划/专家重试；不含在主输入/输出里）">
+            planner{' '}
+            <b>{fmtTok((status.usage.plannerInputTokens || 0) + (status.usage.plannerOutputTokens || 0))}</b>
+          </span>
+        )}
         <span>
-          合计 <b>{fmtTok(status.usage.inputTokens + status.usage.outputTokens)}</b> tokens
+          合计{' '}
+          <b>
+            {fmtTok(
+              status.usage.inputTokens +
+                status.usage.outputTokens +
+                (status.usage.plannerInputTokens || 0) +
+                (status.usage.plannerOutputTokens || 0)
+            )}
+          </b>{' '}
+          tokens
         </span>
         <span>
           步数 <b>{status.stepCount}</b>

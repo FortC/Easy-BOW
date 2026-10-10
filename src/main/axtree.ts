@@ -17,6 +17,8 @@ export interface AxItem {
   h: number
   /** role name（如 "textbox 商品名称"） */
   desc: string
+  /** W4 state 行内：disabled/checked/expanded 等语义状态（仅存在时携带；写入候选并进元素列表行内） */
+  state?: string
 }
 
 /** 保留的可交互 AX 角色（只取有语义名的，避免整棵树噪声） */
@@ -43,8 +45,9 @@ const AX_ROLES = new Set([
  * 取 AX 树并解析为带矩形的语义条目（最多 maxNodes 个盒子查询，分批并行）。
  * DOM.getBoxModel 的坐标与 getBoundingClientRect 可能差一个滚动偏移——
  * 由 annotateWithAx 的名字配对自动校正，这里只负责取原始数据。
+ * W2/W4：上限 80→150（role/name/state 升格为候选定位键与行内状态）、批 10→25、单批超时 5s→3s。
  */
-export async function fetchAxTree(cdp: Cdp, maxNodes = 80): Promise<AxItem[]> {
+export async function fetchAxTree(cdp: Cdp, maxNodes = 150): Promise<AxItem[]> {
   await cdp.send('Accessibility.enable', {})
   let nodes: any[]
   try {
@@ -53,7 +56,7 @@ export async function fetchAxTree(cdp: Cdp, maxNodes = 80): Promise<AxItem[]> {
   } finally {
     cdp.send('Accessibility.disable', {}).catch(() => {})
   }
-  const picked: Array<{ bid: number; role: string; name: string }> = []
+  const picked: Array<{ bid: number; role: string; name: string; state?: string }> = []
   for (const n of nodes) {
     if (!n || n.ignored) continue
     const role = typeof n.role === 'object' && n.role ? String(n.role.value || '') : String(n?.role || '')
@@ -62,19 +65,25 @@ export async function fetchAxTree(cdp: Cdp, maxNodes = 80): Promise<AxItem[]> {
     if (!bid || !role || !AX_ROLES.has(role)) continue
     const nm = normalize(name)
     if (!nm || nm.length > 30) continue
-    picked.push({ bid, role, name: nm })
+    // W4 state 采集：disabled/checked/expanded（浏览器引擎判定，含 aria 与自定义控件语义）
+    const states: string[] = []
+    if (n.disabled === true) states.push('disabled')
+    if (n.checked === true || n.checked === 'mixed') states.push(n.checked === 'mixed' ? '半选' : '已勾选')
+    if (n.expanded === true) states.push('已展开')
+    if (n.expanded === false) states.push('已收起')
+    picked.push({ bid, role, name: nm, state: states.length ? states.join('/') : undefined })
     if (picked.length >= maxNodes) break
   }
   if (!picked.length) return []
 
   const out: AxItem[] = []
-  // 分批并行取盒子（单批 10，避免瞬时塞满 CDP 通道）
-  for (let i = 0; i < picked.length; i += 10) {
-    const batch = picked.slice(i, i + 10)
+  // 分批并行取盒子（W2：单批 25、单批超时 3s——批量 reflow 风险由「只在步首并行段执行」错峰）
+  for (let i = 0; i < picked.length; i += 25) {
+    const batch = picked.slice(i, i + 25)
     const boxes = await Promise.all(
       batch.map((p) =>
         cdp
-          .send<{ content?: number[] }>('DOM.getBoxModel', { backendNodeId: p.bid }, 5000)
+          .send<{ content?: number[] }>('DOM.getBoxModel', { backendNodeId: p.bid }, 3000)
           .then((bm) => ({ p, bm }))
           .catch(() => ({ p, bm: null as { content?: number[] } | null }))
       )
@@ -89,7 +98,7 @@ export async function fetchAxTree(cdp: Cdp, maxNodes = 80): Promise<AxItem[]> {
       const w = Math.max(...xs) - x
       const h = Math.max(...ys) - y
       if (w <= 0 || h <= 0) continue
-      out.push({ x, y, w, h, desc: `${p.role} ${p.name}` })
+      out.push({ x, y, w, h, desc: `${p.role} ${p.name}`, state: p.state })
     }
   }
   return out
@@ -130,12 +139,12 @@ export function annotateWithAx(res: ExtractResult, ax: AxItem[]): number {
     dy /= pairs
   }
 
-  // 3) 就近匹配叠加
+  // 3) 就近匹配叠加。
+  //    W4：state（disabled/checked/expanded）对**所有**几何匹配候选生效——这是文本里没有的新信息，
+  //    已有充足语义线索的候选不重复叠 ax= 文本标签，但 state 照写（元素列表行内渲染 `(disabled)` 等）
   let hits = 0
   for (const c of res.candidates) {
-    if (hits >= 40) break
     const known = normalize(`${c.text}${c.extra}`)
-    if (known.length >= 6) continue // 已有充足语义线索的不重复叠加
     const cx = c.rect.x + c.rect.w / 2
     const cy = c.rect.y + c.rect.h / 2
     let best: AxItem | null = null
@@ -146,10 +155,13 @@ export function annotateWithAx(res: ExtractResult, ax: AxItem[]): number {
         if (!best || item.w * item.h < best.w * best.h) best = item // 最小包含盒最精确
       }
     }
-    if (best && !known.includes(best.desc.split(' ')[1] || '\0')) {
-      const tag = `ax=${best.desc.replace(/\s+/g, '_')}`
-      c.extra = c.extra ? `${c.extra} ${tag}`.slice(0, 200) : tag
-      hits++
+    if (best) {
+      if (best.state && !c.state) c.state = best.state
+      if (hits < 40 && known.length < 6 && !known.includes(best.desc.split(' ')[1] || '\0')) {
+        const tag = `ax=${best.desc.replace(/\s+/g, '_')}`
+        c.extra = c.extra ? `${c.extra} ${tag}`.slice(0, 200) : tag
+        hits++
+      }
     }
   }
   return hits

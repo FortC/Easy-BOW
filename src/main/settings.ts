@@ -33,6 +33,7 @@ const BOOLEANS: Array<keyof Settings> = [
   'smartWait',
   'structuredOut',
   'locatorChain',
+  'shadowDom',
   'reflection',
   'replan',
   'actionVerify'

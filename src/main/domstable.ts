@@ -1,5 +1,7 @@
 /**
- * T2/W1 统一 DOM 变动分类表 + 静默探针（W1 智能等待与 W10 动作后核验共用同一份常量）。
+ * T2/W1 统一 DOM 变动分类表 + 静默探针。
+ * 分类口径约束两处消费方：①W1 settle 探针（本文件注入页面的实现，与下方常量语义同步维护）；
+ * ②W10 动作后核验（runner deltaVerify 经 executor 的 toggle 实时回读对齐同一语义属性口径）。
  *
  * 计入变动：childList/characterData 结构性增删、aria-*、disabled、checked、selected、
  *           value、hidden、role 属性变化；

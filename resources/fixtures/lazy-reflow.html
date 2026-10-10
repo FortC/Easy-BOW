@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>懒加载图片撑高布局</title>
+<style>
+  body { font-family: system-ui, sans-serif; padding: 24px; background: #fafafa; color: #222; }
+  h1 { font-size: 20px; }
+  p { color: #555; }
+  #rows { max-width: 520px; background: #fff; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; }
+  .row { display: flex; align-items: center; gap: 10px; padding: 6px 12px; border-bottom: 1px solid #eee; transition: none; }
+  .row img { width: 40px; height: 30px; object-fit: cover; background: #eee; border-radius: 4px; }
+  .row img.loaded { width: 120px; height: 90px; } /* 图片加载完成后撑高整行——快照后的坐标全部漂移 */
+  .row .lbl { flex: 1; font-size: 14px; }
+  .row button { min-height: 32px; padding: 4px 14px; font-size: 13px; cursor: pointer; }
+  .row.hit { background: #fff7d6; }
+  #result { margin-top: 16px; padding: 12px 14px; background: #eef6ff; border: 1px solid #8cf; border-radius: 6px; min-height: 24px; }
+</style>
+</head>
+<body>
+<h1>懒加载图片撑高布局</h1>
+<p>每行一张延迟加载的图片：占位 30px 高，加载完成后撑到 90px——快照之后的行坐标整体漂移，
+验证重定位不靠过期坐标、锚文本行操作不串行。</p>
+
+<div id="rows"></div>
+
+<div id="result">（结果区）等待操作</div>
+
+<script>
+  var rowsBox = document.getElementById('rows')
+  var nextId = 1
+
+  function makeRow(id) {
+    var row = document.createElement('div')
+    row.className = 'row'
+    row.setAttribute('data-id', String(id))
+    row.innerHTML =
+      '<img alt="商品图">' +
+      '<span class="lbl">商品 G-' + (100 + id) + '（库存 ' + (id * 3) + '）</span>' +
+      '<button type="button" class="act">购买</button>'
+    rowsBox.appendChild(row)
+    // 懒加载：各图延迟不同时间撑高（模拟图片陆续到达），快照后布局持续变化
+    var img = row.querySelector('img')
+    setTimeout(function () {
+      img.src = 'data:image/svg+xml;utf8,' + encodeURIComponent(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="180"><rect width="240" height="180" fill="hsl(' + (id * 37) % 360 + ',70%,80%)"/></svg>'
+      )
+      img.classList.add('loaded')
+    }, 300 + (id % 5) * 250)
+    return row
+  }
+
+  for (var i = 1; i <= 10; i++) makeRow(i)
+
+  document.getElementById('result').textContent = '已生成 10 行（图片陆续加载中）'
+
+  rowsBox.addEventListener('click', function (e) {
+    var btn = e.target.closest('button')
+    if (!btn) return
+    var row = btn.closest('.row')
+    if (!row) return
+    var id = row.getAttribute('data-id')
+    var all = rowsBox.querySelectorAll('.row')
+    for (var k = 0; k < all.length; k++) all[k].classList.remove('hit')
+    row.classList.add('hit')
+    document.getElementById('result').textContent = '已购买商品行 ' + id
+  })
+</script>
+</body>
+</html>

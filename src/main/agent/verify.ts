@@ -35,7 +35,9 @@ export async function verifyNode(opts: {
   forceL2?: boolean
 }): Promise<Verdict> {
   // —— L0：结构化预期的确定性校验 ——
-  const c = opts.node.check
+  // T9 硬门禁补漏（P0-5）：forceL2 时跳过 L0——此前末节点带 check 且确定性命中会直接放行，
+  // 云端 L2 根本不被调用，「重规划任务 done 强制云端 L2」被 L0 短路（跳过率应恒为 0）
+  const c = opts.forceL2 ? undefined : opts.node.check
   if (c) {
     try {
       const negate = !!c.negate

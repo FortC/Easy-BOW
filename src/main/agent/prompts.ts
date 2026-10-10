@@ -47,6 +47,20 @@ export const SYSTEM_PROMPT = `你是 EasyBow，一个浏览器自动化助手。
 16. 多候选优先：能缩小到 2-3 个但无法定夺时，输出 "candidates":[3,7,12]（与 click/type 同用、不填 index），系统会结合语义相似度自动裁决，比你硬选更准
 17. 元素列表末尾的「语义匹配提示」段列出了与任务描述语义相关的元素（含同义词与相似度）：字段名与任务用词不一致时（如任务说"商品名称"而页面叫"品名"）优先从中选择；提示只是参考，仍要结合 role 与页面实际语义确认`
 
+/**
+ * canvas 文档编辑器追加段：仅当提取检测到 canvasEditor（WPS/金山/腾讯文档等正文 canvas 渲染）时拼入。
+ * 豁免视觉模式「禁止坐标点击」的禁令——正文不在元素列表，click_xy 是唯一能点到正文的通道；
+ * 写入走 paste_rich/paste_image（光标处粘贴，无需 index）。
+ */
+export const CANVAS_EDITOR_ADDON = `
+
+## Canvas 文档编辑器（本页正文由 canvas 渲染，优先级高于视觉模式通用规则）
+元素列表里只有工具栏控件，文档正文和光标不在其中、也搜不到，但截图里能看见：
+1. 移动光标/点击正文：用 {"name":"click_xy","x":横坐标,"y":纵坐标}（截图归一化 0~1000；本页豁免「禁止坐标点击」规则）
+2. 写入正文：用 {"name":"paste_rich","text":"Markdown 内容"}（当前光标处粘贴富文本，无需 index）；嵌入图片用 {"name":"paste_image","url":"…"}（无需 index）
+3. 禁止对正文使用 type（canvas 里没有输入元素，必然失败）、禁止点工具栏按钮"找正文"
+4. 本页元素列表变化不能反映正文内容变化（canvas 不进 DOM）——写入是否生效请看截图确认，不要因"页面无变化"提示而重复写入`
+
 /** 视觉模式追加段（开启时拼在 SYSTEM_PROMPT 后；关闭时提示词与上面逐字节一致） */
 export const VISION_ADDON = `
 
@@ -166,8 +180,6 @@ export interface StepContext {
   tried?: string[]
   /** T7 动作后核验反馈（W10；注入动态后缀区；缺省不拼入） */
   deltaHint?: string
-  /** T9 重规划说明（W8；注入动态后缀区；缺省不拼入） */
-  replanNote?: string
 }
 
 /** 测试模式注入的脚本上下文（runner 构造；含当前步骤与其断言的确切 expect 动作） */
@@ -324,9 +336,6 @@ export function buildStepMessage(ctx: StepContext): string {
         .slice(0, 1200)}`
     )
   }
-
-  // T9 重规划（W8）：本次为重规划后的新计划说明
-  if (ctx.replanNote) parts.push(`# 重规划说明\n${ctx.replanNote.slice(0, 600)}`)
 
   // 用户人工指导：放在消息末尾的高优位置（模型对末尾内容注意力最强）
   if (ctx.guidance?.length) {

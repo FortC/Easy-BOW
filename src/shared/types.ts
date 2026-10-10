@@ -71,6 +71,8 @@ export interface Settings {
   structuredOut?: boolean
   /** W4 定位链：元素失效后按定位键/文本/坐标就近重定位（关闭退回旧「全等+序号」仲裁） */
   locatorChain?: boolean
+  /** W5 Shadow DOM 穿透：元素提取递归进入 open shadowRoot（关闭=回滚 v2.x 不可见行为） */
+  shadowDom?: boolean
   /** W7 反思：失败尝试清单注入 + 禁止第 3 次重复同一失败方式 */
   reflection?: boolean
   /** W8 动态重规划：节点连续复核失败时重排剩余节点 */
@@ -123,6 +125,7 @@ export const DEFAULT_SETTINGS: Settings = {
   timelineShot: 'smart',
   structuredOut: true,
   locatorChain: true,
+  shadowDom: true,
   reflection: true,
   replan: true,
   actionVerify: true
@@ -289,6 +292,8 @@ export interface AgentAction {
   query?: string
   /** T8 反思签名（主进程回填）：动作名+目标语义+容器锚文本——失败尝试清单按它去重 */
   failSig?: string
+  /** 主进程回填：本动作目标是提交/保存/删除/支付类（submitish）——W10 delta 核验按它分流强提示 */
+  submitish?: boolean
   /** 执行结果摘要（主进程回填） */
   result?: string
   /** 执行错误（主进程回填） */
@@ -502,7 +507,14 @@ export interface AgentStatus {
   task: string
   stepCount: number
   statusText: string
-  usage: { inputTokens: number; outputTokens: number; steps: number }
+  usage: {
+    inputTokens: number
+    outputTokens: number
+    steps: number
+    /** T10 planner 累计用量（重规划/专家重试；未配置 planner 恒 0/缺省，UI 可分列显示） */
+    plannerInputTokens?: number
+    plannerOutputTokens?: number
+  }
   memory: Record<string, string>
   /** 节点链执行进度（计划失败/复核关闭时缺省） */
   plan?: PlanStatus
