@@ -373,7 +373,7 @@ export default function App() {
       )}
       {viewerMounted && viewer && (
         <div className="img-viewer" onClick={() => setViewer(null)}>
-          <img src={viewer} alt="步骤截图" />
+          <img src={viewer} alt="步骤截图" referrerPolicy="no-referrer" />
         </div>
       )}
       <div className="toasts" role="status" aria-live="polite">

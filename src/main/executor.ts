@@ -912,8 +912,30 @@ export class Executor {
           .catch(() => null as { w: number; h: number } | null)
         const W = vp?.w || 1280
         const H = vp?.h || 720
-        const px = Math.round(nx * W)
-        const py = Math.round(ny * H)
+        let px = Math.round(nx * W)
+        let py = Math.round(ny * H)
+        // v4.1 磁吸校准：模型坐标是「看图估算」，存在系统性小偏移（scrollbar/DPR/密集小图标）——
+        // 本页快照里有中心距离 ≤24px 的候选元素时，吸附到其真实中心再点（rect 来自
+        // getBoundingClientRect，是元素真位置）；canvas 编辑器页无正文候选，跳过
+        let calib = ''
+        const snap0 = this.snapshots.get(t.id)
+        if (snap0 && !snap0.canvasEditor) {
+          let best: { x: number; y: number; d: number; label: string } | null = null
+          for (const c of snap0.candidates) {
+            if (!c.inViewport) continue
+            const cx = c.rect.x + c.rect.w / 2
+            const cy = c.rect.y + c.rect.h / 2
+            const d = Math.hypot(cx - px, cy - py)
+            if (d <= 24 && (!best || d < best.d)) {
+              best = { x: Math.round(cx), y: Math.round(cy), d: Math.round(d), label: (c.text || c.extra || c.role || '').slice(0, 16) }
+            }
+          }
+          if (best) {
+            px = best.x
+            py = best.y
+            calib = `（已校准：吸附到元素「${best.label}」中心，修正 ${best.d}px）`
+          }
+        }
         // T5 坐标命中护栏（诊断信息）：记录最上层命中元素，时间线命中标记 + 点错时可归因
         const hitInfo = await t.cdp
           .evaluate<{ ok: boolean; tag?: string; text?: string }>(HIT_TEST_FN, [px, py])
@@ -948,7 +970,7 @@ export class Executor {
             await this.overlay.click(px, py)
           } catch {}
         }
-        a.result = `按截图坐标点击(${Math.round(a.x)},${Math.round(a.y)}) → 视口(${px},${py})`
+        a.result = `按截图坐标点击(${Math.round(a.x)},${Math.round(a.y)}) → 视口(${px},${py})${calib}`
         return false
       }
       case 'type': {

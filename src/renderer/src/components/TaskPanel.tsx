@@ -994,7 +994,18 @@ export default function TaskPanel(props: {
               <h4>任务记忆（跨页签保持）</h4>
               {Object.entries(status.memory || {}).map(([k, v]) => {
                 const u = v.trim()
-                const isImg = /^https?:\/\/\S+\.(jpe?g|png|webp|gif|bmp)([?#]\S*)?$/i.test(u)
+                // v4.1 图片预览增强：① 单值是 http(s) 任意 URL 或 data:image/ 都尝试预览
+                //（CDN 图常无扩展名/带 query；onError 隐藏——非图片 URL 不裂图）；
+                // ② 长文本里嵌入的多个图片 URL 也逐个出缩略图（extract_images 结果直接 save 的场景）；
+                // ③ no-referrer 过防盗链（多数 CDN 拒绝带外站 referer，允许空 referer）
+                const singleImg = /^(https?:\/\/\S+|data:image\/\S+)$/i.test(u)
+                const embedded =
+                  !singleImg && u.length > 40
+                    ? [...u.matchAll(/https?:\/\/\S+?\.(?:jpe?g|png|webp|gif|bmp)(?:[?#]\S*)?/gi)]
+                        .map((m) => m[0])
+                        .slice(0, 6)
+                    : []
+                const imgSrcs = singleImg ? [u] : embedded
                 return (
                   <div className="mem-row" key={k}>
                     <div className="mem-row-head">
@@ -1019,15 +1030,24 @@ export default function TaskPanel(props: {
                         ⧉ 复制
                       </button>
                     </div>
-                    {isImg && (
-                      <img
-                        className="mem-thumb"
-                        src={u}
-                        alt={k}
-                        loading="lazy"
-                        title="点击查看大图"
-                        onClick={() => props.onShotClick(u)}
-                      />
+                    {imgSrcs.length > 0 && (
+                      <div className="mem-thumbs">
+                        {imgSrcs.map((src, i) => (
+                          <img
+                            key={i}
+                            className="mem-thumb"
+                            src={src}
+                            alt={`${k}-${i + 1}`}
+                            loading="lazy"
+                            referrerPolicy="no-referrer"
+                            title="点击查看大图"
+                            onError={(e) => {
+                              ;(e.target as HTMLImageElement).style.display = 'none'
+                            }}
+                            onClick={() => props.onShotClick(src)}
+                          />
+                        ))}
+                      </div>
                     )}
                     <div className="mem-val" title={v}>
                       {v}

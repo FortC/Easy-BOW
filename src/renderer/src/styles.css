@@ -556,10 +556,12 @@ img.hdrop-fav { object-fit: contain; }
 }
 .mem-copy:hover { border-color: var(--accent); color: var(--accent); }
 .mem-thumb {
-  display: block; margin-top: 5px; max-width: 180px; max-height: 120px;
+  display: block; max-width: 180px; max-height: 120px;
   border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: zoom-in; object-fit: contain;
   background: var(--input-bg);
 }
+/* 多图缩略图行（记忆值里嵌了多个图片 URL 时） */
+.mem-thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 5px; }
 /* 记忆 tab 里滚动即可，不再限高 */
 .tab-mem .mem-section { max-height: none; flex: 1; min-height: 0; padding: 0; }
 

@@ -286,6 +286,10 @@ export class AgentRunner {
   private plannerUsage = { inputTokens: 0, outputTokens: 0 }
   /** T7 动作后核验（W10）：上一批动作（delta 比对输入） */
   private lastBatchActions: AgentAction[] = []
+  /** v4.1 非预期跳转检测（用户提案）：任务起始页 URL（回滚提示里的「初始页面」）；
+   *  lastJumpNotified 防同一跳转重复提醒 */
+  private taskOriginUrl = ''
+  private lastJumpNotified = ''
 
   constructor(tabManager: TabManager, executor: Executor, broadcast: Broadcast) {
     this.tabManager = tabManager
@@ -424,6 +428,9 @@ export class AgentRunner {
     this.expertArmed = false
     this.plannerUsage = { inputTokens: 0, outputTokens: 0 }
     this.lastBatchActions = []
+    // v4.1 非预期跳转检测：记录任务起始页（后续步误触跳转时给模型回滚锚点）
+    this.taskOriginUrl = (this.tabManager.active()?.url || '').slice(0, 300)
+    this.lastJumpNotified = ''
     this.abortCtrl = new AbortController()
     this.pauseRequested = false
     // S0 trace 埋点（设置关闭时完全静默）
@@ -1754,6 +1761,8 @@ export class AgentRunner {
 
       const tab = this.tabManager.active()
       if (!tab) throw new Error('没有可用页签，请新建页签后再开始任务')
+      // v4.1 非预期跳转检测：本步开始时的页面 URL（批后对比用；tab.url 会随导航实时更新，须值拷贝）
+      const stepStartUrl = tab.url || ''
 
       // 0.5 登录态刷新（测试模式 + 开启复用；一次轻量探针，约几十毫秒）
       if (this.testCtx) await this.refreshLoginState()
@@ -2367,6 +2376,41 @@ export class AgentRunner {
         .filter((a) => a.name !== 'done' && a.name !== 'expect' && a.name !== 'test_step_done')
         .map(({ result: _r, error: _e, ...rest }) => rest)
       this.lastBatchActions = executed.filter((a) => a.name !== 'wait')
+
+      // v4.1 非预期跳转检测（用户提案）：同一页签内 URL 变化、且本批没有「导航意图」动作
+      //（goto/back/forward/页签类/submitish）→ 大概率是误触了跳转元素。把「原 URL + 任务起始页」
+      // 告知模型，由模型判断回滚（goto 返回）还是继续（打开新页面本就是本步目的）——不自动回滚，
+      // 因为列表翻页/详情跳转也是普通 click 触发的合法 URL 变化。同一跳转只提醒一次
+      try {
+        const nowTab = this.tabManager.active()
+        const nowUrl = nowTab?.url || ''
+        const navIntent = executed.some(
+          (a) =>
+            ['goto', 'back', 'forward', 'new_tab', 'close_tab', 'switch_tab'].includes(a.name) || a.submitish === true
+        )
+        if (
+          nowTab &&
+          nowTab.id === tab.id &&
+          stepStartUrl &&
+          nowUrl &&
+          !navIntent &&
+          nowUrl.split('#')[0] !== stepStartUrl.split('#')[0] &&
+          this.lastJumpNotified !== nowUrl
+        ) {
+          this.lastJumpNotified = nowUrl
+          this.telemetry.log('friction', stepN, {
+            kind: 'url_jump',
+            from: stepStartUrl.slice(0, 150),
+            to: nowUrl.slice(0, 150)
+          })
+          this.lastResults.push(
+            `系统提示: 页面发生了跳转：${stepStartUrl.slice(0, 120)} → ${nowUrl.slice(0, 120)}。` +
+              `若这不是任务预期（可能误触了跳转元素/广告位），请用 {"name":"goto","url":"${stepStartUrl.slice(0, 300)}"} 返回原页面后继续任务` +
+              `${this.taskOriginUrl && this.taskOriginUrl !== stepStartUrl ? `（任务起始页：${this.taskOriginUrl.slice(0, 120)}）` : ''}；` +
+              `若打开新页面正是本步骤的目的，请忽略本提示继续。`
+          )
+        }
+      } catch {}
 
       // S2 失败分类学：先维护「同一动作连续失败」计数（loop 判定），再七类归因→分类自愈
       const failNames = executed.filter((a) => a.error).map((a) => a.name)
