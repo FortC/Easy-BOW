@@ -1,5 +1,11 @@
 # Changelog
 
+## [4.3.2] - 2026-10-11
+
+### 4.3.1 打包回归修复
+
+- **修复「timeout must be an integer」导致所有模型调用失败**：4.3.1 给模型请求选项显式传了 `timeout: undefined`，SDK 校验不接受显式 undefined（非纯文本调用全部中招，测试连接/任务执行均报「模型调用失败: timeout must be an integer」）。现改为仅纯文本调用才带 timeout，普通调用恢复原行为
+
 ## [4.3.1] - 2026-10-11
 
 ### 节点链规划失败根因修复（结构化 schema 错配 + 推理模型输出截断）

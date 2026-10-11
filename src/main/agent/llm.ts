@@ -103,7 +103,9 @@ export class OpenAIProvider implements LlmProvider {
       if (fmt) req.response_format = fmt
       return req
     }
-    const reqOpts = { signal, timeout: opts?.plain ? PLAIN_TIMEOUT_MS : undefined }
+    // timeout 只在 plain 调用时才带上：显式传 undefined 会被 SDK 校验为「timeout must be an integer」
+    const reqOpts: any = { signal }
+    if (opts?.plain) reqOpts.timeout = PLAIN_TIMEOUT_MS
     const finish = (res: any, structured: StructuredSupport): LlmResult => {
       const text = res.choices?.[0]?.message?.content || ''
       return {
@@ -183,7 +185,9 @@ export class AnthropicProvider implements LlmProvider {
       max_tokens: opts?.maxTokens ?? 2048,
       temperature: 0.2
     }
-    const reqOpts = { signal, timeout: opts?.plain ? PLAIN_TIMEOUT_MS : undefined }
+    // timeout 只在 plain 调用时才带上：显式传 undefined 会被 SDK 校验为「timeout must be an integer」
+    const reqOpts: any = { signal }
+    if (opts?.plain) reqOpts.timeout = PLAIN_TIMEOUT_MS
     const finishText = (res: any, structured: StructuredSupport): LlmResult => {
       const text = (res.content || [])
         .filter((b: any) => b.type === 'text')
