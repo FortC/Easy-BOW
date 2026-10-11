@@ -34,7 +34,14 @@ export const PLAN_SYSTEM_PROMPT = `你是浏览器自动化任务的规划器。
 4. 纯查询/单步任务可只给 1 个节点`
 
 export function parsePlan(text: string): PlanNode[] | null {
-  let t = text.trim().replace(/```(?:json)?/gi, '')
+  // 推理模型常把 <think>…</think> 思考写进 content：先剥完整思考块，
+  // 再截掉未闭合的 <think> 尾巴（输出被截断只剩思考开头时其后没有 JSON，思考文本里的 { 会破坏切片范围）
+  let t = text
+    .trim()
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/```(?:json)?/gi, '')
+  const unclosed = t.search(/<think[^>]*>/i)
+  if (unclosed !== -1) t = t.slice(0, unclosed)
   const start = t.indexOf('{')
   const end = t.lastIndexOf('}')
   if (start === -1 || end <= start) return null

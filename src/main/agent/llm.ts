@@ -35,10 +35,25 @@ export interface LlmResult {
 }
 
 export interface LlmProvider {
-  chat(system: string, messages: ChatMessage[], signal?: AbortSignal): Promise<LlmResult>
+  chat(system: string, messages: ChatMessage[], signal?: AbortSignal, opts?: ChatOpts): Promise<LlmResult>
+}
+
+/**
+ * 调用级选项：
+ * - plain：纯文本模式——不带 step 结构化输出（Anthropic tool_use / OpenAI response_format）。
+ *   规划/重规划/L2 复核的输出形状是 {nodes}/{pass}，与 STEP_SCHEMA（thought/actions/node_done）不匹配，
+ *   强制 step 工具会让 parsePlan 永远解析不到 nodes（规划必失败的根因之一）。
+ * - maxTokens：输出上限（默认 2048）。推理模型思考计入输出，规划类调用需给更大余量，
+ *   否则思考吃满预算、JSON 被截断。
+ */
+export interface ChatOpts {
+  plain?: boolean
+  maxTokens?: number
 }
 
 const TIMEOUT_MS = 90000
+/** 纯文本调用（规划/复核）的请求超时：推理模型长思考 + 更大 max_tokens，90s 偏紧 */
+const PLAIN_TIMEOUT_MS = 180000
 
 /** 1x1 PNG 测试图（llm:test 探测模型是否接受图片输入用） */
 export const TINY_TEST_IMAGE =
@@ -73,7 +88,7 @@ export class OpenAIProvider implements LlmProvider {
     this.settings = settings
   }
 
-  async chat(system: string, messages: ChatMessage[], signal?: AbortSignal): Promise<LlmResult> {
+  async chat(system: string, messages: ChatMessage[], signal?: AbortSignal, opts?: ChatOpts): Promise<LlmResult> {
     // 基础请求体与旧版逐字节一致；response_format 仅在结构化启用时才附加
     const buildReq = (fmt: any): any => {
       const req: any = {
@@ -83,11 +98,12 @@ export class OpenAIProvider implements LlmProvider {
           ...messages.map((m) => ({ role: m.role, content: toOpenAiContent(m.content) }))
         ],
         temperature: 0.2,
-        max_tokens: 2048
+        max_tokens: opts?.maxTokens ?? 2048
       }
       if (fmt) req.response_format = fmt
       return req
     }
+    const reqOpts = { signal, timeout: opts?.plain ? PLAIN_TIMEOUT_MS : undefined }
     const finish = (res: any, structured: StructuredSupport): LlmResult => {
       const text = res.choices?.[0]?.message?.content || ''
       return {
@@ -100,27 +116,28 @@ export class OpenAIProvider implements LlmProvider {
       }
     }
 
-    // W3 结构化输出：关闭或探测不支持时走纯文本（请求体与现状逐字节一致）
-    const mode = this.settings.structuredOut !== false ? await probeStructuredSupport(this.settings) : 'none'
+    // W3 结构化输出：关闭/纯文本调用/探测不支持时走纯文本（请求体与现状逐字节一致）
+    const mode =
+      opts?.plain || this.settings.structuredOut === false ? 'none' : await probeStructuredSupport(this.settings)
     if (mode === 'none') {
-      const res = await this.client.chat.completions.create(buildReq(undefined), { signal })
+      const res = await this.client.chat.completions.create(buildReq(undefined), reqOpts)
       return finish(res, 'none')
     }
     try {
-      const res = await this.client.chat.completions.create(buildReq(responseFormatFor(mode)), { signal })
+      const res = await this.client.chat.completions.create(buildReq(responseFormatFor(mode)), reqOpts)
       return finish(res, mode)
     } catch (e) {
       if (!isResponseFormatError(e)) throw e
       // response_format 不支持/参数错：缓存降级一档，原参数（其余不变）重试一次
       const m2 = downgradeStructured(this.settings)
       try {
-        const res = await this.client.chat.completions.create(buildReq(responseFormatFor(m2)), { signal })
+        const res = await this.client.chat.completions.create(buildReq(responseFormatFor(m2)), reqOpts)
         return finish(res, m2)
       } catch (e2) {
         if (m2 === 'none') throw e2
         // 重试仍失败：按原有纯文本行为返回
         forceStructuredNone(this.settings)
-        const res = await this.client.chat.completions.create(buildReq(undefined), { signal })
+        const res = await this.client.chat.completions.create(buildReq(undefined), reqOpts)
         return finish(res, 'none')
       }
     }
@@ -157,15 +174,16 @@ export class AnthropicProvider implements LlmProvider {
     this.settings = settings
   }
 
-  async chat(system: string, messages: ChatMessage[], signal?: AbortSignal): Promise<LlmResult> {
+  async chat(system: string, messages: ChatMessage[], signal?: AbortSignal, opts?: ChatOpts): Promise<LlmResult> {
     // 基础请求体与旧版逐字节一致（system 保留 cache_control 提示词缓存，与 tool_use 兼容）
     const baseReq: any = {
       model: this.model,
       system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
       messages: messages.map((m) => ({ role: m.role, content: toAnthropicContent(m.content) })),
-      max_tokens: 2048,
+      max_tokens: opts?.maxTokens ?? 2048,
       temperature: 0.2
     }
+    const reqOpts = { signal, timeout: opts?.plain ? PLAIN_TIMEOUT_MS : undefined }
     const finishText = (res: any, structured: StructuredSupport): LlmResult => {
       const text = (res.content || [])
         .filter((b: any) => b.type === 'text')
@@ -178,10 +196,11 @@ export class AnthropicProvider implements LlmProvider {
       }
     }
 
-    // W3 结构化输出：关闭或已标记 tool_use 不可用时走纯文本（请求体与现状逐字节一致）
-    const useTool = this.settings.structuredOut !== false && isToolUseAvailable(this.settings)
+    // W3 结构化输出：关闭/纯文本调用/已标记 tool_use 不可用时走纯文本（请求体与现状逐字节一致）。
+    // plain 门禁在最前：规划/复核类调用的输出形状与 STEP_SCHEMA 不匹配，绝不能带 step 工具
+    const useTool = !opts?.plain && this.settings.structuredOut !== false && isToolUseAvailable(this.settings)
     if (!useTool) {
-      const res = await this.client.messages.create(baseReq, { signal })
+      const res = await this.client.messages.create(baseReq, reqOpts)
       return finishText(res, 'none')
     }
     try {
@@ -198,7 +217,7 @@ export class AnthropicProvider implements LlmProvider {
           ],
           tool_choice: { type: 'tool', name: 'submit_step' }
         },
-        { signal }
+        reqOpts
       )
       const toolBlock = (res.content || []).find((b: any) => b.type === 'tool_use')
       if (toolBlock && toolBlock.input != null) {
@@ -214,7 +233,7 @@ export class AnthropicProvider implements LlmProvider {
       if (!isToolUseCompatError(e)) throw e
       // tool_use/中转兼容性报错：标记该 baseURL|model 不再带 tools，降回纯文本重试一次
       markToolUseUnavailable(this.settings)
-      const res = await this.client.messages.create(baseReq, { signal })
+      const res = await this.client.messages.create(baseReq, reqOpts)
       return finishText(res, 'none')
     }
   }

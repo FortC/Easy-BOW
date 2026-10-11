@@ -1307,13 +1307,17 @@ export class AgentRunner {
   private async buildPlan(task: string, provider: LlmProvider, epoch: number): Promise<void> {
     let nodes: PlanNode[] | null = null
     let lastErr = ''
+    let lastRaw = ''
     for (let attempt = 0; attempt < 2 && !nodes; attempt++) {
       try {
         this.setState({ statusText: attempt === 0 ? '规划任务节点链…' : '节点链规划失败，重试…' })
+        // plain：输出形状是 {nodes}，与 STEP_SCHEMA 不匹配，不能带 step 结构化输出；
+        // maxTokens 6144：推理模型思考计入输出，2048 会被思考吃满、JSON 截断（tokensOut==max 的根因）
         const out = await provider.chat(
           PLAN_SYSTEM_PROMPT,
           [{ role: 'user', content: task.slice(0, 2000) }],
-          this.abortCtrl!.signal
+          this.abortCtrl!.signal,
+          { plain: true, maxTokens: 6144 }
         )
         if (epoch !== this.epoch) return
         this.setState({
@@ -1323,6 +1327,7 @@ export class AgentRunner {
             outputTokens: this.state.usage.outputTokens + out.usage.outputTokens
           }
         })
+        lastRaw = out.text
         nodes = parsePlan(out.text)
         if (!nodes) lastErr = '模型输出不是合法的节点 JSON'
       } catch (e: any) {
@@ -1333,6 +1338,8 @@ export class AgentRunner {
     }
     if (epoch !== this.epoch) return
     if (!nodes || !nodes.length) {
+      // 规划失败此前无任何 trace 事件，只能靠 usage 反推；记 lastErr + 原始输出片段便于回溯
+      this.telemetry.log('failure', 0, { kind: 'plan_fail', err: lastErr, raw: lastRaw.slice(0, 200) })
       this.broadcast({
         channel: 'toast',
         message: `节点链规划失败（${lastErr || '未知原因'}），本次退化为逐步执行、不做节点复核`,
@@ -1639,7 +1646,11 @@ export class AgentRunner {
     let nodes: PlanNode[] | null = null
     for (let attempt = 0; attempt < 2 && !nodes; attempt++) {
       try {
-        const out = await useProvider.chat(REPLAN_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], this.abortCtrl!.signal)
+        // plain + 大 maxTokens：重规划输出 {nodes}，与 step 结构化不匹配且推理模型思考需余量（同 buildPlan）
+        const out = await useProvider.chat(REPLAN_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], this.abortCtrl!.signal, {
+          plain: true,
+          maxTokens: 6144
+        })
         if (epoch !== this.epoch) return
         nodes = parsePlan(out.text)
         // T10 token 分列：配置了独立 planner 时，重规划调用归入 planner 用量（telemetry + UI 分列）

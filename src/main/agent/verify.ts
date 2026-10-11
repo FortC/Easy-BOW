@@ -119,7 +119,11 @@ export async function verifyNode(opts: {
     // 云端复核失败先重试一次再降级：接口抖动一次就无条件放行 = 复核形同虚设（复核 P1-12）
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const out = await opts.provider.chat(VERIFY_SYSTEM_PROMPT, [{ role: 'user', content: judgePrompt }])
+        // plain：复核输出 {"pass":...}，与 step 结构化形状不匹配，不能带 submit_step 工具（否则全判 uncertain）
+        const out = await opts.provider.chat(VERIFY_SYSTEM_PROMPT, [{ role: 'user', content: judgePrompt }], undefined, {
+          plain: true,
+          maxTokens: 4096
+        })
         const v = parseJudge(out.text)
         if (v.pass === true) return { passed: true, source: 'l2', reason: v.reason ? `大模型复核通过（${v.reason}）` : '大模型复核通过' }
         if (v.pass === false)

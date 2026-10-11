@@ -1350,10 +1350,21 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
       const { parsePlan } = await import('./agent/plan')
       const planOk = parsePlan('```json\n{"nodes":[{"intent":"搜索","expected":"出现结果列表","check":{"kind":"text_visible","value":"结果"}},{"intent":"记录","expected":"存入记忆"}]}\n```')
       const planBad = parsePlan('这不是 JSON')
+      // 推理模型思考剥离：完整 <think> 块剥掉后 JSON 仍可解析；未闭合思考尾巴截断时不得把思考里的 { 当 JSON
+      const planThink = parsePlan(
+        '<think>用户要搜索，{我需要先想}一下分几步</think>\n{"nodes":[{"intent":"搜索","expected":"出现结果"}]}'
+      )
+      const planTrunc = parsePlan('<think>先把任务{拆成}几步，首先')
       check(
         '节点计划解析(parsePlan)',
-        !!planOk && planOk.length === 2 && planOk[0].check?.kind === 'text_visible' && !planBad,
-        `节点数=${planOk?.length} check=${planOk?.[0]?.check?.kind || '无'} 非法输入=${!planBad}`
+        !!planOk &&
+          planOk.length === 2 &&
+          planOk[0].check?.kind === 'text_visible' &&
+          !planBad &&
+          !!planThink &&
+          planThink.length === 1 &&
+          !planTrunc,
+        `节点数=${planOk?.length} check=${planOk?.[0]?.check?.kind || '无'} 非法输入=${!planBad} think剥离=${!!planThink} 截断思考=${!planTrunc}`
       )
 
       // 10.2d 模板自动变量解析（纯函数；{{记忆键}} 不是变量不得误替换）
