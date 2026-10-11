@@ -8,6 +8,7 @@ import {
   Pause,
   PenLine,
   Play,
+  ScrollText,
   Sparkles,
   Square,
   Timer,
@@ -127,6 +128,41 @@ const STATE_LABEL: Record<string, string> = {
   stopped: '已停止'
 }
 
+/** v4.3 耗时格式：890ms / 5.3s / 2分31秒 */
+function fmtDur(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return ''
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
+  const m = Math.floor(ms / 60_000)
+  const sec = Math.round((ms % 60_000) / 1000)
+  return sec ? `${m}分${sec}秒` : `${m}分钟`
+}
+
+/** v4.3 HH:mm:ss */
+function fmtClock(ts: number): string {
+  const d = new Date(ts)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+/** v4.3 单步六段耗时汇总 */
+function stepDur(s: StepRecord): number {
+  const t = s.timings
+  if (!t) return 0
+  return ['extractMs', 'axMs', 'llmMs', 'actMs', 'settleMs', 'shotMs'].reduce((acc, k) => acc + ((t as any)[k] || 0), 0)
+}
+
+/** v4.3 分段明细 tooltip */
+function stepDurTip(s: StepRecord): string {
+  const t = s.timings
+  if (!t) return ''
+  const segs: Array<[string, number]> = [
+    ['提取', t.extractMs || 0], ['AX', t.axMs || 0], ['模型', t.llmMs || 0],
+    ['动作', t.actMs || 0], ['等待', t.settleMs || 0], ['截图', t.shotMs || 0]
+  ]
+  return `本步耗时分解：${segs.filter(([, v]) => v > 0).map(([k, v]) => `${k} ${Math.round(v)}ms`).join(' · ')}`
+}
+
 export default function TaskPanel(props: {
   status: AgentStatus
   steps: StepRecord[]
@@ -148,6 +184,8 @@ export default function TaskPanel(props: {
   const [hist, setHist] = useState<HistItem[]>(loadHist)
   const [expandedTs, setExpandedTs] = useState<number | null>(null)
   const [askDone, setAskDone] = useState<{ task: string; key: string } | null>(null)
+  // v4.3 日志页：仅看异常筛选
+  const [logOnlyErr, setLogOnlyErr] = useState(false)
   const timelineRef = useRef<HTMLDivElement>(null)
   const running = status.state === 'running' || status.state === 'paused' || status.state === 'captcha'
   const paused = status.state === 'paused' || status.state === 'captcha'
@@ -173,7 +211,7 @@ export default function TaskPanel(props: {
   const [enhancing, setEnhancing] = useState(false)
   const [enhancedOrig, setEnhancedOrig] = useState<string | null>(null)
   // 面板 tab：任务（输入/模板/历史）/ 执行（人工介入/状态/节点/时间线）/ 记忆
-  const [tab, setTab] = useState<'task' | 'run' | 'mem'>('task')
+  const [tab, setTab] = useState<'task' | 'run' | 'mem' | 'log'>('task')
   // 任务启动/暂停/需人工时自动切到「执行」tab（看进度、做人工介入）
   useEffect(() => {
     if (status.state === 'running' || status.state === 'paused' || status.state === 'captcha') setTab('run')
@@ -377,6 +415,51 @@ export default function TaskPanel(props: {
     setAskDone({ task: status.task, key })
   }, [status.state, status.task])
 
+  /** v4.3 导出任务日志（文本）：任务信息 + 每步时间/耗时分解/动作与结果 */
+  const exportLog = () => {
+    const L: string[] = []
+    L.push('EasyBow 任务日志')
+    L.push(`导出时间: ${new Date().toLocaleString('zh-CN', { hour12: false })}`)
+    if (status.task) L.push(`任务: ${status.task.replace(/\n/g, ' ').slice(0, 300)}`)
+    L.push(
+      `状态: ${status.state}${status.totalMs ? ` · 总耗时 ${fmtDur(status.totalMs)}` : ''} · 步数 ${props.steps.filter((x) => !x.userGuidance).length} · tokens ↑${status.usage.inputTokens} ↓${status.usage.outputTokens}`
+    )
+    L.push('='.repeat(60))
+    for (const s of props.steps) {
+      if (s.userGuidance) {
+        L.push(`[${fmtClock(s.ts)}] 🧑 用户指导: ${s.thought.slice(0, 120)}`)
+        continue
+      }
+      const d = stepDur(s)
+      const t = s.timings
+      const segs = t
+        ? [
+            ['提取', t.extractMs],
+            ['AX', t.axMs],
+            ['模型', t.llmMs],
+            ['动作', t.actMs],
+            ['等待', t.settleMs],
+            ['截图', t.shotMs]
+          ]
+            .filter(([, v]) => v)
+            .map(([k, v]) => `${k} ${Math.round(v as number)}ms`)
+            .join(' ')
+        : ''
+      L.push(`#${s.n} ${fmtClock(s.ts)}${d ? ` 耗时 ${fmtDur(d)}` : ''}${segs ? `（${segs}）` : ''}`)
+      if (s.thought) L.push(`  思考: ${s.thought.slice(0, 160)}`)
+      for (const a of s.actions) {
+        L.push(`  ${a.name}${a.index != null ? `[${a.index}]` : ''} → ${a.error ? '⚠ ' + a.error : (a.result || '').slice(0, 120)}`)
+      }
+    }
+    const blob = new Blob([L.join('\n')], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `easybow-log-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-')}.txt`
+    a.click()
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+
   const answerFeedback = (fb: 'good' | 'bad') => {
     setAskDone(null)
     setHist((h) => {
@@ -483,6 +566,14 @@ export default function TaskPanel(props: {
           {Object.keys(status.memory || {}).length > 0 && (
             <span className="panel-tab-count">{Object.keys(status.memory || {}).length}</span>
           )}
+        </button>
+        <button
+          className={`panel-tab-btn${tab === 'log' ? ' active' : ''}`}
+          role="tab"
+          aria-selected={tab === 'log'}
+          onClick={() => setTab('log')}
+        >
+          <ScrollText size={13} strokeWidth={2} /> 日志
         </button>
       </div>
 
@@ -895,6 +986,14 @@ export default function TaskPanel(props: {
                   <span className="step-tab" title={s.url}>
                     {s.tabTitle.slice(0, 16) || '页面'}
                   </span>
+                  {(() => {
+                    const d = stepDur(s)
+                    return d > 0 ? (
+                      <span className="step-dur" title={stepDurTip(s)}>
+                        ⏱ {fmtDur(d)}
+                      </span>
+                    ) : null
+                  })()}
                   {s.vision && (
                     <span className="step-vision" title="本步模型收到了页面视口截图（视觉模式）">
                       <Eye size={11} strokeWidth={2} />
@@ -982,6 +1081,11 @@ export default function TaskPanel(props: {
         <span>
           步数 <b>{status.stepCount}</b>
         </span>
+        {status.totalMs ? (
+          <span title={`任务从 ${status.startedAt ? fmtClock(status.startedAt) : ''} 开始，含等待与暂停的墙钟总时长`}>
+            总耗时 <b>{fmtDur(status.totalMs)}</b>
+          </span>
+        ) : null}
       </div>
 
       </div>
@@ -1062,6 +1166,69 @@ export default function TaskPanel(props: {
         </div>
       )}
 
+      {tab === 'log' && (
+        <div className="panel-tab tab-log" role="tabpanel">
+          <div className="log-toolbar">
+            <label className="log-filter" title="只显示有错误动作或被拦截的步骤">
+              <input
+                type="checkbox"
+                checked={logOnlyErr}
+                onChange={(e) => setLogOnlyErr(e.target.checked)}
+              />
+              仅看异常
+            </label>
+            <span className="log-summary" title="工作耗时=各步六段耗时之和；不含任务暂停等空闲时间">
+              共 {props.steps.filter((s) => !s.userGuidance).length} 步
+              {(() => {
+                const work = props.steps.reduce((acc, s) => acc + stepDur(s), 0)
+                return work > 0 ? ` · 工作耗时 ${fmtDur(work)}` : ''
+              })()}
+              {status.totalMs ? ` · 总耗时 ${fmtDur(status.totalMs)}` : ''}
+            </span>
+            <button className="btn log-export" onClick={exportLog} title="导出为文本文件（含每步耗时分解）">
+              ⭳ 导出日志
+            </button>
+          </div>
+          {props.steps.length === 0 ? (
+            <div className="log-empty">任务启动后，每步的时间与动作明细会记录在这里</div>
+          ) : (
+            <div className="log-list">
+              {props.steps
+                .filter((s) => !logOnlyErr || (!s.userGuidance && s.actions.some((a) => a.error)))
+                .map((s) => {
+                  const d = stepDur(s)
+                  return (
+                    <div key={s.n + '-' + s.ts} className={`log-entry${s.actions.some((a) => a.error) ? ' has-err' : ''}`}>
+                      <div className="log-entry-head">
+                        <span className="log-n">#{s.n}</span>
+                        <span className="log-time">{fmtClock(s.ts)}</span>
+                        {d > 0 && (
+                          <span className="log-dur" title={stepDurTip(s)}>
+                            ⏱ {fmtDur(d)}
+                          </span>
+                        )}
+                        {s.nodeIdx ? <span className="log-node">N{s.nodeIdx}</span> : null}
+                        {s.vision ? <span title="视觉模式步">👁</span> : null}
+                        {s.local ? <span title="本地快速决策直出">⚡</span> : null}
+                        {s.tokens ? <span className="log-tok">↑{fmtTok(s.tokens.input)} ↓{fmtTok(s.tokens.output)}</span> : null}
+                      </div>
+                      {s.thought && <div className="log-thought">{s.thought}</div>}
+                      {s.actions.map((a, i) => (
+                        <div key={i} className={`log-action${a.error ? ' err' : ''}`}>
+                          <span className="log-act-name">{a.name}{a.index != null ? `[${a.index}]` : ''}</span>
+                          <span className="log-act-result" title={a.error || a.result || ''}>
+                            {a.error ? `⚠ ${a.error}` : a.result || ''}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )
+                })}
+            </div>
+          )}
+        </div>
+      )}
+
       {askDone && (
         <div className="fb-mask" onClick={() => setAskDone(null)}>
           <div
@@ -1078,6 +1245,13 @@ export default function TaskPanel(props: {
             <div className="fb-task" title={askDone.task}>
               {askDone.task.slice(0, 80)}
             </div>
+            {status.totalMs ? (
+              <div className="fb-stats">
+                ⏱ 总耗时 <b>{fmtDur(status.totalMs)}</b> · {status.stepCount} 步
+                {status.stepCount > 1 && status.totalMs > 0 ? ` · 平均 ${fmtDur(status.totalMs / status.stepCount)}/步` : ''}
+                {' · '}↑{fmtTok(status.usage.inputTokens)} ↓{fmtTok(status.usage.outputTokens)} tokens
+              </div>
+            ) : null}
             <div className="fb-q">实际结果正确吗？（用于统计任务正确率）</div>
             <div className="fb-ops">
               <button className="btn mini good" onClick={() => answerFeedback('good')}>

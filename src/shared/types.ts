@@ -524,6 +524,10 @@ export interface AgentStatus {
   result?: string
   /** 已排队未注入给模型的人工指导条数 */
   pendingGuidance?: number
+  /** v4.3 日志/耗时：任务启动时间戳（完成时算总耗时用） */
+  startedAt?: number
+  /** v4.3：任务总耗时（done/error/stopped/exhausted 时由 runner 回填） */
+  totalMs?: number
 }
 
 /** 本地快速决策模型状态（混合模式） */

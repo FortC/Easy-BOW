@@ -98,6 +98,15 @@ function assertionToAction(asrt: TestAssertion): AgentAction {
   }
 }
 
+/** v4.3 任务总耗时的友好格式（完成 toast/状态用）：890ms / 5.3s / 2分31秒 */
+function fmtTaskDur(ms: number): string {
+  if (ms < 1000) return `${ms}ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
+  const m = Math.floor(ms / 60_000)
+  const sec = Math.round((ms % 60_000) / 1000)
+  return sec ? `${m}分${sec}秒` : `${m}分钟`
+}
+
 /**
  * 动作必填参数校验（参数契约前置拦截）：缺参动作不进执行批，直接标错误给模型——
  * 此前「click 无 index」要走到执行器才报错，每次白烧一步模型调用（WPS 任务 trace：6 次）。
@@ -290,6 +299,8 @@ export class AgentRunner {
    *  lastJumpNotified 防同一跳转重复提醒 */
   private taskOriginUrl = ''
   private lastJumpNotified = ''
+  /** v4.3 日志/耗时：任务启动时刻（完成时算总耗时） */
+  private taskStartedAt = 0
 
   constructor(tabManager: TabManager, executor: Executor, broadcast: Broadcast) {
     this.tabManager = tabManager
@@ -445,6 +456,7 @@ export class AgentRunner {
     if (settings.structuredOut !== false) {
       probeStructuredSupport(settings).catch(() => undefined)
     }
+    this.taskStartedAt = Date.now()
     this.setState({
       state: 'running',
       task,
@@ -453,7 +465,9 @@ export class AgentRunner {
       usage: { inputTokens: 0, outputTokens: 0, steps: 0 },
       memory: {},
       plan: undefined,
-      result: undefined
+      result: undefined,
+      startedAt: this.taskStartedAt,
+      totalMs: undefined
     })
     // 异步跑循环，startTask 立即返回
     // 原生弹窗（confirm/alert）自动应答：弹窗会阻塞页面 JS 与 CDP evaluate（任务挂死），
@@ -481,7 +495,7 @@ export class AgentRunner {
             this.broadcast({ channel: 'step', step: ds })
           }
         } catch {}
-        this.setState({ state: 'error', statusText: `任务异常: ${msg}` })
+        this.setState({ state: 'error', statusText: `任务异常: ${msg}`, totalMs: this.taskStartedAt ? Date.now() - this.taskStartedAt : undefined })
         this.broadcast({ channel: 'toast', message: `任务异常: ${msg}`, kind: 'error' })
         // 经验负反馈（P1-12）：异常收尾也是「命中经验但没跑成」，相关经验降分才可被淘汰
         try {
@@ -1172,7 +1186,7 @@ export class AgentRunner {
     const ws = this.resumeWaiters
     this.resumeWaiters = []
     ws.forEach((w) => w())
-    this.setState({ state: 'stopped', statusText: '已停止' })
+    this.setState({ state: 'stopped', statusText: '已停止', totalMs: this.taskStartedAt ? Date.now() - this.taskStartedAt : undefined })
     // 立即收尾测试状态：loop 可能卡在不可中断的 CDP/模型调用上（要等它自然退出才收尾的话，
     // UI 会一直停在「执行中」，且「运行」按钮被禁用 → 表现为点运行没反应）
     if (this.testCtx) this.finishTest(this.testCtx.epoch)
@@ -1747,7 +1761,8 @@ export class AgentRunner {
         this.setState({
           state: 'done',
           statusText: `已达到最大步数 ${maxSteps}，任务结束`,
-          result: diagText
+          result: diagText,
+          totalMs: this.taskStartedAt ? Date.now() - this.taskStartedAt : undefined
         })
         return
       }
@@ -2684,9 +2699,12 @@ export class AgentRunner {
           state: 'done',
           statusText: '任务完成',
           result: doneAction.result || doneAction.value || '任务完成',
-          stepCount: this.steps.length
+          stepCount: this.steps.length,
+          totalMs: this.taskStartedAt ? Date.now() - this.taskStartedAt : undefined
         })
-        this.broadcast({ channel: 'toast', message: `任务完成：${(doneAction.result || '').slice(0, 80)}`, kind: 'success' })
+        // v4.3：完成 toast 带总耗时（面板 usage-bar 与日志页也有明细）
+        const totalTxt = this.taskStartedAt ? `（总耗时 ${fmtTaskDur(Date.now() - this.taskStartedAt)}）` : ''
+        this.broadcast({ channel: 'toast', message: `任务完成${totalTxt}：${(doneAction.result || '').slice(0, 80)}`, kind: 'success' })
         return
       }
 
