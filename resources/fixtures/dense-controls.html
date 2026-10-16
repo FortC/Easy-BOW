@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>密集控件定位基准</title>
+<style>
+  body { font: 14px/1.6 system-ui, sans-serif; margin: 24px; background: #fafafa; }
+  h1 { font-size: 18px; }
+  table { border-collapse: collapse; width: 100%; background: #fff; }
+  th, td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; }
+  th { background: #f0f0f0; }
+  button { margin: 0 2px; padding: 3px 10px; cursor: pointer; }
+  .toolbar { margin: 12px 0; display: flex; gap: 4px; }
+  .toolbar button { width: 32px; height: 28px; padding: 0; }
+  #status { margin: 12px 0; padding: 8px; background: #eef6ff; border: 1px solid #bcd; min-height: 22px; }
+  #overlay { position: absolute; left: 40px; top: 260px; width: 220px; height: 48px; background: rgba(255,0,0,0.25); display: none; }
+</style>
+</head>
+<body>
+<h1>密集控件定位基准（16 行同名按钮 + 密集工具栏）</h1>
+<div class="toolbar" id="toolbar"></div>
+<div id="status">ready</div>
+<div id="overlay"></div>
+<table>
+  <thead><tr><th>订单号</th><th>商品</th><th>金额</th><th>操作</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<script>
+  // 点击日志：selftest 按 {row, act} 精确断言命中行——点错一行立刻可见
+  window.__clickLog = []
+  var acts = ['编辑', '删除', '查看']
+  var tbody = document.getElementById('rows')
+  for (var i = 1; i <= 16; i++) {
+    var id = 'SO2026-1' + String(100 + i)
+    var tr = document.createElement('tr')
+    tr.innerHTML = '<td>' + id + '</td><td>测试商品' + i + '</td><td>' + (99 + i) + '.00</td><td></td>'
+    var cell = tr.lastElementChild
+    for (var j = 0; j < acts.length; j++) {
+      (function (row, act) {
+        var b = document.createElement('button')
+        b.textContent = act
+        b.setAttribute('data-mfs-key', id)
+        b.addEventListener('click', function () {
+          window.__clickLog.push({ row: row, act: act })
+          document.getElementById('status').textContent = 'clicked row=' + row + ' act=' + act
+        })
+        cell.appendChild(b)
+      })(i, acts[j])
+    }
+    tbody.appendChild(tr)
+  }
+  // 密集工具栏：10 个同款图标按钮（无文本，aria-label 同名）
+  var toolbar = document.getElementById('toolbar')
+  for (var t = 0; t < 10; t++) {
+    (function (n) {
+      var b = document.createElement('button')
+      b.setAttribute('aria-label', '工具')
+      b.textContent = '⚙'
+      b.addEventListener('click', function () {
+        window.__clickLog.push({ row: 'toolbar', act: 'tool' + n })
+        document.getElementById('status').textContent = 'clicked toolbar tool' + n
+      })
+      toolbar.appendChild(b)
+    })(t)
+  }
+</script>
+</body>
+</html>

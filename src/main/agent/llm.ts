@@ -29,9 +29,20 @@ export interface ChatMessage {
 
 export interface LlmResult {
   text: string
-  usage: { inputTokens: number; outputTokens: number }
+  usage: LlmUsage
   /** 本次实际使用的结构化模式（可选，不传也合法） */
   structured?: StructuredSupport
+}
+
+/** A1 token 计量：cached/write 为前缀缓存命中/写入量（端点未上报时缺省，不得当 0 统计） */
+export interface LlmUsage {
+  inputTokens: number
+  outputTokens: number
+  /** 命中前缀缓存的部分（OpenAI prompt_tokens_details.cached_tokens / prompt_cache_hit_tokens；
+   *  Anthropic cache_read_input_tokens）。成本按缓存价（约 1/10）估算 */
+  cachedInputTokens?: number
+  /** Anthropic 写缓存部分（cache_creation_input_tokens，按 1.25x 计价，单列不并入 cached） */
+  cacheWriteInputTokens?: number
 }
 
 export interface LlmProvider {
@@ -108,14 +119,18 @@ export class OpenAIProvider implements LlmProvider {
     if (opts?.plain) reqOpts.timeout = PLAIN_TIMEOUT_MS
     const finish = (res: any, structured: StructuredSupport): LlmResult => {
       const text = res.choices?.[0]?.message?.content || ''
-      return {
-        text: typeof text === 'string' ? text : JSON.stringify(text),
-        usage: {
-          inputTokens: res.usage?.prompt_tokens ?? 0,
-          outputTokens: res.usage?.completion_tokens ?? 0
-        },
-        structured
+      // A1：缓存命中量——OpenAI 官方在 prompt_tokens_details.cached_tokens，
+      // DeepSeek 兼容字段为 prompt_cache_hit_tokens；都没有则缺省（端点未上报 ≠ 0 命中）
+      const cached = Math.max(
+        0,
+        Number(res.usage?.prompt_tokens_details?.cached_tokens ?? res.usage?.prompt_cache_hit_tokens ?? 0) || 0
+      )
+      const usage: LlmUsage = {
+        inputTokens: res.usage?.prompt_tokens ?? 0,
+        outputTokens: res.usage?.completion_tokens ?? 0
       }
+      if (cached > 0) usage.cachedInputTokens = cached
+      return { text: typeof text === 'string' ? text : JSON.stringify(text), usage, structured }
     }
 
     // W3 结构化输出：关闭/纯文本调用/探测不支持时走纯文本（请求体与现状逐字节一致）
@@ -193,11 +208,15 @@ export class AnthropicProvider implements LlmProvider {
         .filter((b: any) => b.type === 'text')
         .map((b: any) => b.text)
         .join('')
-      return {
-        text,
-        usage: { inputTokens: res.usage?.input_tokens ?? 0, outputTokens: res.usage?.output_tokens ?? 0 },
-        structured
+      // A1：Anthropic 缓存计量——cache_read=命中（约 1/10 价），cache_creation=写缓存（1.25x）
+      const usage: LlmUsage = {
+        inputTokens: res.usage?.input_tokens ?? 0,
+        outputTokens: res.usage?.output_tokens ?? 0
       }
+      if (Number(res.usage?.cache_read_input_tokens) > 0) usage.cachedInputTokens = Number(res.usage.cache_read_input_tokens)
+      if (Number(res.usage?.cache_creation_input_tokens) > 0)
+        usage.cacheWriteInputTokens = Number(res.usage.cache_creation_input_tokens)
+      return { text, usage, structured }
     }
 
     // W3 结构化输出：关闭/纯文本调用/已标记 tool_use 不可用时走纯文本（请求体与现状逐字节一致）。
@@ -225,11 +244,14 @@ export class AnthropicProvider implements LlmProvider {
       )
       const toolBlock = (res.content || []).find((b: any) => b.type === 'tool_use')
       if (toolBlock && toolBlock.input != null) {
-        return {
-          text: JSON.stringify(toolBlock.input),
-          usage: { inputTokens: res.usage?.input_tokens ?? 0, outputTokens: res.usage?.output_tokens ?? 0 },
-          structured: 'json_schema'
+        const usage: LlmUsage = {
+          inputTokens: res.usage?.input_tokens ?? 0,
+          outputTokens: res.usage?.output_tokens ?? 0
         }
+        if (Number(res.usage?.cache_read_input_tokens) > 0) usage.cachedInputTokens = Number(res.usage.cache_read_input_tokens)
+        if (Number(res.usage?.cache_creation_input_tokens) > 0)
+          usage.cacheWriteInputTokens = Number(res.usage.cache_creation_input_tokens)
+        return { text: JSON.stringify(toolBlock.input), usage, structured: 'json_schema' }
       }
       // 中转忽略 tool_choice 未返回 tool_use：退回文本
       return finishText(res, 'none')
@@ -287,4 +309,66 @@ export function isVisionUnsupportedError(e: any): boolean {
   return /(不支持|无法处理|无法识别)[^\n]{0,20}(图片|图像|视觉|多模态)|(image|vision|multimodal|multi-modal)[^\n]{0,40}(not supported|unsupported)/i.test(
     msg
   )
+}
+
+/* ———————————— v4.6 C6 输出预算分档 ————————————
+ * 实测平均输出远低于现行预算（决策步均值 119 token vs 预算 2048；L2 复核答案是 ~15 token vs 4096）。
+ * 输出按 token 计费且串行生成，预算直接决定上限延迟；但推理模型的思考计入输出预算，
+ * 一刀切收紧会截断思考 → JSON 解析失败。故按「是否推理模型」分两档。
+ */
+
+/** 推理模型判定（**保守方向 = 宁可误判为推理**：max_tokens 是上限不是成本，
+ *  误判为推理只是给个用不满的宽预算（零额外花费）；漏判则思考吃满预算、JSON 被截断——
+ *  v4.6 发布当日 MiniMax-M3.1 即踩中此坑）。持续补充：o 系列/gpt-5/deepseek r+v3/qwq/
+ *  minimax-m/glm-4.5+/gemini-2.5+/reasoner/thinking；正则外的模型由「截断自愈升级」兜底。 */
+const REASONING_MODEL_RE =
+  /(^|\/|[-_])(o[134](-mini|-preview)?($|[-_])|gpt-5|deepseek-(r\d|v3)|qwq|qwen3|minimax-m\d|glm-[45]|gemini-[2-9]|[\w.-]*reasoner|[\w.-]*thinking)/i
+
+/** 是否推理模型（思考计入输出预算的模型；漏判的代价远大于误判，见上） */
+export function isReasoningModel(model: string): boolean {
+  return REASONING_MODEL_RE.test(model || '')
+}
+
+/** C6 截断自愈的会话级记忆：某模型出现过「输出吃满预算」→ 本会话内对该模型一律用 legacy 预算。
+ *  按模型名记忆（端点无关——误扩大只会更安全）。 */
+const budgetEscalatedModels = new Set<string>()
+
+/** 标记某模型本会话内升级为 legacy 预算（截断证据出现后调用） */
+export function escalateBudget(model: string): void {
+  if (model) budgetEscalatedModels.add(model)
+}
+
+/** 某模型是否已被截断自愈升级 */
+export function isBudgetEscalated(model: string): boolean {
+  return budgetEscalatedModels.has(model)
+}
+
+/** LLM 调用点（A2 分账 + C6 预算共用同一套口径） */
+export type CallSite = 'step' | 'plan' | 'replan' | 'verify' | 'clickVerify' | 'enhance'
+
+/** 各调用点输出预算：fast=普通模型 / reasoning=推理模型（思考余量） */
+const OUTPUT_BUDGET: Record<CallSite, { fast: number; reasoning: number }> = {
+  step: { fast: 768, reasoning: 2048 }, // 决策步：实测均值 119，768 足够 5 动作 JSON
+  plan: { fast: 1536, reasoning: 6144 }, // 规划 2~8 节点 JSON
+  replan: { fast: 1536, reasoning: 6144 },
+  verify: { fast: 256, reasoning: 1024 }, // L2 复核答案 ~15 token
+  clickVerify: { fast: 256, reasoning: 256 }, // {"ok":true|false} 一行
+  enhance: { fast: 2048, reasoning: 2048 } // 任务描述增强（保持现状）
+}
+
+/** v4.5 固定预算（outputBudget 开关关闭 / 截断自愈回退时使用） */
+export const LEGACY_BUDGET: Record<CallSite, number> = {
+  step: 2048,
+  plan: 6144,
+  replan: 6144,
+  verify: 4096,
+  clickVerify: 256,
+  enhance: 2048
+}
+
+/** 按模型档位取某调用点的输出预算（useLegacy=true 时回退 v4.5 固定值） */
+export function outputBudget(model: string, site: CallSite, useLegacy = false): number {
+  if (useLegacy) return LEGACY_BUDGET[site]
+  const b = OUTPUT_BUDGET[site]
+  return isReasoningModel(model) ? b.reasoning : b.fast
 }

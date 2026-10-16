@@ -55,6 +55,19 @@ function startFixtureServer(rootDir: string): Promise<{ url: string; close: () =
 
 export async function runSelftest(deps: SelftestDeps): Promise<void> {
   const results: { name: string; ok: boolean; detail?: string; skipped?: boolean }[] = []
+  // 自测总时长硬上限：个别用例卡死不许拖死整轮测试，到点按当前结果收尾退出。
+  // 默认 8 分钟；EASYBOW_SELFTEST_TIMEOUT_MIN 可临时放宽（本机慢 / 新增用例后跑完整套时用），
+  // CI 不设该变量，行为与此前完全一致。
+  const timeoutMin = Number(process.env.EASYBOW_SELFTEST_TIMEOUT_MIN) > 0 ? Number(process.env.EASYBOW_SELFTEST_TIMEOUT_MIN) : 8
+  const deadline = setTimeout(() => {
+    const failed = results.filter((r) => !r.ok && !r.skipped)
+    console.log(
+      `\n========== 自测到达时间上限（${timeoutMin} 分钟），按当前结果收尾：${results.length - failed.length}/${results.length} 通过 ==========`
+    )
+    if (failed.length) console.log('失败项: ' + failed.map((f) => f.name).join(', '))
+    app.exit(failed.length ? 1 : 0)
+  }, timeoutMin * 60 * 1000)
+  ;(deadline as unknown as { unref?: () => void }).unref?.()
   const check = (name: string, ok: boolean, detail?: string) => {
     results.push({ name, ok, detail })
     console.log(`[${ok ? 'PASS' : 'FAIL'}] ${name}${detail ? ' — ' + detail : ''}`)
@@ -78,6 +91,81 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
     const fixturePath = app.isPackaged
       ? join(process.resourcesPath, 'testpage.html')
       : join(__dirname, '../../resources/testpage.html')
+    // v4.5 截断标签基准（自包含：用完把页签导航回主测试页，后续节次不受影响）
+    const truncPath = app.isPackaged
+      ? join(process.resourcesPath, 'fixtures', 'truncated-labels.html')
+      : join(__dirname, '../../resources/fixtures/truncated-labels.html')
+    await tm.navigate('file:///' + truncPath.replace(/\\/g, '/'))
+    await sleep(900)
+    // v4.5 专项一：截断标签基准。CSS 省略号 / JS 截断 / SVG text / 超长文案 / 表格 adj。
+    //     验收的是「模型能拿到全称」这条链路：fullText 填充、truncatedBy 标记、
+    //     以及**用截断串当 expect_text 也必须命中**（此前双向 includes 在此失配会被误拒）。
+    //     位置说明：整节自包含（自己导航、自己建快照），且刻意排在最前面执行——
+    //     后面的节次依赖长链路的页签状态，不稳定环境下可能中途拿不到活动页签；
+    //     放这里能保证这条基准每次都真的跑到，而不是「写在代码里但从不执行」。
+    try {
+      const tres = await ex.extract()
+
+      // ① JS 截断场景：可见文案只有 8 字 + 省略号，全称必须从 title 回收
+      const jsCand = tres.candidates.find((c) => (c.extra || '').includes('买家备注'))
+      check(
+        '截断标签①-JS截断回收全称',
+        !!jsCand && !!jsCand.fullText && jsCand.fullText.includes('收货注意事项') && jsCand.truncatedBy === 'js',
+        jsCand
+          ? `text="${jsCand.text}" fullText="${jsCand.fullText}" by=${jsCand.truncatedBy || '无'}`
+          : '未找到买家备注字段候选'
+      )
+
+      // ② CSS 省略号场景：innerText 本就是全量（省略号只是渲染层效果），因此**不该**被标成
+      //    js 截断、也不需要 fullText 重复——label 必须原样完整地出现在 adj 线索里。
+      //    注意断言看的是 extra/label 而非 text：input 的 text 是它的「值」，不是字段名。
+      const cssCand = tres.candidates.find((c) => (c.extra || '').includes('收货地址'))
+      check(
+        '截断标签②-CSS省略号拿到全量',
+        !!cssCand && cssCand.extra.includes('门牌号必填') && cssCand.truncatedBy !== 'js',
+        cssCand
+          ? `extra="${cssCand.extra.slice(0, 70)}" by=${cssCand.truncatedBy || '无'}（应为非 js）`
+          : '未找到收货地址字段候选'
+      )
+
+      // ③ 表格布局：左侧 td 被 JS 截断，adj 线索必须带回 title 全称
+      const adjCand = tres.candidates.find((c) => (c.extra || '').includes('adj=') && c.extra!.includes('发货'))
+      check(
+        '截断标签③-表格adj全称',
+        !!adjCand && !!adjCand.extra && /顺丰|京东|中通/.test(adjCand.extra),
+        adjCand ? `extra="${adjCand.extra.slice(0, 60)}"` : '未找到发货方式候选'
+      )
+
+      // ④ 端到端：用截断串做 expect_text 点击，不得被拒（v4.5 之前这里会被误拒）
+      const clickCtx = { memory: {}, signal: new AbortController().signal, settings: { speed: 'fast' } as any }
+      const idx = jsCand ? tres.candidates.indexOf(jsCand) : -1
+      let truncClickOk = false
+      let truncClickErr = '未找到候选'
+      if (idx >= 0) {
+        const out = await ex.executeBatch(
+          [{ name: 'click', index: idx, expect_text: '买家备注：请填写收货注意事项' } as any],
+          clickCtx
+        )
+        truncClickErr = (out[0]?.error || '').slice(0, 60)
+        truncClickOk = !out[0]?.error
+      }
+      check('截断标签④-全称expect_text不误拒', truncClickOk, truncClickOk ? '全称点击通过' : `err=${truncClickErr}`)
+
+      // ⑤ 指纹存在且唯一：fp 是 v4.5 跨步定位的根基，同名元素必须得到不同的 fp
+      const withFp = tres.candidates.filter((c) => !!c.fp)
+      const fpUniq = new Set(withFp.map((c) => c.fp)).size
+      check(
+        '截断标签⑤-元素指纹完整性',
+        withFp.length === tres.candidates.length && fpUniq === withFp.length,
+        `带指纹 ${withFp.length}/${tres.candidates.length}，唯一 ${fpUniq}`
+      )
+    } catch (e: any) {
+      check('截断标签基准回归', false, String(e?.stack || e))
+    }
+
+    // 导航回主测试页（下面统一导航），多等一会儿让渲染稳定
+    await sleep(600)
+
     const fixture = 'file:///' + fixturePath.replace(/\\/g, '/')
     await tm.navigate(fixture)
     await sleep(1800)
@@ -1212,6 +1300,7 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
       }
     }
 
+
     // 10. 浏览器仿真测试（feature/browser-test）
     try {
       const sampleMd = [
@@ -1365,6 +1454,328 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
           planThink.length === 1 &&
           !planTrunc,
         `节点数=${planOk?.length} check=${planOk?.[0]?.check?.kind || '无'} 非法输入=${!planBad} think剥离=${!!planThink} 截断思考=${!planTrunc}`
+      )
+
+      // 10.2c-2 v4.5 统一文本匹配器 textMatch（纯函数，专项一的地基）
+      const { textMatch, normalizeText, stripEllipsis, TEXT_CAP } = await import('./textmatch')
+      const mEllipsis = textMatch('收货人姓名…', '收货人姓名（必填）')
+      const mReverse = textMatch('收货人姓名（必填）', '收货人姓名…')
+      const mSub = textMatch('删除', '批量删除')
+      const mWords = textMatch('SO20261012-001 删除', '删除')
+      const mMiss = textMatch('提交订单', '取消订单')
+      // 模糊档只在 expect_text 场景开启；这两条证明开关确实起作用（不是恒匹配也不是恒不匹配）
+      const mFuzzyHit = textMatch('收货人详细地址', '收货人详细住址', { fuzzy: true, fuzzyMin: 0.6 })
+      const mFuzzyOff = textMatch('收货人详细地址', '收货人详细住址')
+      const mEmpty = textMatch('', '任意')
+      const textMatchOk =
+        mEllipsis.ok &&
+        mEllipsis.via === '省略号前缀' &&
+        mReverse.ok &&
+        mSub.ok &&
+        mWords.ok &&
+        !mMiss.ok &&
+        mFuzzyHit.ok &&
+        !mFuzzyOff.ok &&
+        mEmpty.ok &&
+        normalizeText('Ａ　Ｂ') === 'A B' &&
+        stripEllipsis('查看更多…') === '查看更多'
+      check(
+        'v4.5 文本匹配器（省略号前缀/子串/分词/模糊）',
+        textMatchOk,
+        `省略号=${mEllipsis.via} 反向=${mReverse.ok} 子串=${mSub.ok} 分词=${mWords.ok} 不匹配=${!mMiss.ok} 模糊开关=${mFuzzyHit.ok}/${!mFuzzyOff.ok}`
+      )
+      // 10.2c-3 expect_text 核验走统一匹配器：模型从截图抄的截断串必须能命中 DOM 全称
+      const { verifyExpectText } = await import('./executor')
+      const expTrunc = verifyExpectText(
+        {
+          text: '收货人姓名…',
+          fullText: '收货人姓名（必填）',
+          extra: '',
+          anchor: undefined,
+          role: 'input文本'
+        } as any,
+        '收货人姓名（必填）'
+      )
+      const expOk = verifyExpectText(
+        { text: '删除', extra: '', anchor: 'SO20261012-001', role: 'button' } as any,
+        'SO20261012-001 删除'
+      )
+      const expMiss = verifyExpectText(
+        { text: '删除', extra: '', anchor: 'SO20261012-002', role: 'button' } as any,
+        'SO99999999-999 删除'
+      )
+      check(
+        'v4.5 expect_text 截断感知核验',
+        expTrunc.ok && expOk.ok && !expMiss.ok,
+        `截断串命中=${expTrunc.ok} 行标识命中=${expOk.ok} 错行拒绝=${!expMiss.ok}`
+      )
+
+      // 10.2d v4.6 Token 成本与提速：纯函数断言（modeSuffix / 历史折叠 / 输出预算 / 页面指纹 /
+      // clickVerifier 分档 / 网格 edges / summary 分档）——全部零网络
+      try {
+        const { buildModeSuffix, renderHistoryLines, SYSTEM_PROMPT: SP46 } = await import('./agent/prompts')
+        // ① C1：modeSuffix 组合——空组合=空串（普通任务 user 消息零变更）；各开关产出对应区块；
+        //    system 本身不含任何模式区块（缓存断点恒稳定）
+        const mEmpty = buildModeSuffix({})
+        const mVision = buildModeSuffix({ vision: 'fallback' })
+        const mAll = buildModeSuffix({ vision: 'on', canvas: true, test: true })
+        const modeOk =
+          mEmpty === '' &&
+          mVision.includes('视觉兜底') &&
+          mAll.includes('## 视觉模式') &&
+          mAll.includes('## Canvas 文档编辑器') &&
+          mAll.includes('## 测试模式') &&
+          !SP46.includes('## Canvas 文档编辑器')
+        // ② C1 落位：modeSuffix 拼进 user 消息时位于「# 下一步」之前（动态后缀区，不截断公共前缀）
+        const { buildStepMessage: bsm46 } = await import('./agent/prompts')
+        const msg46 = bsm46({
+          task: 't',
+          tabs: [],
+          activeTabId: 1,
+          extract: { candidates: [], title: 't', url: 'u', scrollHeight: 0, viewportH: 0, scrollY: 0 } as any,
+          elementLines: '[1] <button> "确定"',
+          maxElements: 80,
+          memory: {},
+          steps: [],
+          lastResults: [],
+          kbTips: [],
+          modeSuffix: '## 视觉模式（当前已启用）'
+        })
+        const placeOk = msg46.includes('## 视觉模式') && msg46.indexOf('## 视觉模式') < msg46.indexOf('# 下一步')
+        check('v4.6 C1 模式后缀(组合/落位/system恒定)', modeOk && placeOk, `空组合=${mEmpty === ''} 落位=${placeOk} system含canvas=${SP46.includes('## Canvas')}`)
+
+        // ③ C2a：历史折叠——≤12 步全量逐行；>12 步折叠聚合；用户指导行永不折叠；出错行保留
+        const mkSteps = (n: number): any[] =>
+          Array.from({ length: n }, (_, i) => ({
+            n: i + 1,
+            thought: `步骤${i + 1}`,
+            actions: [{ name: 'click', index: 1 }],
+            tabId: 1,
+            tabTitle: 't',
+            url: 'u',
+            title: '',
+            ts: i
+          }))
+        const s15 = mkSteps(15)
+        s15[0].userGuidance = true
+        s15[3].actions = [{ name: 'click', index: 1, error: '元素已失效' }]
+        const noFold = renderHistoryLines(s15, false)
+        const folded = renderHistoryLines(s15, true)
+        const foldOk =
+          noFold.length === 15 &&
+          folded.length < 15 &&
+          folded[0].includes('第1~9步') &&
+          folded.some((l) => l.includes('用户指导')) &&
+          // 早期出错行保留最近 1 条（行内容=步骤摘要 + ⚠计数，非错误原文）
+          folded.some((l) => l.startsWith('第4步') && l.includes('⚠'))
+        check('v4.6 C2a 历史折叠(阈值/指导保留/错误保留)', foldOk, `15步: 全量=${noFold.length}行 → 折叠=${folded.length}行 首行=${folded[0].slice(0, 20)}`)
+
+        // ④ C6：输出预算表——普通模型收紧 / 推理模型放宽 / legacy 回退 / 截断自愈升级记忆
+        const { outputBudget, isReasoningModel, LEGACY_BUDGET, escalateBudget, isBudgetEscalated } = await import('./agent/llm')
+        const budgetOk =
+          outputBudget('gpt-4o-mini', 'step') === 768 &&
+          outputBudget('gpt-4o-mini', 'verify') === 256 &&
+          outputBudget('o3-mini', 'step') === 2048 &&
+          outputBudget('deepseek-r1', 'plan') === 6144 &&
+          outputBudget('qwq-32b', 'verify') === 1024 &&
+          // v4.6 发布日实测：MiniMax-M3.1 是推理模型，漏判会把规划预算砍到 1536 → 思考吃满、JSON 空输出
+          isReasoningModel('MiniMax-M3.1-flash') === true &&
+          outputBudget('MiniMax-M3.1-flash', 'plan') === 6144 &&
+          isReasoningModel('deepseek-v3') === true &&
+          isReasoningModel('qwen3-32b') === true &&
+          isReasoningModel('glm-4.6') === true &&
+          isReasoningModel('gemini-2.5-pro') === true &&
+          isReasoningModel('gpt-4o-mini') === false &&
+          outputBudget('gpt-4o-mini', 'step', true) === LEGACY_BUDGET.step &&
+          isReasoningModel('o3') === true &&
+          isReasoningModel('openai/o3-mini') === true
+        // 截断自愈升级：标记后该模型一律走 legacy（会话级）
+        escalateBudget('selftest-escalate-model')
+        const escalateOk = isBudgetEscalated('selftest-escalate-model') && outputBudget('selftest-escalate-model', 'plan') === 1536 && isBudgetEscalated('other-model') === false
+        check('v4.6 C6 输出预算分档(含推理模型判定/升级记忆)', budgetOk && escalateOk, `miniMax推理=${isReasoningModel('MiniMax-M3.1-flash')} step=${outputBudget('gpt-4o-mini', 'step')} 升级记忆=${escalateOk}`)
+
+        // ⑤ A3/B3：pageHashOf——确定性 + 敏感性（内容变→哈希变）
+        const { pageHashOf } = await import('./extractor')
+        const base = { url: 'https://x.com/a', title: 'T', scrollY: 0, scrollHeight: 900, candidates: [{ role: 'button', text: '确定', extra: '', state: '' }] }
+        const h1 = pageHashOf(base)
+        const h2 = pageHashOf({ ...base })
+        const h3 = pageHashOf({ ...base, candidates: [{ role: 'button', text: '取消', extra: '', state: '' }] })
+        const h4 = pageHashOf({ ...base, url: 'https://x.com/b' })
+        check('v4.6 A3 页面指纹(确定性/敏感性)', h1 === h2 && h1 !== h3 && h1 !== h4 && /^[0-9a-f]{8}$/.test(h1), `h=${h1} 同输入同哈希=${h1 === h2} 内容敏感=${h1 !== h3} URL敏感=${h1 !== h4}`)
+
+        // ⑥ D1：clickVerifier 分档真值表
+        const { Executor: Ex46 } = await import('./executor')
+        const d1 = Ex46.clickVerifyDecision({ submitish: true, dupCount: 1, expectText: '提交', candText: '提交', anchor: '' })
+        const d2 = Ex46.clickVerifyDecision({ submitish: false, dupCount: 1, expectText: '编辑', candText: '编辑', anchor: '' })
+        const d3 = Ex46.clickVerifyDecision({ submitish: false, dupCount: 3, expectText: 'SO2026-1101 删除', candText: '删除', anchor: 'SO2026-1101' })
+        const d4 = Ex46.clickVerifyDecision({ submitish: false, dupCount: 3, expectText: '删除', candText: '删除', anchor: 'SO2026-1101' })
+        const dOk = d1.decision === 'run' && d2.decision === 'skip' && d3.decision === 'skip' && d4.decision === 'run'
+        check('v4.6 D1 点击复核分档(真值表)', dOk, `submitish=${d1.decision} 唯一=${d2.decision} 行锚=${d3.decision} 同名无锚=${d4.decision}`)
+
+        // ⑦ C4/C3：网格 edges + summary 裁剪（full 档输出与 v4.5 逐字节一致）
+        const { formatCandidates: fc46 } = await import('./extractor')
+        const mkCands = (n: number): any =>
+          ({
+            title: 't',
+            url: 'u',
+            scrollY: 0,
+            scrollHeight: 5000,
+            viewportW: 1000,
+            viewportH: 800,
+            semanticHints: [],
+            totalFound: n,
+            imgCount: 0,
+            candidates: Array.from({ length: n }, (_, i) => ({
+              framePaths: [],
+              path: [],
+              tag: 'BUTTON',
+              role: 'button',
+              text: `按钮${i}`,
+              fullText: `按钮${i}全称`,
+              anchor: `ROW${i}`,
+              extra: 'name=btn',
+              rect: { x: 10, y: 10 + i * 12, w: 40, h: 10 },
+              inViewport: true
+            }))
+          }) as any
+        const big = mkCands(40)
+        const fullAll = fc46(big, false, undefined, 'all', 'full')
+        const fullEdges = fc46(big, false, undefined, 'edges', 'full')
+        const sumEdges = fc46(big, false, undefined, 'edges', 'summary')
+        const midFull = fullAll.split('\n')[20]
+        const midEdges = fullEdges.split('\n')[20]
+        const midSum = sumEdges.split('\n')[20]
+        const fmtOk =
+          midFull.includes('(格') &&
+          !midEdges.includes('(格') &&
+          fullEdges.split('\n')[0].includes('(格') &&
+          midFull.includes('~全称') &&
+          midFull.includes('(行:ROW20)') &&
+          midSum.includes('"按钮20"') &&
+          !midSum.includes('~全称') &&
+          !midSum.includes('(行:ROW20)') &&
+          !midSum.includes('(name=btn')
+        check('v4.6 C4/C3 网格edges+summary裁剪', fmtOk, `中部: 全量格=${midFull.includes('(格')} edges格=${midEdges.includes('(格')} summary含全称=${midSum.includes('~全称')}`)
+        // summary 语义行保留全字段（rich 集合：语义命中 + 视口前 8）
+        const richRes: any = { ...big, semanticHints: [{ index: 20, text: '按钮20', via: ['kw'], score: 0.9 }] }
+        const sumRich = fc46(richRes, false, undefined, 'all', 'summary').split('\n')
+        check('v4.6 C3 summary语义行保留全字段', sumRich[20].includes('~全称') && sumRich[20].includes('(行:ROW20)'), `语义行[20]保留=${sumRich[20].includes('~全称')}`)
+      } catch (e: any) {
+        check('v4.6 纯函数断言', false, String(e?.message || e))
+      }
+
+      // 10.2c-4 v4.5 PlanValidator：check 必填 / 幻觉取值 / target 可达性
+      const { validatePlan, buildPlanSnapshot, buildPlanPrompt } = await import('./agent/plan')
+      const fakeSnap = buildPlanSnapshot({
+        title: '订单页',
+        url: 'https://example.com/order',
+        candidates: [
+          { role: 'input文本', text: '', extra: 'label=收货人姓名（必填） placeholder=请输入姓名' },
+          { role: 'input文本', text: '', extra: 'label=联系电话 placeholder=请输入电话' },
+          { role: 'button', text: '提交订单', extra: '' }
+        ]
+      })
+      const vGood = validatePlan({
+        nodes: [
+          {
+            intent: '填写收货人',
+            expected: '收货人姓名已填入',
+            check: { kind: 'text_visible', value: '收货人姓名' },
+            risk: 'read'
+          },
+          {
+            intent: '提交',
+            expected: '订单已提交',
+            check: { kind: 'text_visible', value: '提交订单' },
+            risk: 'write'
+          }
+        ],
+        snap: fakeSnap,
+        task: '填写收货人姓名并提交订单'
+      })
+      const vNoCheck = validatePlan({ nodes: [{ intent: '填写', expected: '填好了' }], snap: fakeSnap, task: '填写收货人姓名' })
+      const vHalluc = validatePlan({
+        nodes: [
+          {
+            intent: '提交',
+            expected: '提交成功',
+            check: { kind: 'text_visible', value: '会员等级钻石卡' },
+            target: { kind: 'button', label: '支付并完成会员升级' }
+          }
+        ],
+        snap: fakeSnap,
+        task: '提交订单'
+      })
+      const vOk =
+        vGood.ok &&
+        vNoCheck.issues.some((i) => i.code === 'no_check') &&
+        vNoCheck.weakNodes.includes(0) &&
+        vHalluc.issues.some((i) => i.code === 'hallucinated_value') &&
+        vHalluc.issues.some((i) => i.code === 'unreachable_target')
+      // 接地规划：页面摘要必须进入规划提示词，且列出表单字段
+      const planPrompt = buildPlanPrompt('填写收货人姓名', fakeSnap)
+      const groundedOk = planPrompt.includes('收货人姓名') && planPrompt.includes('当前页面真实状态')
+      check(
+        'v4.5 PlanValidator + 接地规划快照',
+        vOk && groundedOk,
+        `合格=${vGood.ok} 无check=${vNoCheck.issues.map((i) => i.code).join('/')} 幻觉=${vHalluc.issues
+          .map((i) => i.code)
+          .join('/')} 接地提示=${groundedOk}`
+      )
+      // TEXT_CAP 单一真源：快照与实时回读共用，消除历史上的 80/40 不对称
+      check('v4.5 TEXT_CAP 统一为 80', TEXT_CAP === 80, `TEXT_CAP=${TEXT_CAP}`)
+
+      // 10.2c-5 v4.5 节点 schema 扩展（target/risk/precheck + risk 缺省按文案推断）
+      const planFull = (await import('./agent/plan')).parsePlan(
+        JSON.stringify({
+          nodes: [
+            {
+              intent: '查看订单详情',
+              expected: '订单详情已展开',
+              check: { kind: 'text_visible', value: '收货人姓名' }
+            },
+            {
+              intent: '填写收货人',
+              expected: '收货人姓名已填入',
+              target: { kind: 'field', label: '收货人姓名（必填）', near: '收货信息' },
+              check: { kind: 'text_visible', value: '收货人姓名' },
+              precheck: { kind: 'text_visible', value: '收货信息' }
+            },
+            { intent: '提交订单', expected: '订单提交成功', check: { kind: 'text_visible', value: '提交订单' } }
+          ]
+        })
+      )
+      const schemaOk =
+        !!planFull &&
+        planFull[1].target?.kind === 'field' &&
+        planFull[1].target?.label === '收货人姓名（必填）' &&
+        planFull[1].precheck?.kind === 'text_visible' &&
+        // risk 缺省时的自动推断：纯查询节点=read；改数据的节点（填写/提交）=write。
+        // 漏标 write 会失去 L2 强制复核——错误提交将直接放行，所以这两档必须判对。
+        planFull[0].risk === 'read' &&
+        planFull[1].risk === 'write' &&
+        planFull[2].risk === 'write'
+      check(
+        'v4.5 节点 schema（target/precheck/risk 自动推断）',
+        schemaOk,
+        planFull
+          ? `target=${planFull[1].target?.kind || '无'} precheck=${planFull[1].precheck?.kind || '无'} risk=${planFull
+              .map((n) => n.risk)
+              .join(',')}`
+          : '解析失败'
+      )
+
+      // 10.2c-6 v4.5 复核证据切片：长页面必须切到目标区域，而不是只给前 1200 字
+      const { sliceTargetRegion } = await import('./agent/verify')
+      const filler = '无关内容'.repeat(900) // 远超历史实现的 1200 字上限
+      const longPage = `${filler}收货人姓名已填入张三${filler}`
+      const slice = sliceTargetRegion(longPage, '收货人姓名已填入', '填写收货人')
+      const sliceOk = slice.includes('收货人姓名已填入张三') && slice.length < 1400
+      const sliceShort = sliceTargetRegion('短页面', '短页面', '')
+      check(
+        'v4.5 复核证据目标区域切片',
+        sliceOk && sliceShort === '短页面',
+        `切片长度=${slice.length} 含目标=${slice.includes('收货人姓名已填入张三')} 短页直通=${sliceShort === '短页面'}`
       )
 
       // 10.2d 模板自动变量解析（纯函数；{{记忆键}} 不是变量不得误替换）
@@ -1820,6 +2231,372 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
       }
     } catch (e: any) {
       check('仿真测试功能', false, String(e?.stack || e))
+    }
+
+    // 11. 密集控件定位基准（v4.4 定位精度强化验收）：16 行同名「编辑/删除/查看」按钮 +
+    //     密集工具栏，逐点断言命中行——行标识定位、expect_text 语义核验、遮挡拒绝、
+    //     语义磁吸、滚动漂移补偿，任一环节失灵都会点错行并在点击日志里现形
+    try {
+      const densePath = app.isPackaged
+        ? join(process.resourcesPath, 'fixtures', 'dense-controls.html')
+        : join(__dirname, '../../resources/fixtures/dense-controls.html')
+      await tm.navigate('file:///' + densePath.replace(/\\/g, '/'))
+      await sleep(1200)
+      const page = tm.active()!
+      await page.cdp.evaluate(
+        String(function resetLog() {
+          ;(window as any).__clickLog = []
+        }),
+        []
+      )
+      const readLog = () =>
+        page.cdp.evaluate<Array<{ row: string | number; act: string }>>(
+          String(function readClickLog() {
+            return (window as any).__clickLog || []
+          }),
+          []
+        )
+      const hitCtx = { memory: {}, signal: new AbortController().signal, settings: { speed: 'fast' } as any }
+      const dres = await ex.extract()
+      const candIdx = (text: string, anchorKey: string): number =>
+        dres.candidates.findIndex((c) => c.text === text && (c.anchor || '').includes(anchorKey))
+
+      // ① 行锚点提取：16 个「删除」候选应带互不相同的 (行:订单号) 锚
+      const dels = dres.candidates.filter((c) => c.text === '删除')
+      const anchorSet = new Set(dels.map((c) => c.anchor).filter(Boolean))
+      check(
+        '密集定位①-行锚点提取',
+        dels.length >= 12 && anchorSet.size >= 12,
+        `删除候选 ${dels.length} 个、不同行锚 ${anchorSet.size} 个`
+      )
+
+      let exactHits = 0
+      let attempts = 0
+
+      // ② 指定行精确点击（expect_text=行标识+按钮文字）：必须只点中第 7 行删除
+      const i7 = candIdx('删除', 'SO2026-1107')
+      if (i7 >= 0) {
+        attempts++
+        await ex.executeBatch([{ name: 'click', index: i7, expect_text: 'SO2026-1107 删除' } as any], hitCtx)
+        await sleep(250)
+        const log = await readLog()
+        const exact = log.length === 1 && log[0].row === 7 && log[0].act === '删除'
+        if (exact) exactHits++
+        check('密集定位②-指定行点击命中', exact, `点击日志=${JSON.stringify(log)}（应恰好 row=7,act=删除）`)
+      } else {
+        check('密集定位②-指定行点击命中', false, '未找到第 7 行删除候选')
+      }
+
+      // ③ expect_text 语义核验：拿第 7 行的索引却声明第 12 行的预期 → 必须拒绝点击
+      {
+        const before = (await readLog()).length
+        const out = await ex.executeBatch(
+          [{ name: 'click', index: i7, expect_text: 'SO2026-1112 编辑' } as any],
+          hitCtx
+        )
+        await sleep(200)
+        const after = await readLog()
+        const ok = !!out[0]?.error && /拒绝|不符/.test(out[0].error) && after.length === before
+        check('密集定位③-expect_text不符拒绝', ok, `err=${(out[0]?.error || '').slice(0, 40)} 日志 ${before}→${after.length}`)
+      }
+
+      // ④ 语义磁吸（click_xy）：坐标落进第 9 行「编辑」矩形 + expect_text 匹配 → 精确命中第 9 行
+      {
+        const i9 = candIdx('编辑', 'SO2026-1109')
+        const c9 = i9 >= 0 ? dres.candidates[i9] : null
+        if (c9) {
+          attempts++
+          const nx = Math.round(((c9.rect.x + c9.rect.w / 2) / dres.viewportW) * 1000)
+          const ny = Math.round(((c9.rect.y + c9.rect.h / 2) / dres.viewportH) * 1000)
+          await ex.executeBatch([{ name: 'click_xy', x: nx, y: ny, expect_text: 'SO2026-1109 编辑' } as any], hitCtx)
+          await sleep(250)
+          const log = await readLog()
+          const hit = log.some((l) => l.row === 9 && l.act === '编辑')
+          const onlyOne = log.filter((l) => l.row === 9).length === 1
+          if (hit && onlyOne) exactHits++
+          check('密集定位④-语义磁吸命中第9行', hit && onlyOne, `点击日志=${JSON.stringify(log)}`)
+          // ④' 同坐标错预期 → 拒绝
+          const before = (await readLog()).length
+          const out2 = await ex.executeBatch(
+            [{ name: 'click_xy', x: nx, y: ny, expect_text: 'SO2026-1103 查看' } as any],
+            hitCtx
+          )
+          await sleep(200)
+          const after = await readLog()
+          check(
+            '密集定位④-坐标命中错预期拒绝',
+            !!out2[0]?.error && /拒绝|不符/.test(out2[0].error) && after.length === before,
+            `err=${(out2[0]?.error || '').slice(0, 40)}`
+          )
+        } else {
+          check('密集定位④-语义磁吸命中第9行', false, '未找到第 9 行编辑候选')
+        }
+      }
+
+      // ⑤ 遮挡拒绝：悬浮层盖住第 15 行删除 → 点击必须报遮挡拒绝；移开后点击成功
+      {
+        const i15 = candIdx('删除', 'SO2026-1115')
+        const c15 = i15 >= 0 ? dres.candidates[i15] : null
+        if (c15) {
+          await page.cdp.evaluate(
+            String(function coverTarget(rect: { x: number; y: number; w: number; h: number }) {
+              const o = document.getElementById('overlay')!
+              o.style.left = rect.x + 'px'
+              o.style.top = rect.y + 'px'
+              o.style.width = rect.w + 'px'
+              o.style.height = rect.h + 'px'
+              o.style.display = 'block'
+            }),
+            [c15.rect]
+          )
+          await sleep(150)
+          const before = (await readLog()).length
+          const out = await ex.executeBatch([{ name: 'click', index: i15, expect_text: 'SO2026-1115 删除' } as any], hitCtx)
+          await sleep(200)
+          const blocked = !!out[0]?.error && /遮挡/.test(out[0].error) && (await readLog()).length === before
+          await page.cdp.evaluate(
+            String(function uncover() {
+              document.getElementById('overlay')!.style.display = 'none'
+            }),
+            []
+          )
+          await sleep(150)
+          attempts++
+          const out2 = await ex.executeBatch([{ name: 'click', index: i15, expect_text: 'SO2026-1115 删除' } as any], hitCtx)
+          await sleep(250)
+          const log = await readLog()
+          const hit = !out2[0]?.error && log.some((l) => l.row === 15 && l.act === '删除')
+          if (hit) exactHits++
+          check('密集定位⑤-遮挡拒绝+解除后命中', blocked && hit, `遮挡拒绝=${blocked} 解除后命中=${hit}`)
+        } else {
+          check('密集定位⑤-遮挡拒绝+解除后命中', false, '未找到第 15 行删除候选')
+        }
+      }
+
+      // ⑥ 滚动漂移补偿：页面滚动后用「滚动前」的归一化坐标 click_xy，仍须命中第 3 行编辑
+      {
+        const i3 = candIdx('编辑', 'SO2026-1103')
+        const c3 = i3 >= 0 ? dres.candidates[i3] : null
+        if (c3) {
+          const nx = Math.round(((c3.rect.x + c3.rect.w / 2) / dres.viewportW) * 1000)
+          const ny = Math.round(((c3.rect.y + c3.rect.h / 2) / dres.viewportH) * 1000)
+          await page.cdp.evaluate(
+            String(function scrollDown() {
+              window.scrollBy(0, 150)
+            }),
+            []
+          )
+          await sleep(300)
+          attempts++
+          const out = await ex.executeBatch(
+            [{ name: 'click_xy', x: nx, y: ny, expect_text: 'SO2026-1103 编辑' } as any],
+            hitCtx
+          )
+          await sleep(250)
+          const log = await readLog()
+          const hit = !out[0]?.error && log.some((l) => l.row === 3 && l.act === '编辑')
+          if (hit) exactHits++
+          check('密集定位⑥-滚动漂移补偿命中', hit, `err=${(out[0]?.error || '').slice(0, 30)} 日志=${JSON.stringify(log)}`)
+          await page.cdp.evaluate(
+            String(function scrollBack() {
+              window.scrollTo(0, 0)
+            }),
+            []
+          )
+        } else {
+          check('密集定位⑥-滚动漂移补偿命中', false, '未找到第 3 行编辑候选')
+        }
+      }
+
+      check(
+        '密集定位-基准命中率',
+        attempts > 0 && exactHits === attempts,
+        `精确命中 ${exactHits}/${attempts}（要求 100%，点错行=重大失误）`
+      )
+    } catch (e: any) {
+      check('密集定位基准回归', false, String(e?.stack || e))
+    }
+
+    // 11.5 MFS 覆盖率（v4.6 P4-M1）：fixtures 里标了 data-mfs-key 的元素 = 「任务成败依赖的最小元素集」。
+    //     任何提取/压缩/分档/网格改动都必须保证这些键仍出现在渲染给模型的元素列表里——
+    //     确定性、0 token、毫秒级，替代昂贵的端到端回归（详见 docs/EasyBow-v4.6-完整升级实施方案.md M1）。
+    //     组合口径：full 档 × 全部网格模式必过（100% 覆盖）；truncated-labels 额外验 summary 档
+    //     （非密集页 runner 的实际档位；MFS 键取自文案/行锚，裁剪字段后仍必须在场）。
+    try {
+      const fxDir = app.isPackaged
+        ? join(process.resourcesPath, 'fixtures')
+        : join(__dirname, '../../resources/fixtures')
+      const collectKeys = async (): Promise<string[]> => {
+        const page = tm.active()!
+        const keys = await page.cdp.evaluate<string[]>(
+          String(() => Array.from(document.querySelectorAll('[data-mfs-key]')).map((el) => el.getAttribute('data-mfs-key') || '').filter(Boolean)),
+          []
+        )
+        return [...new Set(keys)]
+      }
+      const cover = (lines: string, keys: string[]): string[] => keys.filter((k) => !lines.includes(k))
+      // ① truncated-labels：full×3 网格 + summary×edges（非密集页实际组合）
+      const truncPath2 = join(fxDir, 'truncated-labels.html')
+      await tm.navigate('file:///' + truncPath2.replace(/\\/g, '/'))
+      await sleep(900)
+      const truncKeys = await collectKeys()
+      const truncRes = await ex.extract()
+      const gTrunc = truncKeys.length >= 4
+      let truncMissing: string[] = []
+      if (gTrunc) {
+        for (const gm of ['all', 'edges', 'off'] as const) {
+          truncMissing.push(...cover(ex.formatForPrompt(truncRes, 80, false, undefined, gm, 'full'), truncKeys))
+        }
+        truncMissing.push(...cover(ex.formatForPrompt(truncRes, 80, false, undefined, 'edges', 'summary'), truncKeys))
+        truncMissing = [...new Set(truncMissing)]
+      }
+      check(
+        'v4.6 MFS 覆盖率-截断标签页(full×3网格+summary)',
+        gTrunc && truncMissing.length === 0,
+        `MFS 键 ${truncKeys.length} 个${truncMissing.length ? `，缺失: ${truncMissing.slice(0, 4).join('/')}` : '，全部在场'}`
+      )
+      // ② dense-controls：runner 对密集页恒走 full——验 full×all/edges 的行锚覆盖
+      const densePath2 = join(fxDir, 'dense-controls.html')
+      await tm.navigate('file:///' + densePath2.replace(/\\/g, '/'))
+      await sleep(1200)
+      const denseKeys = await collectKeys()
+      const denseRes = await ex.extract()
+      const gDense = denseKeys.length >= 16
+      let denseMissing: string[] = []
+      if (gDense) {
+        for (const gm of ['all', 'edges'] as const) {
+          denseMissing.push(...cover(ex.formatForPrompt(denseRes, 80, false, undefined, gm, 'full'), denseKeys))
+        }
+        denseMissing = [...new Set(denseMissing)]
+      }
+      check(
+        'v4.6 MFS 覆盖率-密集控件页(行锚全量在场)',
+        gDense && denseMissing.length === 0,
+        `MFS 行锚 ${denseKeys.length} 个${denseMissing.length ? `，缺失: ${denseMissing.slice(0, 4).join('/')}` : '，全部在场'}`
+      )
+      // 用完导航回主测试页（后续节次不受影响，同第 0 节惯例）
+      await tm.navigate('file:///' + fixturePath.replace(/\\/g, '/'))
+      await sleep(600)
+    } catch (e: any) {
+      check('v4.6 MFS 覆盖率', false, String(e?.message || e))
+    }
+
+
+    // 12. iframe 全穿透（v4.4）：二层同源嵌套 + 跨域 frame（双端口模拟，真跨源）——
+    //     聚水潭式嵌套报表的「抓不到数据」验收：提取/read_content/跨域点击三项都必须通
+    try {
+      const http = await import('http')
+      // 跨域页（端口B）：表格 + 点击写 title（点击验证锚点）
+      const srvB = http.createServer((_q, s) => {
+        s.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+        s.end(
+          '<!doctype html><meta charset=utf-8><body><h3>跨域报表区</h3>' +
+            '<table><tr><th>单号</th><th>金额</th></tr><tr><td>XO-9001</td><td>88.00</td></tr></table>' +
+            "<button id=\"xb\" onclick=\"document.title='x-clicked'\">跨域按钮</button></body>"
+        )
+      })
+      await new Promise<void>((r) => srvB.listen(0, '127.0.0.1', r))
+      const portB = (srvB.address() as { port: number }).port
+      // 同源两层（端口A）：/l1.html 内嵌 /l2.html；顶层再嵌跨域 frame
+      const srvA = http.createServer((q, s) => {
+        const u = String(q.url)
+        let html: string
+        if (u.startsWith('/l1')) {
+          html =
+            '<!doctype html><meta charset=utf-8><body><h3>一层嵌套</h3>' +
+            '<table><tr><td>A1</td><td>100</td></tr><tr><td>A2</td><td>200</td></tr></table>' +
+            "<button id=\"b1\" onclick=\"top.document.title='l1-clicked'\">一层按钮</button>" +
+            '<iframe id="l2" src="/l2.html" width="500" height="120"></iframe></body>'
+        } else if (u.startsWith('/l2')) {
+          html =
+            '<!doctype html><meta charset=utf-8><body><h3>二层嵌套</h3>' +
+            '<table><tr><td>B1</td><td>300</td></tr><tr><td>B2</td><td>400</td></tr></table>' +
+            "<button id=\"b2\" onclick=\"top.document.title='l2-clicked'\">二层按钮</button></body>"
+        } else {
+          html =
+            '<!doctype html><meta charset=utf-8><body><h1>iframe穿透父页</h1>' +
+            '<table><tr><td>R1</td><td>10</td></tr><tr><td>R2</td><td>20</td></tr></table>' +
+            "<button id=\"rb\" onclick=\"document.title='root-clicked'\">父页按钮</button>" +
+            '<iframe id="l1" src="/l1.html" width="600" height="260"></iframe>' +
+            `<iframe id="cf" src="http://127.0.0.1:${portB}/" width="600" height="160"></iframe></body>`
+        }
+        s.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+        s.end(html)
+      })
+      await new Promise<void>((r) => srvA.listen(0, '127.0.0.1', r))
+      const portA = (srvA.address() as { port: number }).port
+      try {
+        await tm.navigate(`http://127.0.0.1:${portA}/`)
+        await sleep(1800)
+        const ir = await ex.extract()
+        const texts = ir.candidates.map((c) => c.text).join('|')
+        check(
+          'iframe穿透-二层同源嵌套',
+          texts.includes('一层按钮') && texts.includes('二层按钮'),
+          `一层=${texts.includes('一层按钮')} 二层=${texts.includes('二层按钮')}`
+        )
+        const xc = ir.candidates.find((c) => c.text === '跨域按钮')
+        check('iframe穿透-跨域frame候选补充', !!xc, `跨域候选=${!!xc} frameKey=${xc?.frameKey || '无'}`)
+        // read_content：一层/二层/跨域表格全收集
+        const rc = await ex.executeBatch([{ name: 'read_content' } as any], {
+          memory: {},
+          signal: new AbortController().signal,
+          settings: { speed: 'fast' } as any
+        })
+        const rcText = String(rc[0]?.result || '')
+        check(
+          'iframe穿透-read_content全收集',
+          rcText.includes('A1') && rcText.includes('B1') && rcText.includes('XO-9001'),
+          `一层=${rcText.includes('A1')} 二层=${rcText.includes('B1')} 跨域=${rcText.includes('XO-9001')}`
+        )
+        // 二层按钮点击（同源 framePaths 链 + 偏移坐标）
+        const i2 = ir.candidates.findIndex((c) => c.text === '二层按钮')
+        const c2out = await ex.executeBatch([{ name: 'click', index: i2, expect_text: '二层按钮' } as any], {
+          memory: {},
+          signal: new AbortController().signal,
+          settings: { speed: 'fast' } as any
+        })
+        await sleep(300)
+        const t2 = await tm.active()!.view.webContents.executeJavaScript('document.title')
+        check(
+          'iframe穿透-二层按钮点击命中',
+          !c2out[0]?.error && t2 === 'l2-clicked',
+          `err=${(c2out[0]?.error || '').slice(0, 30)} title=${t2}`
+        )
+        // 跨域按钮点击（frameKey 解析 + 偏移链坐标）
+        const xi = ir.candidates.findIndex((c) => c.text === '跨域按钮')
+        const xout = await ex.executeBatch([{ name: 'click', index: xi, expect_text: '跨域按钮' } as any], {
+          memory: {},
+          signal: new AbortController().signal,
+          settings: { speed: 'fast' } as any
+        })
+        await sleep(300)
+        let xt = ''
+        try {
+          const { runByKey } = await import('./frameAccess')
+          const fkey = ir.candidates[xi]?.frameKey
+          if (fkey) {
+            xt =
+              (await runByKey<string>(
+                tm.active()!.view.webContents,
+                fkey,
+                String(function readTitle() {
+                  return document.title
+                })
+              )) || ''
+          }
+        } catch {}
+        check(
+          'iframe穿透-跨域按钮点击命中',
+          !xout[0]?.error && xt === 'x-clicked',
+          `err=${(xout[0]?.error || '').slice(0, 30)} 跨域frame title=${xt}`
+        )
+      } finally {
+        srvA.close()
+        srvB.close()
+      }
+    } catch (e: any) {
+      check('iframe穿透(嵌套/跨域)', false, String(e?.stack || e))
     }
   } catch (e: any) {
     check('自测流程', false, String(e?.stack || e))

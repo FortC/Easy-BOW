@@ -2,13 +2,14 @@ import { BrowserWindow, dialog, type WebContents } from 'electron'
 import { WAIT_DOM_STABLE_FN } from './domstable'
 
 /**
- * P1-1 SoM 标注页面侧实现：以截图 dataURL 为底图，在离屏 canvas 上画编号圆标。
- * 圆标半径按元素尺寸 8~14px 自适应、描边保证任意底色可读；编号与文本列表一致。
- * 任何异常返回 null（调用方降级用原图）。
+ * P1-1 SoM 标注页面侧实现：以截图 dataURL 为底图，在离屏 canvas 上标注候选。
+ * v4.4 密集页改版：不再在 rect 中心画实心圆标（密集小控件会被标遮住本体图标/文字，
+ * 模型看不清就是错位主因）——改为「极浅底色 + 橙色边框」框住整个控件 + 编号角标贴
+ * 左上角框外，控件内容保持可见；编号与文本列表一致。任何异常返回 null（调用方降级用原图）。
  */
 const SOM_MARK_FN = String(function somMark(
   dataUrl: string,
-  marks: Array<{ x: number; y: number; n: number }>,
+  marks: Array<{ x: number; y: number; w: number; h: number; n: number }>,
   vw: number,
   vh: number
 ): Promise<string | null> {
@@ -25,22 +26,42 @@ const SOM_MARK_FN = String(function somMark(
           // 截图像素与 CSS 视口的换算（DPR/缩放截图尺寸可能大于视口）
           const sx = cv.width / vw
           const sy = cv.height / vh
+          const ss = Math.min(sx, sy)
+          // 角标尺寸随图自适应（编号 1~3 位数都能放下）
+          const bh = Math.max(12, Math.min(22, Math.round(Math.min(cv.width, cv.height) / 56)))
+          const rr = Math.round(bh * 0.28)
           for (const m of marks) {
-            const px = m.x * sx
-            const py = m.y * sy
-            const r = Math.max(8, Math.min(14, Math.round(Math.min(cv.width, cv.height) / 90)))
-            ctx.beginPath()
-            ctx.arc(px, py, r, 0, Math.PI * 2)
-            ctx.fillStyle = 'rgba(255, 106, 0, 0.92)'
-            ctx.fill()
-            ctx.lineWidth = 2
-            ctx.strokeStyle = '#fff'
-            ctx.stroke()
+            const x = m.x * sx
+            const y = m.y * sy
+            const w = Math.max(2, m.w * sx)
+            const h = Math.max(2, m.h * sy)
+            // 控件框：极浅底色（内容透出）+ 高对比边框
+            const bw = Math.max(1.5, 2.2 * ss)
+            ctx.fillStyle = 'rgba(255, 106, 0, 0.10)'
+            ctx.fillRect(x, y, w, h)
+            ctx.lineWidth = bw
+            ctx.strokeStyle = 'rgba(255, 106, 0, 0.95)'
+            ctx.strokeRect(x + bw / 2, y + bw / 2, Math.max(1, w - bw), Math.max(1, h - bw))
+            // 编号角标：优先贴框上方外侧（不遮内容），顶部放不下则放下方，再放不下才压左上角
+            const label = String(m.n)
+            const bwd = Math.round(bh * (0.62 + 0.34 * label.length))
+            let bx = Math.max(0, Math.min(cv.width - bwd, x - 1))
+            let by = y - bh
+            if (by < 0) by = y + h
+            if (by + bh > cv.height) by = Math.max(0, y)
+            ctx.fillStyle = '#FF6A00'
+            if (typeof (ctx as any).roundRect === 'function') {
+              ctx.beginPath()
+              ;(ctx as any).roundRect(bx, by, bwd, bh, rr)
+              ctx.fill()
+            } else {
+              ctx.fillRect(bx, by, bwd, bh)
+            }
             ctx.fillStyle = '#fff'
-            ctx.font = `bold ${Math.round(r * 1.15)}px system-ui, sans-serif`
+            ctx.font = `bold ${Math.round(bh * 0.66)}px system-ui, sans-serif`
             ctx.textAlign = 'center'
             ctx.textBaseline = 'middle'
-            ctx.fillText(String(m.n), px, py + 0.5)
+            ctx.fillText(label, bx + bwd / 2, by + bh / 2 + 0.5)
           }
           resolve(cv.toDataURL('image/jpeg', 0.82))
         } catch {
@@ -266,15 +287,30 @@ export class Cdp {
     return data ? Buffer.from(data, 'base64') : null
   }
 
+  /** 局部截图（视口 CSS 像素矩形，jpeg dataURL）——v4.4 密集页点击前放大复核用 */
+  async screenshotClip(x: number, y: number, w: number, h: number, quality = 82): Promise<string | null> {
+    try {
+      const data = await this.captureScreenshot({
+        format: 'jpeg',
+        quality: Math.max(30, Math.min(95, Math.round(quality))),
+        clip: { x, y, width: w, height: h, scale: 1 },
+        captureBeyondViewport: false
+      })
+      return data ? `data:image/jpeg;base64,${data}` : null
+    } catch {
+      return null
+    }
+  }
+
   /**
-   * P1-1（v4 方案 A3）Set-of-Marks 截图标注：截图后把候选编号画在各自 rect 中心——
-   * 视觉模式的模型不再需要「脑内把文本编号贴到图上」，密集页错位率显著下降。
-   * 实现走页面离屏 canvas（截图 dataURL 为底图 + 视口内候选编号圆标），
+   * P1-1（v4 方案 A3）Set-of-Marks 截图标注：截图后把候选编号标在各自 rect 上（边框高亮 +
+   * 左上角编号角标，不遮控件本体）——视觉模式的模型不再需要「脑内把文本编号贴到图上」，
+   * 密集页错位率显著下降。实现走页面离屏 canvas（截图 dataURL 为底图 + 视口内候选标注），
    * 只给模型看；时间线/存档仍用原图。任何失败静默返回原图（零风险降级）。
    */
   async screenshotWithMarks(
     quality: number,
-    marks: Array<{ x: number; y: number; n: number }>,
+    marks: Array<{ x: number; y: number; w: number; h: number; n: number }>,
     viewportW: number,
     viewportH: number
   ): Promise<string | null> {

@@ -51,6 +51,7 @@ const api: EasybowApi = {
   getTestEnvs: () => ipcRenderer.invoke('testenvs:get'),
   setTestEnvs: (envs) => ipcRenderer.invoke('testenvs:set', envs),
   readClipboardImage: () => ipcRenderer.invoke('clipboard:readImage'),
+  asrTranscribe: (pcm, sampleRate) => ipcRenderer.invoke('asr:transcribe', pcm, sampleRate),
   fastllmStatus: () => ipcRenderer.invoke('fastllm:status'),
   fastllmInit: () => ipcRenderer.invoke('fastllm:init'),
   getSchedules: () => ipcRenderer.invoke('schedules:get'),

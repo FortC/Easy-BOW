@@ -55,6 +55,9 @@ extraResources:
   # 托盘图标（关闭窗口最小化到托盘时的入口）
   - from: resources/tray.png
     to: tray.png
+  # 窗口图标（与安装图标同源；打包后窗口/任务栏显式指定，dev 下也用它）
+  - from: resources/app-icon.png
+    to: app-icon.png
   - from: resources/overlay.html
     to: overlay.html
   - from: resources/overlay-preload.js
@@ -62,6 +65,9 @@ extraResources:
   # 本地快速决策模型内置（用户免下载；由 scripts/fetch-fastmodel.mjs 在构建前拉取）
   - from: resources/fastmodel
     to: fastmodel
+  # 本地语音识别模型内置（v4.4 语音输入，whisper-base int8；scripts/fetch-asr-model.mjs 构建前拉取）
+  - from: resources/asr
+    to: asr
   # 回归 fixtures（--regression 本地用例页；打包后回归也能跑）
   - from: resources/fixtures
     to: fixtures

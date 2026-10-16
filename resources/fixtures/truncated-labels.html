@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>截断标签基准</title>
+<style>
+  body { font-family: system-ui, sans-serif; padding: 24px; background: #fafafa; color: #222; }
+  h1 { font-size: 20px; }
+  .box { margin: 14px 0; padding: 12px 14px; background: #fff; border: 1px solid #ddd; border-radius: 8px; max-width: 720px; }
+  .box h2 { font-size: 15px; margin: 0 0 8px; color: #555; }
+  .row { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+  .row label { width: 190px; }
+  input[type=text] { min-width: 200px; padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px; }
+
+  /* ① CSS 省略号：innerText 仍返回完整文本（这是本基准要锁住的事实） */
+  .css-ellipsis { width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ② JS 截断模拟：DOM 里真的只有半截，全称只在 title 上 */
+  .js-truncated { width: 160px; overflow: hidden; white-space: nowrap; }
+
+  /* ③ 超长文案（>80 字，触发 TEXT_CAP 截断） */
+  .long-label { font-size: 13px; }
+
+  #result { margin-top: 16px; padding: 12px 14px; background: #eef6ff; border: 1px solid #8cf; border-radius: 6px; min-height: 24px; }
+</style>
+</head>
+<body>
+<h1>截断标签基准（CSS 省略号 / JS 截断 / SVG text / 超长文案）</h1>
+<p>用于验证 v4.5 的文本多源采集：short（可见文案）、fullText（title 全称）、truncatedBy（截断来源）。</p>
+
+<div class="box">
+  <h2>① CSS text-overflow:ellipsis —— innerText 应为完整文本</h2>
+  <div class="row">
+    <label class="css-ellipsis" title="收货人姓名（必填）">收货人姓名（必填）</label>
+    <input type="text" id="f1" name="receiver" data-mfs-key="收货人姓名">
+  </div>
+  <div class="row">
+    <label class="css-ellipsis" title="详细的收货地址（门牌号必填）">详细的收货地址（门牌号必填）</label>
+    <input type="text" id="f2" name="address" data-mfs-key="详细的收货地址">
+  </div>
+</div>
+
+<div class="box">
+  <h2>② JS 截断 —— DOM 里只有半截，全称在 title 上</h2>
+  <div class="row">
+    <label class="js-truncated" id="l3" title="买家备注：请填写收货注意事项">买家备注：请填写收货注意事项</label>
+    <input type="text" id="f3" name="buyerRemark" data-mfs-key="买家备注">
+  </div>
+  <div class="row">
+    <label class="js-truncated" id="l4" title="内部编号（系统自动生成，请勿修改）">内部编号（系统自动生成，请勿修改）</label>
+    <input type="text" id="f4" name="innerCode" data-mfs-key="内部编号">
+  </div>
+</div>
+
+<div class="box">
+  <h2>③ SVG &lt;text&gt; 渲染 —— innerText 在部分浏览器为 undefined</h2>
+  <svg width="220" height="40" role="img" aria-label="库存状态标签" data-mfs-key="库存状态">
+    <text x="4" y="24" font-size="14">库存状态：现货充足</text>
+  </svg>
+</div>
+
+<div class="box">
+  <h2>④ 超长文案（&gt; 80 字，验证 TEXT_CAP 统一）</h2>
+  <div class="row">
+    <label class="long-label" id="l5">这是一个非常非常长的表单字段名称用于验证文案长度上限的统一处理它明显超过了八十个字符的截断阈值因此在快照与实时回读两条链路上都必须使用同一个长度常量否则会因为长度不一致而误判身份不匹配</label>
+    <input type="text" id="f5" name="longField">
+  </div>
+</div>
+
+<div class="box">
+  <h2>⑤ 表格布局 + 左侧 label 被 JS 截断（adj 线索）</h2>
+  <table>
+    <tr><td id="t6">发货方式（顺丰/京东/中通…）</td><td><input type="text" id="f6" name="shipping"></td></tr>
+    <tr><td id="t7">买家支付宝账号</td><td><input type="text" id="f7" name="alipay"></td></tr>
+  </table>
+</div>
+
+<div id="result">ready</div>
+
+<script>
+  // 把「可见文案」按宽度截断，只保留到 title 里 —— 模拟后端只给半截的常见场景
+  (function () {
+    var MAX = 8;
+    ['l3', 'l4', 't6', 't7'].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      el.dataset.full = el.getAttribute('title') || el.textContent;
+      el.textContent = (el.dataset.full || '').slice(0, MAX) + '…';
+    });
+  })();
+
+  // 点击日志：selftest 用它断言「全称匹配不会点错元素」
+  window.__clickLog = [];
+  document.addEventListener('click', function (e) {
+    var el = e.target.closest('button,[role=button],svg text');
+    if (el) window.__clickLog.push({ id: el.id || el.textContent, title: el.getAttribute('title') || '' });
+  });
+</script>
+</body>
+</html>

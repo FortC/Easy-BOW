@@ -84,6 +84,31 @@ export interface Settings {
   /** W9 模型分级：planner 强推理模型（仅用于重规划/strict 复核/卡住节点专家重试，
    *  不参与逐步执行；缺省=跟随主配置） */
   planner?: PlannerSettings
+  /* —— v4.6 Token 成本与提速开关（全部默认开启；出问题可逐层关闭独立回滚） —— */
+  /** A1/A2 缓存计量与调用点分账（纯埋点，无行为影响，不建议关） */
+  cacheAccounting?: boolean
+  /** C1 提示词缓存断点修复：vision/canvas/test 附加段迁出 system（false=回退旧行为拼进 system） */
+  stableSystemPrompt?: boolean
+  /** C6 动态输出预算：按调用点与是否推理模型收紧 max_tokens（false=回退固定 2048/6144/4096） */
+  outputBudget?: boolean
+  /** C4 文本模式网格坐标粒度：edges=仅列表首尾 8 行保留（默认）/ all=每行 / off=不输出 */
+  textGridCoords?: 'edges' | 'all' | 'off'
+  /** C2a 历史折叠：超过 12 步的任务把早期步骤折叠为聚合行（false=始终全量逐行） */
+  historyFold?: boolean
+  /** C5 read_content/extract_images 分片：默认只回填预览，offset/limit 按需续读（false=一次性全量 6200 字） */
+  pagedRead?: boolean
+  /** C3 元素列表分级：非密集页用 summary 行格式（false=恒 full 全字段） */
+  obsDetail?: boolean
+  /** B1 打转调优：无推进阈值 3→2、failSig 重复即触发、重规划上限 2→3（false=回退 v4.5 阈值） */
+  replanTune?: boolean
+  /** D1 点击视觉复核分档：文本证据闭合的同名行跳过放大复核（false=submitish 与同名≥2 恒复核） */
+  clickVerifyTune?: boolean
+  /** B2 本地快速决策扩权：失败冷却 10→5 步 + 错误重试直出（false=回退 v4.5 门控） */
+  localRetry?: boolean
+  /** B3 页面指纹去重：页面与上一步完全相同时省略元素列表（false=每步全量列表） */
+  pageHashSkip?: boolean
+  /** B5 repeat 提示：连续 3 步同构动作时注入一次 repeat 建议（false=不提示） */
+  repeatNudge?: boolean
 }
 
 /** T10 planner 配置块（缺省字段跟随主配置；独立 baseURL/apiKey/model 可指向强推理模型） */
@@ -131,7 +156,20 @@ export const DEFAULT_SETTINGS: Settings = {
   shadowDom: true,
   reflection: true,
   replan: true,
-  actionVerify: true
+  actionVerify: true,
+  // v4.6 Token 成本与提速：全部默认开启（独立开关可逐层回滚）
+  cacheAccounting: true,
+  stableSystemPrompt: true,
+  outputBudget: true,
+  textGridCoords: 'edges',
+  historyFold: true,
+  pagedRead: true,
+  obsDetail: true,
+  replanTune: true,
+  clickVerifyTune: true,
+  localRetry: true,
+  pageHashSkip: true,
+  repeatNudge: true
 }
 
 export const MAX_TABS = 5
@@ -255,9 +293,24 @@ export type ExpectKind =
   | 'api_status'
   | 'api_body'
 
+/** v4.5 节点作用对象的接地锚：描述「这个节点要操作谁」，
+ *  而非 index（编号每步重排会漂移，跨步骤无效）。
+ *  进入节点前用它做可达性校验（PlanValidator C4），失败即判定规划器在想象不存在的字段。 */
+export interface PlanNodeTarget {
+  kind: 'field' | 'button' | 'link' | 'text' | 'row_action' | 'tab'
+  /** 目标文案/字段名（支持截断形式，校验时走 textmatch 截断感知比较） */
+  label: string
+  /** 邻近定位词（表格里 label 与输入框分离时用，如「基本信息」「地址」） */
+  near?: string
+}
+
 export interface AgentAction {
   name: ActionName
   index?: number
+  /** v4.5 元素指纹（4 位十六进制）：跨步骤稳定的元素身份。
+   *  与 index 二选一使用——index 每步重排会漂移，fp 不变。模型写 fp 时系统按指纹在当前
+   *  快照里反查元素，天然解决「密集页同名按钮该点哪一行」与「上一步记住的元素这步变了编号」 */
+  fp?: string
   /** drag：拖动目标元素编号（把 index 元素拖到 index2 元素上） */
   index2?: number
   text?: string
@@ -287,12 +340,19 @@ export interface AgentAction {
   x?: number
   /** click_xy：截图上的归一化纵坐标 0~1000 */
   y?: number
+  /** click/click_xy：目标预期文案（按钮文字；同名按钮必须含 (行:…) 行标识）——
+   *  点击前与实际命中元素做语义核验，不符即拒绝点击（密集页防点错行的关键契约） */
+  expect_text?: string
   /** S4 多候选：模型列出 2-3 个候选编号（与 click/type 同用、不填 index），系统语义裁决取最优 */
   candidates?: number[]
   /** S4 模型自述不确定度 0~1（仅记录，不影响执行） */
   uncertain?: number
   /** clarify：要向人工提出的问题 */
   query?: string
+  /** C5 分片读取：read_content/extract_images 的续读偏移（0-based 字符/条目） */
+  offset?: number
+  /** C5 分片读取：续读长度（字符/条目；缺省 2000） */
+  limit?: number
   /** T8 反思签名（主进程回填）：动作名+目标语义+容器锚文本——失败尝试清单按它去重 */
   failSig?: string
   /** 主进程回填：本动作目标是提交/保存/删除/支付类（submitish）——W10 delta 核验按它分流强提示 */
@@ -484,6 +544,14 @@ export interface PlanNode {
   intent: string
   expected: string
   check?: PlanNodeCheck
+  /** v4.5 接地锚：这个节点要作用的对象（字段/按钮/链接…）。规划时基于真实页面元素产出，
+   *  供 PlanValidator 做可达性校验——「规划器在想象页面上不存在的字段」必须在这一层拦下 */
+  target?: PlanNodeTarget
+  /** v4.5 写操作标记（提交/保存/删除/支付/修改…）：退出该节点时强制走云端 L2 复核，
+   *  复核判为不确定一律不放行。只读节点保持 L1 快速放行以控 token */
+  risk?: 'write' | 'read'
+  /** v4.5 进入节点前的门（如「必须先看到登录态」）：不满足就不该进这个节点 */
+  precheck?: PlanNodeCheck
 }
 
 /** 节点运行状态（UI 节点进度条渲染用） */
@@ -514,6 +582,8 @@ export interface AgentStatus {
     inputTokens: number
     outputTokens: number
     steps: number
+    /** A1 前缀缓存命中的输入 token（端点未上报时缺省；成本按缓存价估算的依据） */
+    cachedInputTokens?: number
     /** T10 planner 累计用量（重规划/专家重试；未配置 planner 恒 0/缺省，UI 可分列显示） */
     plannerInputTokens?: number
     plannerOutputTokens?: number
@@ -537,6 +607,12 @@ export interface FastLlmState {
   detail?: string
   /** 模型已内置在安装包中（无需下载） */
   bundled?: boolean
+}
+
+/** v4.4 语音输入：本地 whisper 模型状态（asr-status 事件负载） */
+export interface AsrStatus {
+  state: 'idle' | 'loading' | 'ready' | 'error'
+  detail?: string
 }
 
 /** 定时任务：到点自动把任务描述交给 AI 执行 */
@@ -573,6 +649,8 @@ export type MainEvent =
   | { channel: 'toast'; message: string; kind: 'info' | 'success' | 'error' | 'captcha' }
   | { channel: 'ocr-status'; enabled: boolean; reason?: string }
   | { channel: 'fastllm'; status: FastLlmState }
+  /** v4.4 语音输入：本地 whisper 模型加载/转写状态 */
+  | { channel: 'asr'; status: AsrStatus }
   | { channel: 'schedules'; schedules: Schedule[] }
   /** 定时任务即将执行：secondsLeft ≤ 60 时每秒推送一次（顶部倒计时条 + 取消按钮） */
   | { channel: 'schedule-countdown'; id: number; name: string; secondsLeft: number }
@@ -595,6 +673,8 @@ export interface EasybowApi {
   listCCSwitchProviders(): Promise<CCSwitchProviderInfo[]>
   /** 读取系统剪贴板图片（人工介入附截图用）：PNG/JPEG dataURL，无图返回 null */
   readClipboardImage(): Promise<string | null>
+  /** v4.4 语音输入：PCM（Float32Array，16kHz 单声道）→ 文本（本地 whisper，离线免费） */
+  asrTranscribe(pcm: Float32Array, sampleRate: number): Promise<{ ok: boolean; text?: string; error?: string }>
   // 本地快速决策模型（混合模式）
   fastllmStatus(): Promise<FastLlmState>
   /** 下载并加载本地快速决策模型（幂等），进度经 fastllm 事件推送 */

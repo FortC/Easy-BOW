@@ -8,12 +8,23 @@ import { scoreCandidate } from './semantic'
 export interface Candidate {
   /** iframe 链上每一层的索引路径（从 documentElement 起；-1 哨兵语义同 path） */
   framePaths: number[][]
+  /** v4.4 跨域 frame 标识（frameAccess 的 frame 树位置，如 "0.2.1"）：带此字段的候选
+   *  定位/赋值必须回该 frame 上下文执行（contentDocument 链走不通）；缺省=同源链定位 */
+  frameKey?: string
   /** 本文档内从 documentElement 到元素的 children 索引路径；
    *  -1 哨兵 = 进入当前元素的 shadowRoot（如 [2,-1,0,5] = documentElement.children[2].shadowRoot.children[0].children[5]） */
   path: number[]
   tag: string
   role: string
   text: string
+  /** v4.5 全称：与 text 不同且更长时才有值（JS 截断场景= title 属性；SVG <text> = textContent）。
+   *  模型可引用任一种说法，匹配侧两侧都能命中——见 textmatch.ts 的省略号前缀匹配 */
+  fullText?: string
+  /** v4.5 截断来源：js（脚本 slice 模拟省略）/ css（CSS 省略号，innerText 本就是全量）/ svg */
+  truncatedBy?: 'css' | 'js' | 'svg'
+  /** v4.5 元素指纹：跨步骤稳定（不含 children 索引路径），用于跨步定位与同名消歧。
+   *  模型可输出 {"name":"click","fp":"a3f2"} 直接引用，不受每步重排导致的编号漂移影响 */
+  fp?: string
   extra: string
   /** 视口绝对坐标（iframe 内元素已逐层累加祖先 iframe 偏移，与顶层截图对齐；shadow 内元素坐标本身是视口坐标，不偏移） */
   rect: { x: number; y: number; w: number; h: number }
@@ -53,11 +64,15 @@ export interface SemanticHint {
   score: number
 }
 
-/** 在页面上下文中运行（自包含，序列化注入）；shadow=false 时关闭 shadow DOM 穿透（W5 开关回滚用） */
-export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: boolean) {
+/** 在页面上下文中运行（自包含，序列化注入）；shadow=false 时关闭 shadow DOM 穿透（W5 开关回滚用）。
+ *  cap=TEXT_CAP：文案长度上限，与 RESOLVE_FN 共用同一常量（消除历史上的 80/40 不对称） */
+export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: boolean, cap?: number) {
   const SEL =
     'a[href], button, input, select, textarea, summary, [role], [contenteditable="true"], [onclick], img[onclick], label[for], [tabindex]:not([tabindex="-1"])'
   const INTERACTIVE_TAGS = new Set(['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'SUMMARY'])
+  const CAP = cap || 80
+  /** 尾部省略号/展开控件文案——判定「这份文案是被截断的」 */
+  const ELL = /(?:[…\.]{2,}|。{3,}|【?\s*(?:更多|查看更多|全文|展开)\s*】?|>+)\s*$/
 
   const out: any[] = []
   let total = 0
@@ -104,44 +119,140 @@ export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: 
     return t.toLowerCase()
   }
 
-  function textOf(el: Element, role: string): { text: string; extra: string } {
+  /**
+   * v4.5 全称回收：从 title / data-* / 内层 span[title] 里找比可见文案更长的「真名」。
+   * 返回 null 表示没有更长的全称（多数元素如此，零开销）。
+   *
+   * 背景（务必先读，否则容易把已修好的地方改坏）：
+   * CSS `text-overflow: ellipsis` **不影响** `innerText`——它返回完整文本，省略号纯属渲染层效果。
+   * 所以「CSS 省略号导致只拿到前几个字」在本项目不是问题；真正丢全称的是 **JS 截断**
+   * （s.slice(0,10)+'…'，DOM 里就只剩半截）与 **SVG <text>**（innerText 在部分浏览器为 undefined），
+   * 这两种情况全称只能从属性或 textContent 取。本函数针对的正是这两种。
+   */
+  function recoverFull(el: Element, visible: string): string {
+    if (!visible) return ''
+    // 先扫属性（getAttribute 极廉价），全部没命中才做一次 querySelector('[title]')——
+    // 提取是每步都跑的全页遍历，内层查询放在兜底位而不是第一位
+    const attrs: (string | null)[] = [
+      el.getAttribute('title'),
+      el.getAttribute('data-original'),
+      el.getAttribute('data-full'),
+      el.getAttribute('data-fulltext'),
+      el.getAttribute('data-text'),
+      el.getAttribute('data-name')
+    ]
+    for (const c of attrs) {
+      const v = normText(c)
+      if (v && v.length > visible.length) return v
+    }
+    try {
+      const inner = el.querySelector('[title]')
+      const v = inner ? normText(inner.getAttribute('title')) : ''
+      if (v && v.length > visible.length) return v
+    } catch {}
+    return ''
+  }
+
+  /** 元素是否被 CSS 截断（内容比盒子宽 / 声明了 ellipsis / line-clamp）——只作提示标记 */
+  function cssTruncated(el: Element): boolean {
+    try {
+      const h = el as HTMLElement
+      const cs = getComputedStyle(h)
+      if (cs.textOverflow === 'ellipsis') return true
+      if (cs.webkitLineClamp && cs.webkitLineClamp !== 'none') return true
+      if (h.clientWidth > 0 && h.scrollWidth > h.clientWidth + 2) return true
+    } catch {}
+    return false
+  }
+
+  function textOf(
+    el: Element,
+    role: string
+  ): { text: string; fullText: string; truncatedBy: '' | 'css' | 'js' | 'svg'; extra: string } {
     let text = ''
     let extra = ''
+    let fullText = ''
+    let truncatedBy: '' | 'css' | 'js' | 'svg' = ''
     const t = el.tagName
     if (t === 'INPUT' || t === 'TEXTAREA') {
       const ph = normText(el.getAttribute('placeholder'))
       const val = normText((el as any).value)
-      if (t === 'TEXTAREA') text = val.slice(0, 80)
+      if (t === 'TEXTAREA') text = val.slice(0, CAP)
       else if ((el.getAttribute('type') || 'text') === 'password') text = val ? '(已输入密码)' : ''
-      else text = val.slice(0, 40)
-      if (ph) extra += `placeholder=${ph.slice(0, 30)}`
+      else text = val.slice(0, CAP)
+      if (ph) extra += `placeholder=${ph.slice(0, CAP)}`
       // 关联 label
       let lab = ''
+      let labFull = ''
       const id = el.getAttribute('id')
       if (id) {
         const l = document.querySelector(`label[for="${CSS.escape(id)}"]`)
-        if (l) lab = normText((l as HTMLElement).innerText)
+        if (l) {
+          lab = normText((l as HTMLElement).innerText)
+          labFull = recoverFull(l, lab)
+        }
       }
       if (!lab) {
         const p = el.closest('label')
-        if (p) lab = normText(p.innerText)
+        if (p) {
+          lab = normText(p.innerText)
+          labFull = recoverFull(p, lab)
+        }
       }
-      if (lab) extra += (extra ? ' ' : '') + `label=${lab.slice(0, 30)}`
+      if (lab) {
+        extra += (extra ? ' ' : '') + `label=${lab.slice(0, CAP)}`
+        // v4.5：字段名被 JS 截断时，把 title 里的全称带出来（「收货人姓名…」→ 全称「收货人姓名（必填）」）
+        if (labFull) {
+          extra += `~全称:${labFull.slice(0, CAP)}`
+          if (!fullText) {
+            fullText = labFull
+            truncatedBy = ELL.test(lab) ? 'js' : 'css'
+          }
+        }
+      }
       const ck = el.getAttribute('type')
       if (ck === 'checkbox' || ck === 'radio') text = (el as any).checked ? '已勾选' : '未勾选'
     } else if (t === 'SELECT') {
       const sel = el as HTMLSelectElement
       const opt = sel.selectedOptions[0]
-      text = normText(opt && opt.textContent).slice(0, 30)
+      text = normText(opt && opt.textContent).slice(0, CAP)
       extra = `${sel.options.length}个选项`
     } else if (t === 'IMG') {
       text = normText(el.getAttribute('alt'))
       extra = `图片${Math.round(el.getBoundingClientRect().width)}x${Math.round(el.getBoundingClientRect().height)}`
     } else {
-      text = normText((el as HTMLElement).innerText).slice(0, 80)
+      // v4.5：innerText → textContent 兜底（SVG <text> 的 innerText 在部分浏览器为 undefined）
+      let raw: string = ''
+      try {
+        raw = normText((el as HTMLElement).innerText)
+      } catch {}
+      if (!raw) {
+        raw = normText(el.textContent)
+        // SVG 命名空间下才认定为 svg 来源（HTML 元素 innerText 为空多半是真无文案）
+        if (raw && el.namespaceURI && el.namespaceURI.indexOf('svg') !== -1) truncatedBy = 'svg'
+      }
+      text = raw.slice(0, CAP)
+      // 全称回收：JS 截断（尾部真带省略号）优先级最高，其次 CSS 截断。
+      // 顺序有意为之：先试 recoverFull（只读属性，零布局开销），拿不到全称时**才**调
+      // cssTruncated（一次 getComputedStyle）。绝大多数元素到不了第二步——
+      // 提取是每步都跑的全页遍历，每个元素多一次 getComputedStyle 在密集页上是实打实的成本。
+      if (text) {
+        const jsEll = ELL.test(raw)
+        const full = recoverFull(el, raw)
+        if (full) {
+          fullText = full
+          truncatedBy = jsEll ? 'js' : 'css'
+        } else if (jsEll) {
+          truncatedBy = 'js'
+        } else if (cssTruncated(el)) {
+          truncatedBy = 'css'
+        }
+      }
     }
-    if (!text) text = normText(el.getAttribute('aria-label')).slice(0, 50)
-    if (!text) text = normText(el.getAttribute('title')).slice(0, 50)
+    if (!text) {
+      text = normText(el.getAttribute('aria-label')).slice(0, CAP)
+      if (!text) text = normText(el.getAttribute('title')).slice(0, CAP)
+    }
     if (t === 'A' && role === 'link') {
       const href = el.getAttribute('href') || ''
       if (href && !href.startsWith('javascript')) {
@@ -152,12 +263,18 @@ export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: 
     // S1 语义锚点①：属性锚点 name/id/autocomplete（表单字段的英文语义线索）
     const attrs = attrsOf(el)
     if (attrs) extra += (extra ? ' ' : '') + attrs
-    // S1 语义锚点②：邻近文本（表格布局里 label 常在相邻 td——老式 ERP 字段的唯一线索）
+    // S1 语义锚点②：邻近文本（表格布局里 label 常在相邻 td、flex 表单里在前一个兄弟——
+    // 老式 ERP 与现代表单里字段名的唯一线索）
     if (t === 'INPUT' || t === 'TEXTAREA' || t === 'SELECT') {
       const adj = adjacentOf(el)
-      if (adj) extra += (extra ? ' ' : '') + `adj=${adj}`
+      if (adj.text) extra += (extra ? ' ' : '') + `adj=${adj.text}`
+      // 邻近 label 被 JS 截断时，全称同样要落到候选自身的 fullText 上（不只是 extra 里）
+      if (adj.full && !fullText) {
+        fullText = adj.full
+        truncatedBy = 'js'
+      }
     }
-    return { text: text.slice(0, 80), extra: extra.slice(0, 160) }
+    return { text: text.slice(0, CAP), fullText: fullText.slice(0, CAP), truncatedBy, extra: extra.slice(0, 200) }
   }
 
   /** 属性锚点：name / id / autocomplete（截断控噪声；id 与 name 相同不重复） */
@@ -177,29 +294,44 @@ export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: 
    * 导致聚水潭等老式 ERP 的字段在提示词里是空白元素）。
    * 优先取左侧单元格（label 通常在输入框左边，同行多字段时行文本会混淆语义）。
    */
-  function adjacentOf(el: Element): string {
+  /**
+   * 邻近文本：表格布局里 label 在相邻 td；flex 表单里 label 在前一个兄弟节点。
+   * 返回 { text, full }：full 是从 title 回收的全称（JS 截断场景的字段名真身），
+   * 调用方据此填充候选的 fullText/truncatedBy——此前全称只进了 extra 的拼接串，
+   * 候选自身没有全称字段，模型按 adj= 里的全称去引用时匹配面反而更窄。
+   */
+  function adjacentOf(el: Element): { text: string; full: string } {
+    const none = { text: '', full: '' }
+    const from = (node: Element, raw: string): { text: string; full: string } => {
+      const t = normText(raw)
+      if (!t) return none
+      const full = recoverFull(node, t)
+      return { text: (full || t).slice(0, 40), full: full ? full.slice(0, 40) : '' }
+    }
     try {
       const cell = el.closest('td,th')
       if (cell) {
         const prevCell = cell.previousElementSibling
+        // 长度门槛从 12 放宽到 40：中文字段名（「详细的收货地址（门牌号必填）」）
+        // 本来就超过 12 字，旧的 12 字门槛会把整张表单的字段名全部丢掉
         if (prevCell && !prevCell.querySelector('input,select,textarea')) {
           const t = normText(prevCell.textContent)
-          if (t && t.length <= 12) return t.slice(0, 24)
+          if (t && t.length <= 40) return from(prevCell, t)
         }
         if (cell.parentElement) {
           const t = normText((cell.parentElement as HTMLElement).innerText)
-          if (t) return t.slice(0, 60)
+          if (t) return { text: t.slice(0, 80), full: '' }
         }
       }
       const wrap = el.closest('.form-item,.form-group,.field,.ant-form-item,.el-form-item')
-      if (wrap) return normText((wrap as HTMLElement).innerText).slice(0, 60)
+      if (wrap) return { text: normText((wrap as HTMLElement).innerText).slice(0, 80), full: '' }
       const prev = el.previousElementSibling
       if (prev && !/^(INPUT|SELECT|TEXTAREA)$/.test(prev.tagName)) {
         const t = normText((prev as HTMLElement).innerText)
-        if (t && t.length <= 12) return t.slice(0, 24)
+        if (t && t.length <= 40) return from(prev, t)
       }
     } catch {}
-    return ''
+    return none
   }
 
   /**
@@ -337,6 +469,46 @@ export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: 
     return path.reverse()
   }
 
+  /**
+   * v4.5 结构签名：向上取 4 层的 **tag 名序列**（不含 children 索引）。
+   * 用 tag 而非索引是关键——索引会随每步重排/虚拟滚动全变，tag 序列不会。
+   */
+  function structuralTags(el: Element): string {
+    const parts: string[] = []
+    let cur: Element | null = el
+    for (let i = 0; i < 4 && cur && cur.tagName; i++) {
+      parts.unshift(cur.tagName)
+      cur = parentOf(cur)
+    }
+    return parts.join('/')
+  }
+
+  /**
+   * v4.5 元素指纹（fp）：跨步骤稳定的元素身份。
+   * 构成 = role | tag | 文案(fullText 优先) | anchor | name/placeholder/id | 结构 tag 序列
+   * - 不含 children 索引路径 → 重排、虚拟滚动、分页后仍稳定
+   * - 含 anchor → 表格里几十个同名「删除」按钮得到互不相同的 fp，天然消歧
+   * - 含 name/placeholder/id → **空值输入框之间不再撞指纹**：一张表单里五个都没填值的
+   *   input 的 role/tag/文案/结构完全相同，早期版本会算出同一个 fp，指纹反而帮了倒忙。
+   *   这三个属性是表单里最稳定的语义线索，正是区分它们的关键。
+   * 取 4 位十六进制：足够区分同页元素，又不撑大提示词
+   */
+  function fingerprintOf(el: Element, role: string, text: string, anchor: string): string {
+    const s = [
+      role,
+      el.tagName,
+      (text || '').slice(0, 40),
+      (anchor || '').slice(0, 24),
+      (el.getAttribute('name') || '').slice(0, 24),
+      (el.getAttribute('placeholder') || '').slice(0, 24),
+      (el.getAttribute('id') || '').slice(0, 24),
+      structuralTags(el)
+    ].join('|')
+    let h = 0
+    for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0
+    return (h >>> 0).toString(16).padStart(8, '0').slice(-4)
+  }
+
   function visible(el: Element, offX: number, offY: number): { rect: DOMRect; ok: boolean; inVp: boolean; occluded: boolean } {
     const rect = el.getBoundingClientRect()
     const cs = getComputedStyle(el)
@@ -392,7 +564,7 @@ export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: 
       if (v.rect.top + offY > window.innerHeight * 8) continue
       total++
       const role = roleOf(el)
-      const { text, extra } = textOf(el, role)
+      const { text, fullText, truncatedBy, extra } = textOf(el, role)
       let score = 0
       if (v.inVp) score += 100
       if (/input|select|可编辑/.test(role)) score += 20
@@ -410,6 +582,8 @@ export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: 
         role,
         text,
         extra,
+        // v4.5 元素指纹：跨步骤稳定（不含 children 索引路径），供模型跨步引用与同名消歧
+        fp: fingerprintOf(el, role, fullText || text, anchor),
         rect: {
           x: Math.round(v.rect.left + offX),
           y: Math.round(v.rect.top + offY),
@@ -419,6 +593,9 @@ export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: 
         inViewport: v.inVp,
         _score: score
       }
+      // v4.5 全称与截断来源：JS 截断 / SVG 场景下把全称单独带出来（模型引用任一种说法都能匹配上）
+      if (fullText && fullText !== text) item.fullText = fullText
+      if (truncatedBy) item.truncatedBy = truncatedBy
       // T5 容器锚点：有锚容器才带字段（不落空串）；不进提示词，只供重定位链消歧用
       if (anchor) item.anchor = anchor
       // W4 state 行内：禁用态从 DOM 实时判定（AX 树的 checked/expanded 由 annotateWithAx 补写）
@@ -427,16 +604,16 @@ export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: 
     }
   }
 
-  function collect(doc: Document, framePaths: number[][], depth: number, offX: number, offY: number): void {
+  function collect(doc: Document, framePaths: number[][], fdepth: number, offX: number, offY: number): void {
     scanRoot(doc, framePaths, offX, offY)
     // T6 shadow DOM 穿透（复用 EXTRACT_IMAGES_FN 的 shadow 栈递归模式）：
     // querySelectorAll 看不见 shadowRoot 内元素；shadow 内元素的 getBoundingClientRect
-    // 已是视口坐标，不累加偏移；深度与 iframe 合计 ≤4 层，host 栈去重防环。
-    // shadowDom=false（W5 回滚开关）时整体跳过
+    // 已是视口坐标，不累加偏移；shadow 深度 ≤3（v4.4 与 iframe 预算解耦，各自独立），
+    // host 栈去重防环。shadowDom=false（W5 回滚开关）时整体跳过
     if (shadow !== false) {
       try {
         const stack: { root: Document | ShadowRoot; d: number; hosts: Element[] }[] = [
-          { root: doc, d: depth, hosts: [] }
+          { root: doc, d: 0, hosts: [] }
         ]
         let visited = 0
         while (stack.length && visited < 60) {
@@ -451,15 +628,16 @@ export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: 
             const sr = (el as any).shadowRoot
             if (!sr || top.hosts.indexOf(el) !== -1) continue
             visited++
-            if (top.d >= 3) continue // 合计深度到顶：只收不下沉
+            if (top.d >= 3) continue // shadow 深度到顶：只收不下沉
             scanRoot(sr, framePaths, offX, offY)
             stack.push({ root: sr, d: top.d + 1, hosts: top.hosts.concat(el) })
           }
         }
       } catch {}
     }
-    // 递归穿透同源 iframe（聚水潭等老式布局必需），最多三层（支付/滑块/广告常在第三层）
-    if (depth < 3) {
+    // 递归穿透同源 iframe（聚水潭等老式布局必需）：v4.4 深度预算 3→5 且与 shadow 解耦——
+    // 老式 ERP 的报表/编辑器常嵌到 3~4 层，越界整棵子树静默丢失
+    if (fdepth < 5) {
       let iframes: Element[]
       try {
         iframes = Array.from(doc.querySelectorAll('iframe'))
@@ -475,14 +653,14 @@ export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: 
         }
         if (!cd || !cd.body) {
           // W5 一期「探测 + 告知」（OOPIF/跨域）：contentDocument 不可读 = 跨域挡住，
-          // 记录 src 供元素列表尾部注明（完整穿透需 CDP Target.setAutoAttach，列 v3.4+）
+          // 记录 src 供元素列表尾部注明（v4.4 起 frameAccess 层会兜底读取跨域 frame）
           const src = f.getAttribute('src') || ''
           if (src && blocked.length < 5) blocked.push(src.slice(0, 100))
           continue
         }
         // iframe 内元素的坐标逐层累加，换算为顶层视口绝对坐标（与截图对齐）
         const fr = f.getBoundingClientRect()
-        collect(cd, [...framePaths, indexPath(f)], depth + 1, offX + fr.left, offY + fr.top)
+        collect(cd, [...framePaths, indexPath(f)], fdepth + 1, offX + fr.left, offY + fr.top)
       }
     }
   }
@@ -517,13 +695,40 @@ export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: 
 
 /** 根据提取结果生成给模型的精简文本行；withCoords 时为视口内元素追加截图归一化坐标 @x,y（0~1000）。
  *  keepIdx（S6 本地初筛）：仅渲染这些原始编号的元素（编号保持不变——快照与动作按原始编号解析），
- *  缺省 = 渲染前 limit 个（与历史行为逐字节一致）。 */
-export function formatCandidates(res: ExtractResult, withCoords = false, keepIdx?: number[]): string {
+ *  缺省 = 渲染前 limit 个（与历史行为逐字节一致）。
+ *  v4.6 C4 gridMode（纯文本模式的粗网格坐标粒度）：edges=仅列表首尾各 8 行保留（页头导航/底部
+ *  翻页这类高频空间指代不丢，中间表单区省掉 ~70% 网格开销）；all=每行（v4.5 行为）；off=不输出。
+ *  v4.6 C3 detail：full=全字段（v4.5 行为）；summary=裁掉 全称/截断标记/行锚/extra（fp/state/网格/
+ *  滚动标记保留）——语义命中行与视口前 8 行仍保留全字段兜底（截断文案匹配与密集页行定位不退化）。
+ *  detail/gridMode 缺省时输出与 v4.5 逐字节一致。 */
+export function formatCandidates(
+  res: ExtractResult,
+  withCoords = false,
+  keepIdx?: number[],
+  gridMode: 'edges' | 'all' | 'off' = 'all',
+  detail: 'full' | 'summary' = 'full'
+): string {
   if (!res.candidates.length) return '（页面上没有发现可交互元素）'
   const vw = res.viewportW || 0
   const vh = res.viewportH || 0
   const keep = keepIdx ? new Set(keepIdx) : null
   const lines: string[] = []
+  /** 同文本 → 编号（密集页同名按钮歧义警示用） */
+  const byText = new Map<string, number[]>()
+  // C3：summary 档的「全字段保留集」——语义命中行 + 视口内前 8 行（密集页/视觉兜底由 runner 判定走 full）
+  const richIdx = new Set<number>()
+  if (detail === 'summary') {
+    for (const h of res.semanticHints || []) if (typeof h.index === 'number') richIdx.add(h.index)
+    let vp = 0
+    for (let i = 0; i < res.candidates.length && vp < 8; i++) {
+      if (res.candidates[i].inViewport) {
+        richIdx.add(i)
+        vp++
+      }
+    }
+  }
+  // C4：edges 模式下的总渲染行数（keep 时=keep 大小，否则=候选总数）
+  const totalEmit = keep ? Math.min(keep.size, res.candidates.length) : res.candidates.length
   let emitted = 0
   res.candidates.forEach((c, i) => {
     if (keep && !keep.has(i)) return
@@ -531,23 +736,54 @@ export function formatCandidates(res: ExtractResult, withCoords = false, keepIdx
     emitted++
     const parts = [`[${i}] <${c.role}>`]
     if (c.text) parts.push(`"${c.text}"`)
-    if (c.extra) parts.push(`(${c.extra})`)
+    const rich = detail !== 'summary' || richIdx.has(i)
+    // v4.5 全称 + 截断标记：模型从截图上抄到的可能是「收货人姓名…」，DOM 全称可能是
+    // 「收货人姓名（必填）」——两种说法系统都能匹配上，这里把全称显式给出，让模型不必猜
+    if (rich && c.fullText && c.fullText !== c.text) parts.push(`~全称:"${c.fullText}"`)
+    if (rich && c.truncatedBy)
+      parts.push(`(${c.truncatedBy === 'js' ? '文案被截断' : c.truncatedBy === 'svg' ? 'SVG渲染' : 'CSS截断'})`)
+    // v4.4 行身份上下文：容器锚点（表格行单号/列表标题等）进提示词——
+    // 密集页几十个同名「编辑/删除」按钮，模型要能用「哪一行」精确指定（expect_text 核验依据）
+    if (rich && c.anchor) parts.push(`(行:${c.anchor})`)
+    // v4.5 元素指纹：跨步骤稳定编号（页面重排后编号会变，fp 不变）——模型可写 {"name":"click","fp":"xxxx"}
+    if (c.fp) parts.push(`#${c.fp}`)
+    if (rich && c.extra) parts.push(`(${c.extra})`)
     // W4 state 行内（如 `(disabled)`）：模型可据此避免点死按钮/识别展开态（编号与文案格式不变，纯后缀）
     if (c.state) parts.push(`(${c.state})`)
     if (withCoords && c.inViewport && vw > 0 && vh > 0) {
       const nx = Math.round(((c.rect.x + c.rect.w / 2) / vw) * 1000)
       const ny = Math.round(((c.rect.y + c.rect.h / 2) / vh) * 1000)
       parts.push(`@${Math.max(0, Math.min(1000, nx))},${Math.max(0, Math.min(1000, ny))}`)
-    } else if (c.inViewport && vw > 0 && vh > 0) {
+    } else if (gridMode !== 'off' && c.inViewport && vw > 0 && vh > 0) {
       // v4/A4：纯文本模式补粗粒度位置（8×6 网格，行列从 0 起）——「顶部菜单/底部下一页/中部表单」
-      // 这类空间指代可落地；每行只多 ~8 字符，token 代价可忽略
-      const gx = Math.max(0, Math.min(7, Math.floor(((c.rect.x + c.rect.w / 2) / vw) * 8)))
-      const gy = Math.max(0, Math.min(5, Math.floor(((c.rect.y + c.rect.h / 2) / vh) * 6)))
-      parts.push(`(格${gx},${gy})`)
+      // 这类空间指代可落地；v4.6 C4：edges 模式仅保留列表首尾各 8 行（页头导航/底部翻页），中间省 token
+      const edgeOk =
+        gridMode === 'all' || emitted <= 8 || emitted > Math.max(0, totalEmit - 8) || richIdx.has(i)
+      if (edgeOk) {
+        const gx = Math.max(0, Math.min(7, Math.floor(((c.rect.x + c.rect.w / 2) / vw) * 8)))
+        const gy = Math.max(0, Math.min(5, Math.floor(((c.rect.y + c.rect.h / 2) / vh) * 6)))
+        parts.push(`(格${gx},${gy})`)
+      }
     }
     if (!c.inViewport) parts.push('(需滚动到)')
+    if (c.text) {
+      const key = c.text.replace(/\s+/g, ' ').trim()
+      const arr = byText.get(key) || []
+      arr.push(i)
+      byText.set(key, arr)
+    }
     lines.push(parts.join(' '))
   })
+  // v4.4 同名歧义警示：≥2 个同文本候选（密集页行操作场景）——提示用行标识区分 + expect_text 核验
+  const dups = [...byText.entries()].filter(([, idx]) => idx.length >= 2).slice(0, 4)
+  if (dups.length) {
+    const dupLines = dups
+      .map(([txt, idx]) => `  "${txt.slice(0, 16)}" ×${idx.length}：[${idx.slice(0, 6).join('][')}]`)
+      .join('\n')
+    lines.push(
+      `⚠ 同名元素（密集页注意：点错行是重大失误）：\n${dupLines}\n  这些元素仅靠行标识区分：click 时必须带 "expect_text"，内容=目标的 (行:…) 标识 + 按钮文字（如 "SO20261012-001 删除"），系统会核验不符不点`
+    )
+  }
   // W5 一期「探测 + 告知」：跨域 iframe 内元素不可见——明确告知模型与用户，别盲目找
   if (res.blockedFrames?.length) {
     lines.push(
@@ -579,6 +815,29 @@ export function formatCandidates(res: ExtractResult, withCoords = false, keepIdx
 }
 
 /**
+ * v4.6 A3/B3 页面指纹：URL+标题+滚动位+候选要素的 FNV-1a（8 位 hex）。
+ * 用途：① extract 埋点（观测稳定性度量）② B3 页面未变时省略元素列表（免观测降级）。
+ * 确定性纯函数：同输入同哈希；候选顺序变化会改变哈希（刻意保守——顺序变了说明页面可能重排）。
+ */
+export function pageHashOf(e: {
+  url?: string
+  title?: string
+  scrollY?: number
+  scrollHeight?: number
+  candidates: Array<{ role?: string; text?: string; extra?: string; state?: string }>
+}): string {
+  let h = 0x811c9dc5
+  const s =
+    `${e.url || ''}|${e.title || ''}|${Number(e.scrollY) || 0}/${Number(e.scrollHeight) || 0}|` +
+    (e.candidates || []).map((c) => `${c.role || ''}|${c.text || ''}|${c.extra || ''}|${c.state || ''}`).join('\n')
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0).toString(16).padStart(8, '0')
+}
+
+/**
  * S1 语义重排：语义分 ≥0.5 的 Top-N（topBoost 个，v4/A6 修订——此前全部 ≥0.5 都提前，
  * 常见词如「订单/确定」会把一堆无关元素提到前面挤掉视口内主操作）显著提前，其余保持原序。
  * 必须在 executor 快照落盘前调用（编号即最终编号）；填充 semanticHints（Top-6 命中项及理由）。
@@ -587,7 +846,7 @@ export function rerankByTask(res: ExtractResult, task: string, topBoost = 8): Ex
   if (!task || !res.candidates.length) return res
   const scored = res.candidates.map((c) => ({
     c,
-    sem: scoreCandidate({ text: c.text, extra: c.extra, role: c.role, tag: c.tag }, task).score
+    sem: scoreCandidate({ text: c.text, extra: c.extra, role: c.role, tag: c.tag, anchor: c.anchor }, task).score
   }))
   const boostedAll: typeof scored = []
   const rest: typeof scored = []
@@ -611,13 +870,25 @@ export function rerankByTask(res: ExtractResult, task: string, topBoost = 8): Ex
 }
 
 function matchedViaOf(c: Candidate, task: string): string[] {
-  return scoreCandidate({ text: c.text, extra: c.extra, role: c.role, tag: c.tag }, task).matchedVia
+  return scoreCandidate({ text: c.text, extra: c.extra, role: c.role, tag: c.tag, anchor: c.anchor }, task).matchedVia
 }
 
 /** 在页面上下文中按 framePaths+path 定位元素，返回页面绝对坐标（供 CDP 点击）。
  *  v4.2：额外回传元素可见文本（innerText/aria-label/value）——上层用于「path 命中但
- *  解析到了错误兄弟元素」的文本校验（SPA 重渲染后 children 序号仍有效但指向变了） */
-export const RESOLVE_FN = String(function resolve(framePaths: number[][], path: number[], expectTag?: string) {
+ *  解析到了错误兄弟元素」的文本校验（SPA 重渲染后 children 序号仍有效但指向变了）。
+ *  v4.5：文案截断上限改为与 EXTRACT_FN 共用 TEXT_CAP（此前快照 80 / 回读 40 的不对称
+ *  会让同一元素在两条链路上长度不同，配合来源差异误判失败并触发全页重提取）；
+ *  同时回传 title 全称，供上层做截断感知的文本比较。 */
+export const RESOLVE_FN = String(function resolve(
+  framePaths: number[][],
+  path: number[],
+  expectTag?: string,
+  /** v4.4 命中校验：解析后在元素自身坐标空间做 elementFromPoint 身份核验——
+   *  中心点被遮挡时改试矩形内缩点（返回可命中点坐标）；全部被遮挡返回 occluded:true。
+   *  身份比较（元素同一/互相包含/shadow 宿主链）不依赖 tag/text，图标按钮/自定义元素都稳。 */
+  verify?: boolean,
+  cap?: number
+) {
   function walk(doc: Document, p: number[]): Element | null {
     let el: any = doc.documentElement
     for (const i of p) {
@@ -654,18 +925,70 @@ export const RESOLVE_FN = String(function resolve(framePaths: number[][], path: 
   // 标签不符视为失效（上层会重提取并按文本重定位），杜绝"点错元素还报成功"
   if (expectTag && el.tagName !== expectTag) return { found: false }
   try {
-    ;(el as any).scrollIntoView({ block: 'center', inline: 'nearest' })
+    // behavior:'instant' 强制瞬时滚动（无视页面 CSS scroll-behavior:smooth）——
+    // 读 rect 不会拿到动画中途坐标，也无需任何 rAF/定时器等待（页面隐藏/窗口被遮挡时
+    // Chromium 会深度节流 rAF 与定时器，此前的等待会让每个 evaluate 挂满 CDP 20s 超时）
+    ;(el as any).scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' })
   } catch {}
   const r = el.getBoundingClientRect()
-  let x = r.left + r.width / 2
-  let y = r.top + r.height / 2
+  const tag = el.tagName
+  // v4.4 命中校验（与解析同坐标空间、同文档，元素身份比对）：
+  // 中心 → 矩形内缩点逐个试，第一个能命中目标（或其子/宿主）的点就是点击点
+  let px = r.left + r.width / 2
+  let py = r.top + r.height / 2
+  if (verify) {
+    const rel = (hit: Element | null): boolean => {
+      if (!hit) return false
+      if (hit === el || el.contains(hit) || hit.contains(el)) return true
+      // shadow 边界：elementFromPoint 命中会被重定向到宿主——沿宿主链认亲
+      let cur: any = el
+      for (let i = 0; i < 6; i++) {
+        let root: any = null
+        try {
+          root = cur.getRootNode ? cur.getRootNode() : null
+        } catch {}
+        const host = root && root.host
+        if (!host) break
+        if (host === hit || host.contains(hit) || hit.contains(host)) return true
+        cur = host
+      }
+      return false
+    }
+    const pts: Array<[number, number]> = [
+      [px, py],
+      [r.left + r.width * 0.25, r.top + r.height * 0.25],
+      [r.left + r.width * 0.75, r.top + r.height * 0.25],
+      [r.left + r.width * 0.25, r.top + r.height * 0.75],
+      [r.left + r.width * 0.75, r.top + r.height * 0.75],
+      [r.left + r.width * 0.5, r.top + r.height * 0.2],
+      [r.left + r.width * 0.5, r.top + r.height * 0.8]
+    ]
+    let hitPoint: [number, number] | null = null
+    for (const [lx, ly] of pts) {
+      if (lx < 0 || ly < 0 || lx > window.innerWidth || ly > window.innerHeight) continue
+      let hit: Element | null = null
+      try {
+        hit = doc.elementFromPoint(lx, ly)
+      } catch {}
+      if (rel(hit)) {
+        hitPoint = [lx, ly]
+        break
+      }
+    }
+    if (!hitPoint) {
+      return { found: true, occluded: true, tag, w: Math.round(r.width), h: Math.round(r.height) }
+    }
+    px = hitPoint[0]
+    py = hitPoint[1]
+  }
+  let x = px
+  let y = py
   // 逐层加上祖先 iframe 的偏移，换算为顶层页面坐标
   for (let i = chain.length - 1; i >= 0; i--) {
     const ir = chain[i].iframe.getBoundingClientRect()
     x += ir.left
     y += ir.top
   }
-  const tag = el.tagName
   const editable =
     tag === 'INPUT' || tag === 'TEXTAREA' || el.getAttribute('contenteditable') === 'true'
   const value =
@@ -677,12 +1000,34 @@ export const RESOLVE_FN = String(function resolve(framePaths: number[][], path: 
   let checked: boolean | undefined
   if (any.checked !== undefined && any.checked !== null) checked = any.checked === true
   else if (ariaChecked !== null) checked = ariaChecked === 'true'
-  // v4.2 文本回传：供上层校验「path 解析到的元素」与快照候选是否同一个
+  // v4.2 文本回传：供上层校验「path 解析到的元素」与快照候选是否同一个。
+  // v4.5：截断上限与 EXTRACT_FN 共用；并额外回收 title 全称（JS 截断场景的文案真身）
+  const CAP = cap || 80
   const txt = String(
     (el as HTMLElement).innerText || el.getAttribute('aria-label') || el.getAttribute('title') || ''
   )
     .replace(/\s+/g, ' ')
     .trim()
+  let full = ''
+  try {
+    const cands = [
+      el.getAttribute('title'),
+      el.getAttribute('data-original'),
+      el.getAttribute('data-full'),
+      el.getAttribute('data-fulltext'),
+      el.getAttribute('data-text'),
+      el.getAttribute('data-name')
+    ]
+    const inner = el.querySelector('[title]')
+    if (inner) cands.push(inner.getAttribute('title'))
+    for (const c of cands) {
+      const v = String(c || '').replace(/\s+/g, ' ').trim()
+      if (v && v.length > txt.length) {
+        full = v
+        break
+      }
+    }
+  } catch {}
   return {
     found: true,
     x: Math.round(x * 100) / 100,
@@ -694,7 +1039,8 @@ export const RESOLVE_FN = String(function resolve(framePaths: number[][], path: 
     h: Math.round(r.height),
     disabled,
     checked,
-    text: txt.slice(0, 40)
+    text: txt.slice(0, CAP),
+    ...(full && full !== txt ? { fullText: full.slice(0, CAP) } : {})
   }
 })
 
@@ -726,25 +1072,41 @@ export const READ_CONTENT_FN = String(function readContent(maxChars: number) {
     }
     return res
   }
-  const tables = [...tablesIn(document)]
-  let iframes: Element[]
-  try {
-    iframes = Array.from(document.querySelectorAll('iframe'))
-  } catch {
-    iframes = []
-  }
-  for (const f of iframes) {
+  // v4.4 跨 iframe 全穿透（同源嵌套）：正文与表格逐层递归收集——聚水潭等嵌套布局的数据
+  // 常在二层及更深的 iframe 里，此前「顶层正文 + 一层表格」是数据抓取的直接盲区。
+  const parts: string[] = []
+  const tables: string[] = []
+  const visited: Document[] = []
+  function gather(doc: Document, depth: number): void {
+    if (depth > 5 || visited.indexOf(doc) !== -1) return
+    visited.push(doc)
+    let body = ''
     try {
-      const cd = (f as HTMLIFrameElement).contentDocument
-      if (cd && cd.body) tables.push(...tablesIn(cd))
+      body = (doc.body?.innerText || '').replace(/\n{3,}/g, '\n\n').trim()
     } catch {}
+    if (body) parts.push(depth === 0 ? body : `[iframe${depth > 1 ? '·嵌套' + depth + '层' : ''}区域]\n${body}`)
+    tables.push(...tablesIn(doc))
+    let iframes: Element[] = []
+    try {
+      iframes = Array.from(doc.querySelectorAll('iframe'))
+    } catch {
+      iframes = []
+    }
+    for (const f of iframes) {
+      let cd: Document | null = null
+      try {
+        cd = (f as HTMLIFrameElement).contentDocument
+      } catch {
+        cd = null
+      }
+      // 跨域 frame 本层不可读（B 期 frameAccess 兜底），同源嵌套逐层下沉
+      if (!cd || !cd.body) continue
+      gather(cd, depth + 1)
+    }
   }
-  let body = ''
-  try {
-    body = (document.body?.innerText || '').replace(/\n{3,}/g, '\n\n').trim()
-  } catch {}
-  let text = body
-  if (tables.length) text += '\n\n# 页面表格\n' + tables.join('\n\n')
+  gather(document, 0)
+  let text = parts.join('\n\n')
+  if (tables.length) text += (text ? '\n\n' : '') + '# 页面表格\n' + tables.join('\n\n')
   if (text.length > maxChars) {
     const head = Math.floor(maxChars * 0.65)
     text = text.slice(0, head) + '\n…(中间省略)…\n' + text.slice(text.length - Math.floor(maxChars * 0.35))
@@ -753,7 +1115,7 @@ export const READ_CONTENT_FN = String(function readContent(maxChars: number) {
   try {
     imgs = document.images.length
   } catch {}
-  return { title: document.title, url: location.href, text, bodyLen: body.length, imgs }
+  return { title: document.title, url: location.href, text, bodyLen: text.length, imgs }
 })
 
 /** 验证码 / 登录摩擦检测 */

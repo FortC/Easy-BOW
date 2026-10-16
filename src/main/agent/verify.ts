@@ -19,6 +19,64 @@ export interface Verdict {
   reason: string
 }
 
+/** v4.5 复核证据包：变更摘要 + 目标区域切片。
+ *
+ * 为什么要换掉「取 body.innerText 前 1200 字」（历史实现）：
+ * ERP/后台页的正文动辄上万字，目标区域常在第 5000 字开外。取头部前缀等于让 L1 小模型
+ * 和 L2 云端大模型都看不到证据——不是模型判错，是**证据没送到**。结果只能是 uncertain，
+ * 而写操作节点的 uncertain 按未通过处理，于是反复重规划耗光步数。
+ *
+ * 新证据包按「节点要作用的对象」定向切片，而不是从头截全文：token 更少、信息更全。
+ */
+export interface EvidencePack {
+  /** URL / 标题的变化 */
+  urlDelta: string
+  titleDelta: string
+  /** 新增/消失的候选元素文案（点击是否生效的直接证据） */
+  newCandidates: string[]
+  goneCandidates: string[]
+  /** 目标区域切片：按节点 target/expected 在页面文本里定位出的相关片段 */
+  targetSlice: string
+  /** 焦点元素（点击后焦点落在谁身上，是「点中了哪个控件」的强证据） */
+  focusText?: string
+  /** 任务记忆（本节点抓取/搬运类达成的直接证据） */
+  memory: string
+  /** 最近动作结果 */
+  lastResults: string
+}
+
+/** 从整页文本里定向切出与节点预期相关的片段。
+ *  优先整段包含 expected 中的关键词；找不到就退回首尾摘要（仍远好于只取头部 1200 字）。 */
+export function sliceTargetRegion(pageText: string, expected: string, intent?: string): string {
+  const text = String(pageText || '').replace(/\s+/g, ' ').trim()
+  if (!text) return ''
+  if (text.length <= 1400) return text
+  // 关键词：expected 与 intent 里的中文连续段（≥2 字）+ 去掉标点的引号内容
+  const kws = new Set<string>()
+  for (const src of [expected || '', intent || '']) {
+    for (const m of src.matchAll(/[一-龥]{2,8}/g)) if (m[0].length >= 2) kws.add(m[0])
+    for (const m of src.matchAll(/[a-zA-Z][a-zA-Z0-9_]{2,15}/g)) kws.add(m[0])
+  }
+  // 优先整段包含某个关键词的中后段窗口（目标区域通常在页面靠后位置）
+  const win = 260
+  let best = -1
+  let bestKw = ''
+  for (const kw of kws) {
+    const i = text.indexOf(kw)
+    if (i >= 0 && i > best) {
+      best = i
+      bestKw = kw
+    }
+  }
+  if (best >= 0) {
+    // 目标在页面后半段时优先往后取，避免只截到「表头」
+    const start = Math.min(Math.max(0, best - win), Math.max(0, text.length - win * 2))
+    const out = text.slice(start, start + win * 2)
+    return `…（关键词「${bestKw}」附近）${out}…`
+  }
+  return `（页面共 ${text.length} 字，目标关键词未直接出现，给出首尾摘要）\n${text.slice(0, 700)}\n…\n${text.slice(-600)}`
+}
+
 export async function verifyNode(opts: {
   node: PlanNode
   cdp: Cdp
@@ -33,6 +91,15 @@ export async function verifyNode(opts: {
   /** T9 硬门禁（P0-5）：重规划过的任务 done 时强制云端 L2——不允许本地复核放行、不允许 skip，
    *  复核不确定/调用失败一律按未通过处理 */
   forceL2?: boolean
+  /** v4.5 P1-5：模型声明 node_done 却没附任何证据（没引用本步动作、也没描述观察到的变化）。
+   *  「模型自己觉得做完了」不能白嫖通过——此时本地 L1 的「通过」不作为定论，
+   *  升级到 L2 去看真实证据；无云端 provider 时按写操作节点口径不放行。 */
+  noEvidence?: boolean
+  /** v4.6 C6：L2 输出预算（runner 按 outputBudget(model,'verify') 传入；缺省 4096=v4.5 行为） */
+  maxTokens?: number
+  /** v4.6 A2：L2 云端复核的用量回调（runner 转发到 telemetry llm_call site=verify；
+   *  verify.ts 自身保持无 telemetry 依赖，selftest 传 undefined） */
+  onUsage?: (u: { inputTokens: number; outputTokens: number; cachedInputTokens?: number }) => void
 }): Promise<Verdict> {
   // —— L0：结构化预期的确定性校验 ——
   // T9 硬门禁补漏（P0-5）：forceL2 时跳过 L0——此前末节点带 check 且确定性命中会直接放行，
@@ -80,13 +147,14 @@ export async function verifyNode(opts: {
     }
   }
 
-  // —— 模型复核的证据：页面可见文字（语义化预期按语义匹配页面实际字段）+ 任务记忆 ——
+  // —— 模型复核的证据：变更摘要 + 目标区域切片（v4.5）+ 任务记忆 ——
   const mode = opts.settings.verifyMode || 'fast'
   let l1Fail: { pass: boolean | null; reason?: string } | null = null
   let pageText = ''
   try {
-    pageText =
-      (await opts.cdp.evaluate<string>(PAGE_TEXT_FN, []))?.replace(/\s+/g, ' ').trim().slice(0, 1200) || ''
+    // 取全量正文（不再截头部 1200 字）：切片在主进程做，按节点预期定向取，
+    // 送到模型面前的才是相关的几百字。L0 的 text_visible 另走 EXPECT_TEXT_FN 定点判定。
+    pageText = (await opts.cdp.evaluate<string>(PAGE_TEXT_FN, [])) || ''
   } catch {}
   const judgePrompt = buildJudgePrompt(opts.node, opts.extract, opts.lastResults, opts.memory, pageText)
 
@@ -97,33 +165,48 @@ export async function verifyNode(opts: {
     try {
       const out = await opts.fastllm.decide(VERIFY_SYSTEM_PROMPT, judgePrompt, 24)
       const v = parseJudge(out)
-      if (v.pass === true) return { passed: true, source: 'l1', reason: v.reason ? `本地复核通过（${v.reason}）` : '本地复核通过' }
-      if (v.pass === false && !opts.provider) {
+      if (v.pass === true) {
+        // v4.5：模型无证据地宣告完成时，本地小模型的「通过」不作定论（0 token 也仍是弱信号）
+        if (opts.noEvidence) {
+          l1Fail = { pass: null, reason: '无证据的 node_done' }
+        } else {
+          return { passed: true, source: 'l1', reason: v.reason ? `本地复核通过（${v.reason}）` : '本地复核通过' }
+        }
+      } else if (v.pass === false && !opts.provider) {
         return { passed: false, source: 'l1', reason: v.reason ? `本地复核未通过（${v.reason}）` : '本地复核未通过' }
+      } else {
+        l1Fail = v
       }
-      l1Fail = v
     } catch {}
   }
 
   // —— L2：云端大模型终审 ——
-  // 触发条件：strict 模式 / forceL2（重规划任务 done 硬门禁）/ L1 未通过或不确定
+  // 触发条件：strict 模式 / forceL2（重规划任务 done 硬门禁）/ 节点标记 risk=write / L1 未通过或不确定
   // （fast 模式下 L1 的"未通过"需 L2 确认，防小模型误判阻塞任务）
   // v4/A1.4：写操作节点（提交/保存/删除/支付类预期）的「不确定/调用失败」不放行——
   // 复核门在模型报错时对写操作形同虚设会直接放过错误提交；只读节点保持 skip 放行不空转
+  // v4.5：节点显式标 risk=write 时，无论文案是否命中写操作正则，一律走 L2 且不确定不放行
   const writeish =
+    opts.node.risk === 'write' ||
     /提交|保存|删除|支付|下单|结算|发布|审批|审核|修改|更新|写入|填写|register|submit|save|delete|pay/i.test(
       `${opts.node.intent} ${opts.node.expected}`
     )
-  const needL2 = !!opts.provider && (opts.forceL2 || mode === 'strict' || (l1Fail != null && l1Fail.pass !== true))
+  const needL2 =
+    !!opts.provider && (opts.forceL2 || mode === 'strict' || opts.node.risk === 'write' || (l1Fail != null && l1Fail.pass !== true))
   if (needL2 && opts.provider) {
     // 云端复核失败先重试一次再降级：接口抖动一次就无条件放行 = 复核形同虚设（复核 P1-12）
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         // plain：复核输出 {"pass":...}，与 step 结构化形状不匹配，不能带 submit_step 工具（否则全判 uncertain）
+        // v4.6 C6：maxTokens 由 runner 按「是否推理模型」分档传入（普通模型 256 足够，推理模型留思考余量）
         const out = await opts.provider.chat(VERIFY_SYSTEM_PROMPT, [{ role: 'user', content: judgePrompt }], undefined, {
           plain: true,
-          maxTokens: 4096
+          maxTokens: opts.maxTokens ?? 4096
         })
+        // v4.6 A2：L2 用量上抛（此前这笔云端调用完全不在 token 账里）
+        try {
+          opts.onUsage?.(out.usage)
+        } catch {}
         const v = parseJudge(out.text)
         if (v.pass === true) return { passed: true, source: 'l2', reason: v.reason ? `大模型复核通过（${v.reason}）` : '大模型复核通过' }
         if (v.pass === false)
@@ -172,7 +255,11 @@ function buildJudgePrompt(
   const parts: string[] = []
   parts.push(`# 节点预期\n${node.expected}`)
   parts.push(`# 操作后页面状态\n标题: ${extract.title?.slice(0, 60) || ''}\nURL: ${(extract.url || '').slice(0, 100)}`)
-  if (pageText) parts.push(`# 页面可见文字（摘要）\n${pageText}`)
+  // v4.5 定向切片：按节点预期/意图在页面正文里定位相关片段。
+  // 历史实现取 body.innerText 前 1200 字，后台长页面上目标区域根本不在证据里——
+  // 云端大模型看不到证据只能判 uncertain，写操作节点又按未通过处理，白白耗光步数。
+  const slice = sliceTargetRegion(pageText, node.expected, node.intent)
+  if (slice) parts.push(`# 目标区域页面文字（按本节点预期定向截取，不是页面开头）\n${slice}`)
   const memKeys = Object.entries(memory || {})
   if (memKeys.length) {
     parts.push(

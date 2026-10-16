@@ -113,13 +113,21 @@ export class Overlay {
 
   private readyPromise: Promise<void> | null = null
 
-  /** 等待遮罩页面 __ovl 脚本就绪（最多 6 秒，之后视为永久就绪避免重复等待） */
+  /** 等待遮罩页面 __ovl 脚本就绪（最多 ~5 秒，之后视为永久就绪避免重复等待）。
+   *  每次探测必须带超时竞速：窗口被遮挡/最小化时渲染器被 Chromium 挂起，executeJavaScript
+   *  永不 settle（js() 早有此保护，此处此前漏加——整个动作批会被它挂住 60s+ 甚至无限期） */
   private ready(): Promise<void> {
     if (!this.readyPromise) {
       this.readyPromise = (async () => {
-        for (let i = 0; i < 40; i++) {
+        for (let i = 0; i < 12; i++) {
           try {
-            const ok = await this.view.webContents.executeJavaScript('typeof window.__ovl === "object"', true)
+            const ok = await Promise.race([
+              this.view.webContents.executeJavaScript('typeof window.__ovl === "object"', true),
+              new Promise<false>((r) => {
+                const t = setTimeout(() => r(false), 250)
+                t.unref?.()
+              })
+            ])
             if (ok) return
           } catch {}
           await new Promise((r) => setTimeout(r, 150))

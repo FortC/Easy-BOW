@@ -77,7 +77,8 @@ export class Telemetry {
   end(summary: {
     state: string
     steps?: number
-    tokens?: { inputTokens: number; outputTokens: number }
+    /** v4.6 A1：tokens 可带 cachedInputTokens（前缀缓存命中量）→ 落盘为 tokensCached */
+    tokens?: { inputTokens: number; outputTokens: number; cachedInputTokens?: number }
     triage?: FailureTriage
     triageReason?: string
   }): void {
@@ -94,6 +95,7 @@ export class Telemetry {
           steps: summary.steps,
           tokensIn: summary.tokens?.inputTokens,
           tokensOut: summary.tokens?.outputTokens,
+          tokensCached: summary.tokens?.cachedInputTokens,
           triage: summary.triage,
           triageReason: summary.triageReason?.slice(0, 200)
         }

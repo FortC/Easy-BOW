@@ -453,7 +453,19 @@ export default function SettingsModal(props: {
                     humanLike: true,
                     telemetry: true,
                     persistSession: true,
-                    autoExperience: true
+                    autoExperience: true,
+                    cacheAccounting: true,
+                    stableSystemPrompt: true,
+                    outputBudget: true,
+                    textGridCoords: 'edges',
+                    historyFold: true,
+                    pagedRead: true,
+                    obsDetail: true,
+                    replanTune: true,
+                    clickVerifyTune: true,
+                    localRetry: true,
+                    pageHashSkip: true,
+                    repeatNudge: true
                   })
                 }
               >
@@ -494,6 +506,33 @@ export default function SettingsModal(props: {
               <Toggle label="智能等待" tip="DOM/网络静默信号替代固定盲等（特殊页面自动熔断回退）" on={s.smartWait !== false} onChange={(v) => set({ smartWait: v })} />
               <Toggle label="定位链" tip="元素失效后按容器锚点/语义键重定位（含 path 命中文本校验）" on={s.locatorChain !== false} onChange={(v) => set({ locatorChain: v })} />
               <Toggle label="Shadow DOM" tip="元素提取穿透 open shadow root（组件库表单可见可操作）" on={s.shadowDom !== false} onChange={(v) => set({ shadowDom: v })} />
+            </div>
+
+            <div className="cfg-group">Token 优化（v4.6） <span>省 token / 提速 / 步数收敛——默认全开，出问题逐项关闭回滚</span></div>
+            <div className="cfg-grid">
+              <Toggle label="用量分账" tip="缓存命中率与各调用点（决策/规划/复核/点击复核）token 分账（纯计量，建议常开）" on={s.cacheAccounting !== false} onChange={(v) => set({ cacheAccounting: v })} />
+              <Toggle label="缓存断点修复" tip="视觉/画布/测试附加段移出 system——模式切换不再击穿提示词缓存（大模型多步任务省一半以上输入）" on={s.stableSystemPrompt !== false} onChange={(v) => set({ stableSystemPrompt: v })} />
+              <Toggle label="输出预算分档" tip="按调用点与模型档位收紧 max_tokens（推理模型自动放宽；截断时自动回退旧预算）" on={s.outputBudget !== false} onChange={(v) => set({ outputBudget: v })} />
+              <Toggle label="历史折叠" tip="超过 12 步的任务折叠早期步骤摘要（用户指导与近期错误保留）" on={s.historyFold !== false} onChange={(v) => set({ historyFold: v })} />
+              <Toggle label="正文分片读取" tip="read_content 默认只回填前 800 字，模型按需 offset 续读（缓存秒回，不重复 OCR）" on={s.pagedRead !== false} onChange={(v) => set({ pagedRead: v })} />
+              <Toggle label="元素列表分档" tip="非密集页用精简行格式（语义行与视口前 8 行保留全字段；密集页/出错步自动全量）" on={s.obsDetail !== false} onChange={(v) => set({ obsDetail: v })} />
+              <Toggle label="打转调优" tip="2 步无推进/同一失败重复 2 次即触发重规划（上限 3 次），重规划附带失败现场" on={s.replanTune !== false} onChange={(v) => set({ replanTune: v })} />
+              <Toggle label="点击复核分档" tip="expect_text 已含行标识的同名行跳过放大截图复核（提交/删除/支付类恒复核不放宽）" on={s.clickVerifyTune !== false} onChange={(v) => set({ clickVerifyTune: v })} />
+              <Toggle label="本地重试扩权" tip="本地快速决策失败冷却 10→5 步，简单重试步不再交云端税" on={s.localRetry !== false} onChange={(v) => set({ localRetry: v })} />
+              <Toggle label="免观测降级" tip="页面与上一步完全相同时省略元素列表（单步省 ~2k token；连续 2 次自动回全量）" on={s.pageHashSkip !== false} onChange={(v) => set({ pageHashSkip: v })} />
+              <Toggle label="repeat 提示" tip="连续 3 步同构动作时建议用 repeat 一次执行多轮（翻页采集/批量操作）" on={s.repeatNudge !== false} onChange={(v) => set({ repeatNudge: v })} />
+              <label className="cfg-toggle" title="纯文本模式下粗网格坐标的输出范围">
+                <span className="cfg-name">网格坐标</span>
+                <select
+                  className="cfg-select"
+                  value={s.textGridCoords ?? 'edges'}
+                  onChange={(e) => set({ textGridCoords: e.target.value as 'edges' | 'all' | 'off' })}
+                >
+                  <option value="edges">首尾保留（省 token）</option>
+                  <option value="all">每行输出</option>
+                  <option value="off">不输出</option>
+                </select>
+              </label>
             </div>
 
             <div className="cfg-group">拟人与数据 <span>操作节奏、埋点与会话</span></div>

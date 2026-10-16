@@ -71,7 +71,7 @@ function defaultTracesDir() {
 }
 
 function parseArgs(argv) {
-  const opts = { dir: null, days: 7, help: false }
+  const opts = { dir: null, days: 7, help: false, saveBaseline: null, compare: null }
   for (let i = 0; i < argv.length; i++) {
     let a = argv[i]
     let inline = null
@@ -90,6 +90,14 @@ function parseArgs(argv) {
       const n = Number(v)
       if (v == null || !Number.isFinite(n)) throw new Error('--days 需要一个数字参数')
       opts.days = Math.trunc(n)
+    } else if (a === '--save-baseline') {
+      const v = inline ?? argv[++i]
+      if (v == null) throw new Error('--save-baseline 缺少参数值（输出 JSON 路径）')
+      opts.saveBaseline = resolve(v)
+    } else if (a === '--compare') {
+      const v = inline ?? argv[++i]
+      if (v == null) throw new Error('--compare 缺少参数值（基线 JSON 路径）')
+      opts.compare = resolve(v)
     } else {
       throw new Error(`未知参数：${a}（--help 查看用法）`)
     }
@@ -104,9 +112,11 @@ const HELP = `EasyBow 失败看板周报生成器（W12）
   npm run analyze-traces -- [选项]
 
 选项：
-  --dir <path>   traces 目录（默认 \$EASYBOW_TRACES 或 %APPDATA%/easybow/traces）
-  --days N       只统计最近 N 天（含今天），默认 7；N<=0 表示全部
-  --help, -h     显示本帮助
+  --dir <path>          traces 目录（默认 \$EASYBOW_TRACES 或 %APPDATA%/easybow/traces）
+  --days N              只统计最近 N 天（含今天），默认 7；N<=0 表示全部
+  --save-baseline <f>   把本窗口的核心指标存为基线 JSON（配合 --compare 做 A/B 对比）
+  --compare <f>         与基线 JSON 对比；成功率下降超过 1pp 时退出码 1（可接 CI 门禁）
+  --help, -h            显示本帮助
 
 输出：
   周报 Markdown 打印到 stdout，并写入 reports/weekly-<YYYY-MM-DD>.md（当前目录下）。
@@ -239,9 +249,11 @@ function summarizeTask(fileName, events) {
     llmCalls: 0,
     llmIn: 0,
     llmOut: 0,
+    llmCachedIn: 0, // v4.6 A1：前缀缓存命中输入量（llm_call.cachedIn）
     plannerCalls: 0,
     plannerIn: 0,
     plannerOut: 0,
+    siteCalls: new Map(), // v4.6 A2：site → { calls, in, out, cached }（分调用点账）
     stepsWithLlm: new Set(),
     stepsWithAction: new Set(),
     maxStep: 0
@@ -259,6 +271,7 @@ function summarizeTask(fileName, events) {
           steps: Number(d.steps) || 0,
           tokensIn: Number(d.tokensIn) || 0,
           tokensOut: Number(d.tokensOut) || 0,
+          tokensCached: Number(d.tokensCached) || 0, // v4.6 A1
           triage: typeof d.triage === 'string' ? d.triage : '',
           triageReason: typeof d.triageReason === 'string' ? d.triageReason : ''
         }
@@ -285,6 +298,15 @@ function summarizeTask(fileName, events) {
       case 'llm_call': {
         const input = Number(d.input) || 0
         const output = Number(d.output) || 0
+        const cached = Number(d.cachedIn) || 0
+        // v4.6 A2：site 标签（step/plan/replan/verify/clickVerify/enhance）；旧 trace 无 site 时按 planner 归桶
+        const site = typeof d.site === 'string' && d.site ? d.site : d.planner === true ? 'planner(旧)' : 'step(旧)'
+        if (!t.siteCalls.has(site)) t.siteCalls.set(site, { calls: 0, in: 0, out: 0, cached: 0 })
+        const sc = t.siteCalls.get(site)
+        sc.calls++
+        sc.in += input
+        sc.out += output
+        sc.cached += cached
         if (d.planner === true) {
           t.plannerCalls++
           t.plannerIn += input
@@ -294,6 +316,8 @@ function summarizeTask(fileName, events) {
           t.llmIn += input
           t.llmOut += output
         }
+        // v4.6 A1：缓存命中量与 planner 标志无关，全量累计（含 verify/clickVerify 的埋点）
+        t.llmCachedIn += cached
         if (typeof ev.step === 'number') t.stepsWithLlm.add(ev.step)
         break
       }
@@ -534,6 +558,7 @@ function renderReport(stats, windowLabel) {
   const sum = (f) => allTasks.reduce((s, t) => s + (t[f] || 0), 0)
   const endIn = allTasks.reduce((s, t) => s + (t.end?.tokensIn || 0), 0)
   const endOut = allTasks.reduce((s, t) => s + (t.end?.tokensOut || 0), 0)
+  const endCached = allTasks.reduce((s, t) => s + (t.end?.tokensCached || 0), 0)
   const plannerIn = sum('plannerIn')
   const plannerOut = sum('plannerOut')
   const otherIn = sum('llmIn')
@@ -545,6 +570,56 @@ function renderReport(stats, windowLabel) {
   ]
   L.push(mdTable(['指标', '次数', 'input', 'output', '合计'], tokRows))
   L.push('')
+
+  /* 6.5 v4.6 A1/A2：缓存命中率 + 分调用点账 */
+  L.push('### 6.5 缓存命中率与分调用点账（v4.6 埋点）')
+  L.push('')
+  const callCached = sum('llmCachedIn')
+  const callIn = sum('llmIn') + plannerIn
+  const callCount = sum('llmCalls') + sum('plannerCalls')
+  if (callCount === 0 || callCached === 0) {
+    L.push(
+      callCount === 0
+        ? '窗口内无 llm_call 事件。'
+        : '**端点未上报缓存命中量**（cachedIn 全为 0）——OpenAI 兼容端点需返回 `prompt_tokens_details.cached_tokens`（DeepSeek: `prompt_cache_hit_tokens`），Anthropic 需返回 `cache_read_input_tokens`。'
+    )
+    L.push('')
+  } else {
+    L.push(
+      `llm_call 口径：${fmtInt(callCount)} 次调用，输入 ${fmtInt(callIn)} token，其中**缓存命中 ${fmtInt(callCached)}（命中率 ${fmtRate(callCached, callIn)}）**；全价输入 ≈ ${fmtInt(callIn - callCached)} token。`
+    )
+    L.push('')
+    if (endCached > 0) {
+      L.push(`task_end 口径：累计输入 ${fmtInt(endIn)}，其中缓存 ${fmtInt(endCached)}（命中率 ${fmtRate(endCached, endIn)}）。`)
+      L.push('')
+    }
+  }
+  // 分调用点表（site 标签；旧 trace 无 site 归入「step(旧)/planner(旧)」）
+  const siteAgg = new Map()
+  for (const t of allTasks) {
+    for (const [site, v] of t.siteCalls || []) {
+      if (!siteAgg.has(site)) siteAgg.set(site, { calls: 0, in: 0, out: 0, cached: 0 })
+      const a = siteAgg.get(site)
+      a.calls += v.calls
+      a.in += v.in
+      a.out += v.out
+      a.cached += v.cached
+    }
+  }
+  if (siteAgg.size) {
+    const siteRows = [...siteAgg.entries()]
+      .sort((a, b) => b[1].in - a[1].in)
+      .map(([site, v]) => [
+        site,
+        fmtInt(v.calls),
+        fmtInt(v.in),
+        fmtInt(v.out),
+        fmtInt(v.in + v.out),
+        v.in ? fmtRate(v.cached, v.in) : '—'
+      ])
+    L.push(mdTable(['调用点（site）', '次数', 'input', 'output', '合计', '缓存命中率'], siteRows))
+    L.push('')
+  }
 
   /* 7. 解析失败步占比 */
   L.push('## 7. 解析失败步占比（近似口径）')
@@ -652,6 +727,75 @@ function renderReport(stats, windowLabel) {
   return L.join('\n')
 }
 
+/* ----------------------------- 基线对比（v4.6 M2） ----------------------------- */
+
+/** 汇总窗口核心指标（基线存档与对比共用同一口径） */
+function computeTotals(stats, windowLabel) {
+  const allTasks = []
+  for (const key of stats.dayKeys) allTasks.push(...stats.dayBuckets.get(key).tasks)
+  const timings = []
+  for (const key of stats.dayKeys) timings.push(...stats.dayBuckets.get(key).timingTotals)
+  const sorted = [...timings].sort((a, b) => a - b)
+  const p50 = pct(sorted, 50)
+  const success = allTasks.filter((t) => t.success).length
+  const llmIn = allTasks.reduce((s, t) => s + t.llmIn + t.plannerIn, 0)
+  const llmOut = allTasks.reduce((s, t) => s + t.llmOut + t.plannerOut, 0)
+  const llmCached = allTasks.reduce((s, t) => s + t.llmCachedIn, 0)
+  const calls = allTasks.reduce((s, t) => s + t.llmCalls + t.plannerCalls, 0)
+  return {
+    generatedAt: todayLabel(),
+    window: windowLabel,
+    tasks: allTasks.length,
+    success,
+    successRate: allTasks.length ? success / allTasks.length : 0,
+    llmCalls: calls,
+    tokensIn: llmIn,
+    tokensOut: llmOut,
+    tokensCached: llmCached,
+    tokensPerTask: allTasks.length ? Math.round((llmIn + llmOut) / allTasks.length) : 0,
+    callsPerTask: allTasks.length ? Number(((calls) / allTasks.length).toFixed(1)) : 0,
+    stepP50Ms: p50 == null ? null : Math.round(p50)
+  }
+}
+
+function renderCompare(cur, base) {
+  const L = []
+  L.push('## 基线对比（--compare）')
+  L.push('')
+  const row = (label, key, fmt, lowerIsBetter = true) => {
+    const b = base[key]
+    const c = cur[key]
+    if (b == null || c == null) return [label, fmt(b), fmt(c), '—']
+    const delta = c - b
+    const pctChg = b ? `${delta >= 0 ? '+' : ''}${((delta / b) * 100).toFixed(1)}%` : '—'
+    const good = lowerIsBetter ? delta < 0 : delta > 0
+    return [label, fmt(b), fmt(c), `${delta >= 0 ? '+' : ''}${fmt(delta - 0)}（${pctChg}）${delta === 0 ? '' : good ? ' ✅' : ' ⚠️'}`]
+  }
+  const rows = [
+    row('任务数', 'tasks', (v) => fmtInt(v), false),
+    row('成功率', 'successRate', (v) => (v == null ? '—' : `${(v * 100).toFixed(1)}%`), false),
+    row('云端调用次数', 'llmCalls', (v) => fmtInt(v)),
+    row('调用次数/任务', 'callsPerTask', (v) => (v == null ? '—' : String(v))),
+    row('输入 token', 'tokensIn', (v) => fmtInt(v)),
+    row('输出 token', 'tokensOut', (v) => fmtInt(v)),
+    row('token/任务', 'tokensPerTask', (v) => fmtInt(v)),
+    row('缓存命中 token', 'tokensCached', (v) => fmtInt(v), false),
+    row('步耗时 P50(ms)', 'stepP50Ms', (v) => (v == null ? '—' : fmtInt(v)))
+  ]
+  L.push(mdTable(['指标', '基线', '当前', '变化'], rows))
+  L.push('')
+  // 硬门禁：成功率下降 >1pp → 非零退出（CI 可拦截）
+  const drop = (base.successRate ?? 0) - (cur.successRate ?? 0)
+  if (drop > 0.01) {
+    L.push(`**❌ 门禁未通过：成功率 ${((cur.successRate ?? 0) * 100).toFixed(1)}% 比基线 ${((base.successRate ?? 0) * 100).toFixed(1)}% 下降 ${(drop * 100).toFixed(1)}pp（阈值 1pp）——禁止发版。**`)
+    L.push('')
+    return { text: L.join('\n'), ok: false }
+  }
+  L.push('**✅ 门禁通过（成功率未显著下降）。**')
+  L.push('')
+  return { text: L.join('\n'), ok: true }
+}
+
 /* ----------------------------- 主流程 ----------------------------- */
 
 function main() {
@@ -687,13 +831,40 @@ function main() {
   const windowLabel = `${labels[0]} ~ ${labels[labels.length - 1]}${stats.days > 0 ? `，最近 ${stats.days} 天` : '，全部天数'}`
   const md = renderReport(stats, windowLabel)
 
-  console.log(md)
+  // v4.6 M2：--compare / --save-baseline（对比块插入报告头部；基线存 JSON）
+  const totals = computeTotals(stats, windowLabel)
+  let compareBlock = ''
+  let gateOk = true
+  if (opts.compare) {
+    try {
+      const base = JSON.parse(readFileSync(opts.compare, 'utf-8'))
+      const r = renderCompare(totals, base)
+      compareBlock = `${r.text}\n---\n\n`
+      gateOk = r.ok
+    } catch (e) {
+      console.error(`基线读取失败（--compare ${opts.compare}）：${e.message}`)
+      process.exit(1)
+    }
+  }
+  const mdFinal = compareBlock + md
+  console.log(mdFinal)
+  if (opts.compare && !gateOk) process.exitCode = 1
+
+  if (opts.saveBaseline) {
+    try {
+      writeFileSync(opts.saveBaseline, JSON.stringify(totals, null, 2), 'utf-8')
+      console.error(`基线已写入：${opts.saveBaseline}`)
+    } catch (e) {
+      console.error(`基线写盘失败：${e.message}`)
+      process.exitCode = 1
+    }
+  }
 
   try {
     const outDir = resolve(process.cwd(), 'reports')
     mkdirSync(outDir, { recursive: true })
     const outFile = join(outDir, `weekly-${todayLabel()}.md`)
-    writeFileSync(outFile, md, 'utf-8')
+    writeFileSync(outFile, mdFinal, 'utf-8')
     console.error(`报告已写入：${outFile}`)
   } catch (e) {
     console.error(`报告写盘失败（stdout 输出不受影响）：${e.message}`)

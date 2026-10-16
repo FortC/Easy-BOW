@@ -5,6 +5,7 @@ dist/
 *.tsbuildinfo
 .DS_Store
 resources/fastmodel/
+resources/asr/
 /overlay-demo.png
 /overlay-working.png
 /schedule-modal.png

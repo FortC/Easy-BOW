@@ -5,11 +5,16 @@ import { renderPlanBlock } from './plan'
 export const SYSTEM_PROMPT = `你是 EasyBow，一个浏览器自动化助手。你通过「编号元素列表」观察网页，输出 JSON 动作序列来操作真实浏览器，完成用户任务。
 
 ## 输出格式（只输出纯 JSON，禁止 markdown 代码块、禁止多余文字）
-{"thought":"一句话判断（50字内）","actions":[动作对象,...]}
+{"thought":"一句话判断（50字内）","actions":[动作对象,...],"node_done":false,"node_evidence":"..."}
+
+node_done=true 表示「当前节点的预期已达成」。声明它时**必须**同时给出 node_evidence（50字内，写你观察到的页面变化/已填入的值/已拿到的数据，如"列表出现了3条结果""收货人字段已填张三"）——没有证据的完成声明不会通过系统复核。
 
 ## 动作对象
-- {"name":"click","index":元素编号}
+- {"name":"click","index":元素编号,"expect_text":"目标预期文字"}   expect_text 强烈建议带：写目标按钮/链接文字；页面有同名按钮时必须再带行标识（如 "SO20261012-001 删除"），系统点击前会核验实际元素文案，不符一律拒绝点击
 - {"name":"type","index":元素编号,"text":"要输入的文本"}   （输入框会先清空再输入）
+- 元素编号后的 #xxxx 是**元素指纹**：4 位十六进制，跨步骤不变（页面重排后编号会变、指纹不变）。
+  click/type/drag/hover 都可写 {"name":"click","fp":"a3f2"} 代替 index——上一步记住的元素这一步仍然指得到，
+  同名密集控件页用 fp 能精确锁定「哪一行」，这是 index 做不到的。fp 不在当前页面时系统会明确报错，不会静默改点别的元素
 - {"name":"paste_rich","text":"Markdown 内容","index":可选元素编号}   富文本写入文档/编辑器：自动把 Markdown 转成标题/列表/加粗等真实样式，粘贴到 index 元素光标处（缺省=当前光标），不清空已有内容。写文档正文优先用它
 - {"name":"paste_image","url":"图片链接","index":可选元素编号}   把图片真实嵌入文档/编辑器（自动下载→剪贴板→粘贴上传），链接来自 extract_images。需要插图时必须用它，禁止把图片 URL 当文字 type 进文档
 - {"name":"scroll","direction":"down|up|top|bottom","amount":滚动次数1-10}
@@ -45,7 +50,8 @@ export const SYSTEM_PROMPT = `你是 EasyBow，一个浏览器自动化助手。
 14. 批量填表/写文档必须按 1、2、3…顺序逐段完成：一段写完、核对好，再写下一段，禁止回头在已写内容前面/中间补插文字；某个字段数据获取失败（如图片打不开、内容读不到）时，在该位置写「（xx获取失败）」占位后继续后续字段，全部完成后再统一重试失败项；禁止因单项失败反复回头改动，导致整体内容错乱
 15. 不确定时不要硬选：列表里没有把握的目标时，输出 {"name":"clarify","query":"你指的是哪个字段？候选：[3]xx [7]xx [12]xx"}，禁止猜一个凑数（clarify 会暂停任务等人工回复）
 16. 多候选优先：能缩小到 2-3 个但无法定夺时，输出 "candidates":[3,7,12]（与 click/type 同用、不填 index），系统会结合语义相似度自动裁决，比你硬选更准
-17. 元素列表末尾的「语义匹配提示」段列出了与任务描述语义相关的元素（含同义词与相似度）：字段名与任务用词不一致时（如任务说"商品名称"而页面叫"品名"）优先从中选择；提示只是参考，仍要结合 role 与页面实际语义确认`
+17. 元素列表末尾的「语义匹配提示」段列出了与任务描述语义相关的元素（含同义词与相似度）：字段名与任务用词不一致时（如任务说"商品名称"而页面叫"品名"）优先从中选择；提示只是参考，仍要结合 role 与页面实际语义确认
+18. 密集控件页（ERP/淘宝/小红书类：表格里几十个同名「编辑/删除/查看」按钮）：点错一行就是重大失误，宁可不点不可点错。click 必须带 expect_text 且内容包含该行的 (行:…) 标识；看不准是哪一行时用 {"name":"clarify","query":"哪一行？候选：[3](行:SO123 删除) [7](行:SO456 删除)"} 问用户，禁止猜`
 
 /**
  * canvas 文档编辑器追加段：仅当提取检测到 canvasEditor（WPS/金山/腾讯文档等正文 canvas 渲染）时拼入。
@@ -66,8 +72,8 @@ export const VISION_ADDON = `
 
 ## 视觉模式（当前已启用）
 本消息附带一张当前页面视口截图（jpeg），你能直接"看到"页面。请结合截图与元素列表共同判断：
-1. 元素列表中视口内元素标注了 @x,y 坐标：x 向右、y 向下，均归一化到 0~1000（左上角为 0,0，右下角为 1000,1000），与截图位置一一对应，可用来区分同名/相似元素
-2. 截图能补充元素列表看不到的信息：页面版式、图片内容、图标含义、图片上的文字、弹窗与提示条等；重要判断（下单/删除/切换等）先看截图确认
+1. 元素列表中视口内元素标注了 @x,y 坐标：x 向右、y 向下，均归一化到 0~1000（左上角为 0,0，右下角为 1000,1000），与截图位置一一对应，可用来区分同名/相似元素。归一化含义：x、y 各自按截图宽/高独立换算（不是等比坐标）；坐标值必须在 0~1000 之间，禁止输出像素坐标（如 1600）——那会被当作错误坐标点错位置
+2. 截图能补充元素列表看不到的信息：页面版式、图片内容、图标含义、图片上的文字、弹窗与提示条等；重要判断（下单/删除/切换等）先看截图确认。截图上的编号标注（边框+角标）与元素列表编号严格对应，选编号时以标注为准
 3. 动作仍必须用元素编号（click/type/drag 的 index），禁止凭空输出坐标；列表外的目标先 scroll 或用其他动作
 4. 元素列表仍是操作依据：截图里可见但列表中没有的元素不可直接操作；thought 保持简短，不要描述截图内容`
 
@@ -79,10 +85,12 @@ export const VISION_FALLBACK_ADDON = `
 
 ## 视觉兜底（元素列表定位不到目标，已临时开启截图）
 本消息附带一张当前页面视口截图（jpeg），元素列表里找不到目标时改用「看图定位」：
-1. 先在截图上确认目标所在位置，再输出动作；能确定元素编号时仍优先用 {"name":"click","index":n}
+1. 先在截图上确认目标所在位置，再输出动作；能确定元素编号时仍优先用 {"name":"click","index":n,"expect_text":"目标文字"}
 2. 列表里没有的目标（canvas/自定义控件/图标按钮/被遮挡元素等）用坐标点击：
-   {"name":"click_xy","x":横坐标,"y":纵坐标} —— x/y 均为截图上的归一化值 0~1000（左上角 0,0，右下角 1000,1000）
-   例：截图中间偏右的按钮 → {"name":"click_xy","x":720,"y":480}
+   {"name":"click_xy","x":横坐标,"y":纵坐标,"expect_text":"目标文字"}
+   x/y 均为截图上的归一化值 0~1000（左上角 0,0，右下角 1000,1000）；x、y 各自按图宽/图高独立换算，必须在 0~1000 之间，禁止输出像素坐标
+   例：截图中间偏右的按钮 → {"name":"click_xy","x":720,"y":480,"expect_text":"提交"}
+   expect_text 写目标控件的文字（密集页同名控件必须带行标识）：系统点击前会核验，不符拒绝点击
 3. 目标不在当前视口时先 scroll，再在下一步的截图上定位点击
 4. 坐标点击后必须看下一步的结果确认是否点中；没点中则按新截图修正坐标重试
 5. thought 简短，不要描述截图内容`
@@ -127,6 +135,7 @@ export const LOCAL_SYSTEM_PROMPT = `你是浏览器自动化助手的本地快�
 只输出纯 JSON：{"thought":"一句话","actions":[最多2个动作]}。
 可用动作：{"name":"click","index":n}、{"name":"type","index":n,"text":"..."}、{"name":"scroll","direction":"down|up|top|bottom","amount":1-10}、{"name":"wait","seconds":1-15}、{"name":"read_content"}、{"name":"save","key":"...","value":"..."}、{"name":"recall","key":"..."}。
 禁止 done、goto、页签操作、paste 类、drag、repeat；禁止使用列表外的编号。
+上一步动作失败时：从当前元素列表重新挑最匹配的编号重试同一目标；仍无把握就输出空 actions 交回云端。
 拿不准就输出 {"thought":"需云端决策","actions":[]}。`
 
 /** 混合模式：本地快速决策的精简上下文（token 少 → 本地推理快） */
@@ -151,6 +160,27 @@ export function buildLocalPrompt(ctx: {
   }
   parts.push(`# 下一步\n只输出 JSON，简单步骤直出，不确定输出空 actions：`)
   return parts.join('\n\n')
+}
+
+/**
+ * v4.6 C1：模式说明后缀。vision/canvas/test 四段附加描述原先拼进 system——任一开关变化
+ * 都会击穿 Anthropic cache_control 断点与 OpenAI 自动前缀缓存的公共前缀（整任务缓存全冷）。
+ * 现在统一作为独立段落拼在 user 消息末尾（动态后缀区、# 下一步之前），system 恒等于
+ * SYSTEM_PROMPT（跨任务/跨模式逐字节稳定）。文本正文与原附加段逐字一致，仅落点变化；
+ * stableSystemPrompt=false 时 runner 仍走旧的 system 拼接路径（回滚开关）。
+ */
+export function buildModeSuffix(ctx: {
+  vision?: 'on' | 'fallback'
+  canvas?: boolean
+  test?: boolean
+}): string {
+  let s = ''
+  if (ctx.vision === 'on') s += VISION_ADDON
+  else if (ctx.vision === 'fallback') s += VISION_FALLBACK_ADDON
+  if (ctx.canvas) s += CANVAS_EDITOR_ADDON
+  if (ctx.test) s += TEST_MODE_ADDON
+  // 各常量自带前导 \n\n（历史拼接格式）；作为独立段落拼入时去掉首尾空白，段落间距由 join 补
+  return s.trim()
 }
 
 export interface StepContext {
@@ -180,6 +210,10 @@ export interface StepContext {
   tried?: string[]
   /** T7 动作后核验反馈（W10；注入动态后缀区；缺省不拼入） */
   deltaHint?: string
+  /** v4.6 C1 模式说明后缀（vision/canvas/test 附加段，buildModeSuffix 产物；拼在动态后缀区尾部、# 下一步之前） */
+  modeSuffix?: string
+  /** v4.6 C2a 历史折叠：true 且步数 >12 时把早期步骤折叠为聚合行（缺省 false=全量逐行，v4.5 行为） */
+  historyFold?: boolean
 }
 
 /** 测试模式注入的脚本上下文（runner 构造；含当前步骤与其断言的确切 expect 动作） */
@@ -238,6 +272,34 @@ function summarizeActions(actions: AgentAction[]): string {
     .join(',')
 }
 
+/** 单步历史行（C2a 从 buildStepMessage 内联逻辑抽出，折叠与全量共用同一渲染） */
+function renderOneHistoryLine(s: StepRecord): string {
+  if (s.userGuidance) {
+    return `第${s.n}步: 👤用户指导「${s.thought.slice(0, 60)}」${s.screenshot ? '（含截图）' : ''}`
+  }
+  const errs = s.actions.filter((a) => a.error).length
+  return `第${s.n}步: ${s.thought.slice(0, 40)}（${summarizeActions(s.actions)}${errs ? ` ⚠${errs}个动作出错` : ''}）`
+}
+
+/**
+ * v4.6 C2a 历史折叠（纯函数，selftest 直测）：
+ * - fold=false 或步数 ≤12：全量逐行（v4.5 行为，追加式对前缀缓存最友好）；
+ * - fold=true 且 >12 步：早期步骤折叠为 1 行聚合；用户指导行是最高优先指令**永不折叠**；
+ *   早期出错行保留最近 2 条供反思；最近 6 步始终逐行。
+ */
+export function renderHistoryLines(steps: StepRecord[], fold: boolean): string[] {
+  if (!fold || steps.length <= 12) return steps.map(renderOneHistoryLine)
+  const KEEP = 6
+  const head = steps.slice(0, steps.length - KEEP)
+  const tail = steps.slice(-KEEP)
+  const headErrs = head.filter((s) => s.actions.some((a) => a.error))
+  const agg = `第1~${head.length}步: 已执行 ${head.length} 步${headErrs.length ? `（⚠${headErrs.length} 步有动作出错）` : ''}`
+  const kept: string[] = [agg]
+  for (const s of head) if (s.userGuidance) kept.push(renderOneHistoryLine(s))
+  for (const s of headErrs.slice(-2)) kept.push(renderOneHistoryLine(s))
+  return [...kept, ...tail.map(renderOneHistoryLine)]
+}
+
 /**
  * 构造每步的 user 消息（无状态、含压缩历史，token 可控）。
  * 段落顺序=「稳定前缀在前（任务/记忆/经验库/历史），易变内容在后（页签/页面/元素/上一步）」：
@@ -280,16 +342,10 @@ export function buildStepMessage(ctx: StepContext): string {
   }
 
   // 历史压缩：全部步骤一行摘要（只追加不改写，前缀缓存友好；用户指导单独标记，避免被当成模型自己的动作）
+  // v4.6 C2a：fold=true 且步数 >12 时折叠早期步骤（追加式历史在前缀缓存命中时近乎免费，
+  // 折叠只服务无缓存端点与超长任务——短任务保持逐字节不变）
   if (ctx.steps.length) {
-    const hist = ctx.steps
-      .map((s) => {
-        if (s.userGuidance) {
-          return `第${s.n}步: 👤用户指导「${s.thought.slice(0, 60)}」${s.screenshot ? '（含截图）' : ''}`
-        }
-        const errs = s.actions.filter((a) => a.error).length
-        return `第${s.n}步: ${s.thought.slice(0, 40)}（${summarizeActions(s.actions)}${errs ? ` ⚠${errs}个动作出错` : ''}）`
-      })
-      .join('\n')
+    const hist = renderHistoryLines(ctx.steps, ctx.historyFold === true).join('\n')
     parts.push(`# 已执行步骤（摘要）\n${hist}`)
   }
 
@@ -349,9 +405,13 @@ export function buildStepMessage(ctx: StepContext): string {
   // 节点链进度（复核模式；仅普通任务且计划生成成功时拼入）
   if (ctx.plan?.nodes?.length) parts.push(renderPlanBlock(ctx.plan.nodes, ctx.plan.current))
 
+  // v4.6 C1：模式说明区块（vision/canvas/test）拼在动态后缀区尾部——system 恒等于 SYSTEM_PROMPT，
+  // 缓存断点不被开关变化击穿；放末尾不截断「system+任务+记忆+历史」的公共前缀
+  if (ctx.modeSuffix) parts.push(ctx.modeSuffix)
+
   parts.push(
     ctx.plan?.nodes?.length
-      ? `# 下一步\n输出 JSON（thought + 最多5个动作；当前节点预期达成时加 "node_done":true）：`
+      ? `# 下一步\n输出 JSON（thought + 最多5个动作；当前节点预期达成时加 "node_done":true 与 "node_evidence":"观察到的页面变化"）：`
       : `# 下一步\n输出 JSON（thought + 最多5个动作）：`
   )
   return parts.join('\n\n')

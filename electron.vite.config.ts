@@ -14,7 +14,8 @@ export default defineConfig({
       rollupOptions: {
         input: {
           index: resolve(__dirname, 'src/main/index.ts'),
-          'fastllm-worker': resolve(__dirname, 'src/main/fastllm-worker.ts')
+          'fastllm-worker': resolve(__dirname, 'src/main/fastllm-worker.ts'),
+          'asr-worker': resolve(__dirname, 'src/main/asr-worker.ts')
         }
       }
     }

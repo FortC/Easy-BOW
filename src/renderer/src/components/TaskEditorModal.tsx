@@ -2,6 +2,7 @@ import { Check, PenLine, Sparkles, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import type { TaskTemplate } from '@shared/types'
 import { useModalFocus } from '../hooks/useDelayedUnmount'
+import { VoiceInput } from './VoiceInput'
 
 export default function TaskEditorModal(props: {
   /** 是否处于打开状态（用于焦点管理，退场由 App 的延迟卸载处理） */
@@ -139,6 +140,25 @@ export default function TaskEditorModal(props: {
           <span className="task-editor-count">
             {chars} 字 · {lines} 行
           </span>
+          <VoiceInput
+            onText={(t) => {
+              // 语音转写插入光标处（大编辑器口述长任务）
+              const el = ref.current
+              if (!el) {
+                props.setTask(props.task ? `${props.task}${/\s$/.test(props.task) ? '' : ' '}${t}` : t)
+                return
+              }
+              const s = el.selectionStart ?? el.value.length
+              const e = el.selectionEnd ?? s
+              const add = s > 0 && !/\s$/.test(el.value.slice(0, s)) && !/^\s/.test(t) ? ' ' + t : t
+              props.setTask(el.value.slice(0, s) + add + el.value.slice(e))
+              requestAnimationFrame(() => {
+                el.focus()
+                const p = s + add.length
+                el.setSelectionRange(p, p)
+              })
+            }}
+          />
           <button
             className="btn"
             title="让 AI 把这段描述增强为清晰、结构化的任务指令（补步骤/字段/预期，保留原意）"

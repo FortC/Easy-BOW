@@ -1389,3 +1389,10 @@ img.hdrop-fav { object-fit: contain; }
 .log-action.err .log-act-result { color: #c0392b; white-space: normal; }
 .fb-stats { margin: 6px 0 2px; font-size: var(--fs-sub, 14px); color: var(--text2, #646a73); }
 .fb-stats b { color: var(--accent); font-size: 16px; }
+
+/* —— v4.4 语音输入（本地 whisper 转写） —— */
+.voice-wrap { display: inline-flex; align-items: center; gap: 6px; }
+.voice-on { color: #c0392b; border-color: #e0a8a0; background: #fdf3f2; }
+.voice-err { color: #c0392b; font-size: 11px; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.voice-spin { animation: voice-rot 1s linear infinite; }
+@keyframes voice-rot { to { transform: rotate(360deg); } }

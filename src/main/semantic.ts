@@ -18,6 +18,8 @@ export interface SemanticCandidate {
   extra: string
   role: string
   tag: string
+  /** 行身份锚点（表格行单号/列表标题等，v4.4）：任务里的单号/行标识直接命中它 */
+  anchor?: string
 }
 
 /** 业务同义词组：组内任意词视为等价（附录 B：组内词须确实等价，禁止放单字） */
@@ -207,6 +209,9 @@ function fieldChunks(cand: SemanticCandidate): string[] {
   const chunks: string[] = []
   const t = normalize(cand.text)
   if (t) chunks.push(t)
+  // v4.4 行身份锚点（表格行单号/列表标题）：任务里直接带单号时精准命中对应行的操作
+  const a = normalize(cand.anchor || '')
+  if (a) chunks.push(a)
   for (const part of String(cand.extra || '').split(/\s+/)) {
     const n = normalize(part)
     if (n && n.length >= 2) chunks.push(n)

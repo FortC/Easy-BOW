@@ -18,6 +18,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import type { AgentAction, AgentStatus, Settings, StepRecord, TaskTemplate } from '@shared/types'
+import { VoiceInput } from './VoiceInput'
 import { fillTemplateVars, parseTemplateVars, type TplVar } from '../lib/templateVars'
 
 /** 压缩剪贴板截图：最长边 1600px 的 JPEG dataURL（省 token / IPC 体积） */
@@ -652,6 +653,27 @@ export default function TaskPanel(props: {
           <span className="task-hint-text">
             {task.trim() ? `${task.length} 字` : '小提示：任务越具体（网址、字段名、步骤），AI 执行越准'}
           </span>
+          {!running && (
+            <VoiceInput
+              onText={(t) => {
+                // 语音转写插入光标处（复杂任务口述免打字）
+                const el = taskRef.current
+                if (!el) {
+                  setTask(task ? `${task}${/\s$/.test(task) ? '' : ' '}${t}` : t)
+                  return
+                }
+                const s = el.selectionStart ?? el.value.length
+                const e = el.selectionEnd ?? s
+                const add = s > 0 && !/\s$/.test(el.value.slice(0, s)) && !/^\s/.test(t) ? ' ' + t : t
+                setTask(el.value.slice(0, s) + add + el.value.slice(e))
+                requestAnimationFrame(() => {
+                  el.focus()
+                  const p = s + add.length
+                  el.setSelectionRange(p, p)
+                })
+              }}
+            />
+          )}
           {!running && task.trim() && (
             <button
               className="btn mini enhance-btn"
@@ -890,6 +912,9 @@ export default function TaskPanel(props: {
                 attachImage(file)
               }
             }}
+          />
+          <VoiceInput
+            onText={(t) => setGuideText(guideText ? `${guideText}${/\s$/.test(guideText) ? '' : ' '}${t}` : t)}
           />
           {guideImg && (
             <div className="guide-img-wrap">

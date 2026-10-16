@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, shell, Tray } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, session, shell, Tray } from 'electron'
 import { join } from 'path'
 import { TabManager, chromeLikeUA } from './tabs'
 import { Executor } from './executor'
@@ -18,6 +18,7 @@ import { runRegression } from './regression'
 import { runFastllmTest, isFastllmTest } from './fastllm-test'
 import { tryInitOcr, ocrEnhanceExtract, ocrPageText, disposeOcr } from './ocr'
 import { FastLlm } from './fastllm'
+import { Asr } from './asr'
 import { Scheduler } from './scheduler'
 import { onCleanup, runCleanup, forceExitAfter } from './cleanup'
 import { convertRequirement } from './testcase/converter'
@@ -64,6 +65,7 @@ let tabManager: TabManager
 let executor: Executor
 let runner: AgentRunner
 let fastllm: FastLlm
+let asrMgr: Asr
 let scheduler: Scheduler
 
 /* —— 托盘与关闭行为（用户反馈：关闭后进程残留、托盘看不到图标） —— */
@@ -76,6 +78,11 @@ let quitting = false
 
 function trayIconPath(): string {
   return app.isPackaged ? join(process.resourcesPath, 'tray.png') : join(__dirname, '../../resources/tray.png')
+}
+
+/** 窗口图标（dev 下默认是 Electron 图标，显式指定与安装图标同源） */
+function windowIconPath(): string {
+  return app.isPackaged ? join(process.resourcesPath, 'app-icon.png') : join(__dirname, '../../resources/app-icon.png')
 }
 
 function showMainWindow(): void {
@@ -168,6 +175,7 @@ function createWindow(): void {
     minWidth: 1120,
     minHeight: 720,
     autoHideMenuBar: true,
+    icon: windowIconPath(),
     backgroundColor: '#f5f6f8',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -313,7 +321,66 @@ function createWindow(): void {
     if (!s.apiKey) return Promise.reject(new Error('智能填充需要先在「设置」中配置 AI 接口'))
     return planFormFill(createProvider(s), fields, ctx)
   }
+  // v4.4 点击放大复核器（密集歧义/写操作点击前的视觉确认，宁可不点不可点错）：
+  // 目标局部截图 + 预期文案 → 视觉模型判定是否同一控件；未配置/超时/解析失败一律降级放行
+  // v4.6 A2：provider 按设置缓存复用（此前每次点击都新建客户端实例）；用量进 llm_call 分账（site=clickVerify）
+  let clickVerifyProvider: ReturnType<typeof createProvider> | null = null
+  let clickVerifyProviderKey = ''
+  executor.clickVerifier = async (crop, expect, label) => {
+    const s = getSettings()
+    if (!s.apiKey) return { ok: true }
+    try {
+      const pvKey = `${s.provider}|${s.baseURL}|${s.apiKey}|${s.model}`
+      if (!clickVerifyProvider || clickVerifyProviderKey !== pvKey) {
+        clickVerifyProvider = createProvider(s)
+        clickVerifyProviderKey = pvKey
+      }
+      const res = await Promise.race([
+        clickVerifyProvider.chat(
+          '你是点击前的目标核验员。用户即将点击一个控件，附带目标区域的局部截图。' +
+            '判断截图中央的控件是否与「预期文案」指向同一个操作目标（文字或图标语义大致相符即算匹配）。' +
+            '只输出纯 JSON：{"ok":true} 或 {"ok":false,"reason":"不匹配原因（20字内）"}',
+          [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: `预期文案：${expect || label}（当前控件文案：${label}）` },
+                { type: 'image', dataUrl: crop }
+              ]
+            }
+          ],
+          undefined,
+          { plain: true, maxTokens: 256 }
+        ),
+        new Promise<null>((r) => setTimeout(() => r(null), 20000))
+      ])
+      if (!res) return { ok: true }
+      try {
+        runner?.logEvent('llm_call', (runner?.currentStep || 0) + 1, {
+          site: 'clickVerify',
+          local: false,
+          vision: true,
+          planner: false,
+          input: res.usage.inputTokens,
+          output: res.usage.outputTokens,
+          cachedIn: res.usage.cachedInputTokens
+        })
+      } catch {}
+      const m = /"ok"\s*:\s*(true|false)/i.exec(res.text)
+      if (!m) return { ok: true }
+      const reason = /"reason"\s*:\s*"([^"]{0,80})"/.exec(res.text)?.[1]
+      return { ok: m[1].toLowerCase() === 'true', reason }
+    } catch {
+      return { ok: true }
+    }
+  }
   runner = new AgentRunner(tabManager, executor, sendEvent)
+  // v4.6 D1：clickVerifier 分档决策日志（run/skip + 原因）→ telemetry action_verify 事件
+  executor.clickVerifyHook = (ev) => {
+    try {
+      runner?.logEvent('action_verify', (runner?.currentStep || 0) + 1, { clickVerify: ev.decision, reason: ev.reason })
+    } catch {}
+  }
   // 本地快速决策模型（混合模式）：ready 前不参与决策，任务零影响
   fastllm = new FastLlm(sendEvent)
   runner.fastllm = fastllm
@@ -381,6 +448,15 @@ function registerIpc(): void {
     Promise.resolve(fn(...args)).catch((err) => {
       throw new Error(err?.message || String(err))
     })
+  // v4.4 语音输入管理器（本地 whisper，独立进程推理）；退出时释放
+  asrMgr = new Asr(sendEvent)
+  onCleanup(() => asrMgr?.dispose())
+  // v4.4 麦克风权限：仅放行 UI 窗口（默认会话）的 media 请求；站点页签走独立会话、
+  // 维持 Electron 默认策略（不给站点开麦克风）
+  session.defaultSession.setPermissionRequestHandler((wc, permission, callback) => {
+    if (permission === 'media') return callback(!!win && wc === win.webContents)
+    callback(true)
+  })
 
   ipcMain.handle('settings:get', () => getSettings())
   // 渲染进程不可信（C5）：只接受白名单字段 + 类型/枚举/范围校验，非法字段静默丢弃保留原值
@@ -417,6 +493,19 @@ function registerIpc(): void {
       return null
     }
   })
+  // v4.4 语音输入（本地 whisper，离线免费）：渲染层录音 PCM → 文本（独立进程推理，主进程不卡）
+  ipcMain.handle(
+    'asr:transcribe',
+    ok(async (pcm: Float32Array | number[], sampleRate: number) => {
+      try {
+        const buf = pcm instanceof Float32Array ? pcm : Float32Array.from(pcm || [])
+        const text = await asrMgr.transcribe(buf, Number(sampleRate) || 16000)
+        return { ok: true, text }
+      } catch (e: any) {
+        return { ok: false, error: String(e?.message || e) }
+      }
+    })
+  )
   ipcMain.handle('llm:test', async () => {
     const s = getSettings()
     const provider = createProvider(s)
@@ -702,6 +791,12 @@ if (!gotLock) {
     void shutdown()
   })
   app.on('window-all-closed', () => {
+    // 自测/回归模式下**不退出**：这两套用例过程中会开关浏览器视图与测试页签，
+    // 一旦某一刻窗口数归零就会触发 window-all-closed 把进程带走——表现为
+    // 用例跑到一半静默结束、不打印汇总、却返回 exit 0。
+    // 这正是第 10 节之后的用例（含密集控件定位基准、iframe 全穿透）长期
+    //「写在代码里但从不执行」的原因：不是用例有问题，是进程先没了。
+    if (isSelftest || isRegression) return
     app.quit()
   })
   // 兜底：所有窗口已关闭但进程仍未退出（残留句柄），2s 后无条件结束

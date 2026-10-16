@@ -7,7 +7,8 @@
  *           value、hidden、role 属性变化；
  * 忽略：    style、class 中纯动画/过渡类、轮播/广告容器选择器黑名单内的子树增删、
  *           自注入的 data-easybow-* 句柄属性。
- * 探针覆盖穿透的每个 shadow root（含运行期新增的）。
+ * 探针覆盖穿透的每个 shadow root 与同源嵌套 iframe 文档（均含运行期新增的）——
+ * v4.4：此前不观察 iframe 内部，iframe 数据异步渲染完之前就判稳定、提取抽到空。
  */
 
 /** 属性变动中「计入静默判定」的属性名（精确 + 前缀） */
@@ -137,25 +138,14 @@ export const WAIT_DOM_STABLE_FN = String(function waitDomStable(quietMs: number,
       try {
         var obs = new MutationObserver(function (muts) {
           onMuts(muts)
-          // 运行期新增的 shadow host：挂载探针（覆盖穿透的每个 shadow root）
+          // 运行期新增的 shadow host / iframe：挂载探针（覆盖穿透的每个 shadow root 与嵌套文档）
           for (var i = 0; i < muts.length; i++) {
             var m = muts[i]
             if (m.type !== 'childList') continue
             for (var j = 0; j < m.addedNodes.length; j++) {
               var n = m.addedNodes[j] as any
               if (!n || n.nodeType !== 1) continue
-              if (n.shadowRoot && !n.shadowRoot.__easybowProbe) {
-                n.shadowRoot.__easybowProbe = true
-                observeRoot(n.shadowRoot)
-              }
-              var hosts = n.querySelectorAll ? n.querySelectorAll('*') : []
-              for (var k = 0; k < hosts.length; k++) {
-                var sr = (hosts[k] as any).shadowRoot
-                if (sr && !sr.__easybowProbe) {
-                  sr.__easybowProbe = true
-                  observeRoot(sr)
-                }
-              }
+              installInto(n, 0)
             }
           }
         })
@@ -170,17 +160,40 @@ export const WAIT_DOM_STABLE_FN = String(function waitDomStable(quietMs: number,
         observers.push(obs)
       } catch (e) {}
     }
-    observeRoot(document)
-    // 已存在的 shadow root 一次挂齐
-    try {
-      var all = document.querySelectorAll('*')
-      for (var i = 0; i < all.length; i++) {
-        var sr = (all[i] as any).shadowRoot
-        if (sr && !sr.__easybowProbe) {
-          sr.__easybowProbe = true
-          observeRoot(sr)
+    /** 对子树挂探针：shadow root + 同源 iframe 文档（v4.4 递归进嵌套文档，深度 ≤5）。
+     *  子树逐层只 querySelectorAll 一次（防嵌套递归重复遍历整棵子树） */
+    function installInto(n: any, depth: number) {
+      if (!n || depth > 5) return
+      var list: any[] = [n]
+      try {
+        if (n.querySelectorAll) {
+          var subs = n.querySelectorAll('*')
+          for (var i = 0; i < subs.length; i++) list.push(subs[i])
+        }
+      } catch (e) {}
+      for (var j = 0; j < list.length; j++) {
+        var el = list[j]
+        if (!el || el.nodeType !== 1) continue
+        if (el.shadowRoot && !el.shadowRoot.__easybowProbe) {
+          el.shadowRoot.__easybowProbe = true
+          observeRoot(el.shadowRoot)
+        }
+        if (el.tagName === 'IFRAME') {
+          try {
+            var cd = el.contentDocument
+            if (cd && cd.body && !cd.__easybowProbe) {
+              cd.__easybowProbe = true
+              observeRoot(cd)
+              installInto(cd.body, depth + 1) // 新文档：进入其内部递归（深度独立计）
+            }
+          } catch (e) {}
         }
       }
+    }
+    observeRoot(document)
+    // 已存在的 shadow root 与同源 iframe 文档一次挂齐（v4.4：嵌套 frame 数据渲染完才算稳定）
+    try {
+      installInto(document.body, 0)
     } catch (e) {}
 
     var t0 = Date.now()
