@@ -9,6 +9,7 @@ on:
         type: string
 permissions:
   contents: write
+  actions: read
 concurrency:
   group: release-${{ inputs.tag }}
   cancel-in-progress: false
@@ -56,8 +57,9 @@ jobs:
       - name: Upload verified assets and publish existing draft
         run: |
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          $release = gh release view $env:RELEASE_TAG --json id,isDraft | ConvertFrom-Json
-          if (!$release.isDraft) { throw 'Refusing to replace assets of an already public release' }
+          $releases = gh api "repos/$env:GH_REPO/releases?per_page=100" | ConvertFrom-Json
+          $release = $releases | Where-Object { $_.tag_name -eq $env:RELEASE_TAG } | Select-Object -First 1
+          if (!$release -or !$release.draft) { throw 'Existing unpublished draft required; public release assets will not be replaced' }
           $names = @("EasyBow-Setup-$version.exe", "EasyBow-Portable-$version.exe", "EasyBow-Setup-$version.exe.blockmap", 'latest.yml')
           $checksums = foreach ($name in $names) { $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist/$name").Hash.ToLowerInvariant(); "$hash  $name" }
           $checksumName = "SHA256SUMS-$version.txt"
