@@ -178,7 +178,8 @@ export async function supplementExtract(
   viewportH: number,
   /** v4.5：文案长度上限，与主上下文 EXTRACT_FN 调用保持同一常量（frameAccess 不 import textmatch
    *  以免主进程模块耦合，调用方从 executor 传入） */
-  textCap?: number
+  textCap?: number,
+  query?: string
 ): Promise<number> {
   const served = new Set<string>() // 已补充的 frame key（frame 树每轮重建，跨轮记忆）
   const servedSrcs: string[] = []
@@ -223,8 +224,9 @@ export async function supplementExtract(
         if (!kid || served.has(kid.key)) continue
         served.add(kid.key)
         if (it.src) servedSrcs.push(it.src)
-        const sub = await runInFrame<ExtractResult>(kid.frame, extractFn, [maxElements, true, textCap || 80])
+        const sub = await runInFrame<ExtractResult>(kid.frame, extractFn, [maxElements, true, textCap || 80, query])
         if (!sub || !Array.isArray(sub.candidates) || !sub.candidates.length) continue
+        res.totalFound += Math.max(0, sub.totalFound - sub.candidates.length)
         progressed = true
         const off = await frameOffset(wc, kid, tree)
         for (const c of sub.candidates as Candidate[]) {
@@ -236,6 +238,8 @@ export async function supplementExtract(
           }
           const dup = res.candidates.some(
             (e) =>
+              e.frameKey === kid!.key &&
+              JSON.stringify(e.framePaths) === JSON.stringify(c.framePaths) &&
               e.tag === c.tag &&
               e.text === c.text &&
               Math.abs(e.rect.x - rect.x) <= 2 &&
@@ -244,7 +248,7 @@ export async function supplementExtract(
           if (dup) continue
           const cand: Candidate = {
             ...c,
-            framePaths: [],
+            framePaths: c.framePaths || [],
             frameKey: kid!.key,
             rect,
             inViewport: off ? rect.y + rect.h > 0 && rect.y < viewportH : false // 坐标解不出=仅供读

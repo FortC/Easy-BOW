@@ -23,11 +23,21 @@ export const EXPECT_TEXT_FN = String(function expectText(needle: string) {
       } catch {
         return
       }
-      for (const el of Array.from(all)) {
+      for (const el of Array.from(all) as Element[]) {
         const sr = (el as any).shadowRoot
         if (!sr) continue
         if (++visited > 60) return
-        out += ' ' + norm(sr.textContent || '')
+        const hostRect = el.getBoundingClientRect()
+        if (!hostRect.width || !hostRect.height) continue
+        const walker = el.ownerDocument.createTreeWalker(sr, NodeFilter.SHOW_TEXT)
+        let node: Node | null
+        while ((node = walker.nextNode())) {
+          const parent = node.parentElement
+          if (!parent || getComputedStyle(parent).visibility === 'hidden') continue
+          const range = el.ownerDocument.createRange()
+          range.selectNodeContents(node)
+          if (Array.from(range.getClientRects()).some((r) => r.width > 0 && r.height > 0)) out += ' ' + norm(node.textContent)
+        }
         walk(sr)
       }
     }
@@ -46,10 +56,10 @@ export const EXPECT_TEXT_FN = String(function expectText(needle: string) {
   const top = scan(document)
   if (top.found) return top
   // 同源 iframe 穿透（一层层递归，深度限 3）
-  const queue: Document[] = [document]
-  let depth = 0
-  while (queue.length && depth < 3) {
-    const doc = queue.shift()!
+  const queue: Array<{ doc: Document; depth: number }> = [{ doc: document, depth: 0 }]
+  while (queue.length) {
+    const { doc, depth } = queue.shift()!
+    if (depth >= 5) continue
     const frames = doc.querySelectorAll('iframe')
     for (const f of Array.from(frames)) {
       let inner: Document | null = null
@@ -61,9 +71,8 @@ export const EXPECT_TEXT_FN = String(function expectText(needle: string) {
       if (!inner || !inner.body) continue
       const r = scan(inner)
       if (r.found) return r
-      queue.push(inner)
+      queue.push({ doc: inner, depth: depth + 1 })
     }
-    depth++
   }
   return { found: false, snippet: '' }
 })
@@ -71,53 +80,37 @@ export const EXPECT_TEXT_FN = String(function expectText(needle: string) {
 /** 选择器求值：存在性 / 取值 / 取文本（querySelectorAll 全文档计数；浅层未命中时递归 open shadowRoot） */
 export const EXPECT_SEL_FN = String(function expectSel(selector: string, mode: 'exists' | 'value' | 'text') {
   if (!selector) return { ok: false, err: 'no-selector' }
-  let nodes: NodeList
+  const nodes: Element[] = []
+  const queue: Array<{ root: Document | ShadowRoot; depth: number }> = [{ root: document, depth: 0 }]
+  const seen = new Set<Document | ShadowRoot>()
   try {
-    nodes = document.querySelectorAll(selector)
-  } catch {
-    return { ok: false, err: 'invalid-selector' }
-  }
-  // W5 shadow 穿透：浅层没命中时递归 open shadowRoot（querySelector 不跨 shadow 边界）
-  let shadowHits = 0
-  const deepQuery = (root: Document | ShadowRoot): Element | null => {
-    let hit: Element | null = null
-    try {
-      hit = root.querySelector(selector)
-    } catch {
-      return null
+    while (queue.length && seen.size < 160) {
+      const { root, depth } = queue.shift()!
+      if (seen.has(root)) continue
+      seen.add(root)
+      nodes.push(...Array.from(root.querySelectorAll(selector)))
+      for (const el of Array.from(root.querySelectorAll('*'))) {
+        if (el.shadowRoot) queue.push({ root: el.shadowRoot, depth })
+        if (el.tagName === 'IFRAME' && depth < 5) {
+          try {
+            const doc = (el as HTMLIFrameElement).contentDocument
+            if (doc) queue.push({ root: doc, depth: depth + 1 })
+          } catch { /* 跨域 frame 由执行器 frame 通道处理 */ }
+        }
+      }
     }
-    if (hit) return hit
-    let all: NodeList
-    try {
-      all = root.querySelectorAll('*')
-    } catch {
-      return null
-    }
-    for (const el of Array.from(all)) {
-      const sr = (el as any).shadowRoot
-      if (!sr) continue
-      if (++shadowHits > 100) return null
-      const found = deepQuery(sr)
-      if (found) return found
-    }
-    return null
-  }
-  if (mode === 'exists') {
-    if (nodes.length > 0) return { ok: true, count: nodes.length }
-    const deep = deepQuery(document)
-    return { ok: true, count: deep ? 1 : 0 }
-  }
-  let el = nodes[0] as any
-  if (!el) {
-    el = deepQuery(document) as any
-    if (!el) return { ok: true, count: 0 }
-  }
+  } catch { return { ok: false, err: 'invalid-selector' } }
+  if (queue.length) return { ok: false, err: 'scope-budget-exceeded' }
+  if (mode === 'exists') return { ok: true, count: nodes.length }
+  if (!nodes.length) return { ok: true, count: 0 }
+  if (nodes.length !== 1) return { ok: false, err: `ambiguous-selector:${nodes.length}` }
+  const el = nodes[0] as any
   if (mode === 'value') {
     const v = el.value != null ? String(el.value) : el.getAttribute('value') || ''
     return { ok: true, count: Math.max(nodes.length, 1), v }
   }
   const t = String(el.innerText != null ? el.innerText : el.textContent || '').replace(/\s+/g, ' ').trim()
-  return { ok: true, count: Math.max(nodes.length, 1), v: t.slice(0, 120) }
+  return { ok: true, count: Math.max(nodes.length, 1), v: t }
 })
 
 /**

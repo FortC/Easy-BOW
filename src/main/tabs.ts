@@ -145,6 +145,8 @@ export class TabManager {
   }
 
   newTab(url?: string, opts?: { partition?: string }): { tabs: TabInfo[]; activeTabId: number } {
+    // 测试期间显式新建页签也必须留在测试会话，避免污染日常登录态。
+    if (this.testing && !opts?.partition && this.active()?.partition?.includes('easybow-test')) opts = { partition: this.active()!.partition }
     if (this.tabs.length >= MAX_TABS) {
       this.broadcast('toast', { message: `最多 ${MAX_TABS} 个页签，请先关闭其他页签`, kind: 'error' })
       return this.snapshot()
@@ -167,11 +169,14 @@ export class TabManager {
       loading: false,
       partition: opts?.partition
     }
+    if (this.testing && opts?.partition?.includes('easybow-test')) tab.cdp.setNetworkCapture(true)
 
     wc.setWindowOpenHandler(({ url: openUrl }) => {
       // 弹窗/新窗口一律转为我们的页签（不超出上限）
       if (openUrl && /^https?:/i.test(openUrl)) {
-        setTimeout(() => this.newTab(openUrl), 0)
+        setTimeout(() => {
+          if (!wc.isDestroyed()) this.newTab(openUrl, opts?.partition ? { partition: opts.partition } : undefined)
+        }, 0)
       }
       return { action: 'deny' }
     })
@@ -284,7 +289,22 @@ export class TabManager {
 
   /** 测试页签（独立登录分区；无则 undefined） */
   getTestTab(): Tab | undefined {
-    return this.tabs.find((x) => x.partition === TEST_PARTITION)
+    return this.tabs.find((x) => x.partition === this.testPartition)
+  }
+
+  private testPartition = TEST_PARTITION
+  private testing = false
+  endTestSession(): void { this.testing = false }
+
+  /** 每组重建页签；干净模式使用一次性内存分区，复用模式保留专用登录分区。 */
+  prepareTestTab(reuseLogin: boolean): Tab {
+    this.testing = true
+    const oldPartition = this.testPartition
+    for (const tab of [...this.tabs]) {
+      if (tab.partition === oldPartition) this.closeTab(tab.id)
+    }
+    this.testPartition = reuseLogin ? TEST_PARTITION : `easybow-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    return this.ensureTestTab()
   }
 
   /**
@@ -300,7 +320,7 @@ export class TabManager {
     if (this.tabs.length >= MAX_TABS) {
       throw new Error(`页签已达 ${MAX_TABS} 个上限，请先关闭其他页签再运行测试`)
     }
-    this.newTab('about:blank', { partition: TEST_PARTITION })
+    this.newTab('about:blank', { partition: this.testPartition })
     const t = this.getTestTab()
     if (!t) throw new Error('测试页签创建失败')
     return t

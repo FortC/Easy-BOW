@@ -572,7 +572,11 @@ export class Cdp {
 
   private netCapture = false
   private netHandler: ((_e: unknown, method: string, params: any) => void) | null = null
-  private netLog: Array<{ requestId: string; url: string; status: number; type: string; ts: number }> = []
+  private netLog: Array<{ requestId: string; url: string; status: number; type: string; ts: number; method?: string; sequence?: number; finished?: boolean; failed?: boolean }> = []
+  private requestSequence = 0
+  private requestSequences = new Map<string, number>()
+
+  networkCheckpoint(): number { return this.requestSequence }
   /** W1 轻量网络活动跟踪：只记时间戳（环形最近 50 条），供「网络静默」判定 */
   private netActivity: number[] = []
   /** in-flight 生命周期（P0-3）：只跟白名单 XHR/Fetch/Document——requestWillBeSent 记账、
@@ -628,6 +632,8 @@ export class Cdp {
           if (this.netActivity.length > 50) this.netActivity.splice(0, this.netActivity.length - 50)
         }
         if (method === 'Network.requestWillBeSent') {
+          this.requestSequences.set(String(params.requestId), ++this.requestSequence)
+          if (this.requestSequences.size > 1000) this.requestSequences.delete(this.requestSequences.keys().next().value!)
           const t = String(params?.type || '')
           // in-flight 只记白名单（XHR/Fetch/Document）：图片/样式/字体长连接不卡「网络静默」
           if (['XHR', 'Fetch', 'Document'].includes(t)) {
@@ -655,12 +661,19 @@ export class Cdp {
             url: String(r.url || ''),
             status: Number(r.status || 0),
             type: t,
-            ts: Date.now()
+            ts: Date.now(),
+            method: rec?.method,
+            sequence: this.requestSequences.get(String(params.requestId))
           })
           if (this.netLog.length > 200) this.netLog.splice(0, this.netLog.length - 200)
           return
         }
         if (method === 'Network.loadingFinished' || method === 'Network.loadingFailed') {
+          const logged = [...this.netLog].reverse().find((e) => e.requestId === String(params?.requestId))
+          if (logged) {
+            logged.finished = method === 'Network.loadingFinished'
+            logged.failed = method === 'Network.loadingFailed'
+          }
           const rec = this.netInflight.get(String(params?.requestId))
           if (rec) {
             // loadingFailed（网络层中断，status 常为 0）必须与 loadingFinished 区分：
@@ -801,13 +814,14 @@ export class Cdp {
   }
 
   /** 按 URL 片段找最近一次匹配的响应（状态 + 尽力拉取响应体） */
-  async findResponseBody(urlPart: string): Promise<{ status: number; url: string; body?: string } | null> {
-    const hit = [...this.netLog].reverse().find((e) => e.url.includes(urlPart))
+  async findResponseBody(urlPart: string, since?: number, method?: string): Promise<{ status: number; url: string; body?: string } | null> {
+    const hit = [...this.netLog].reverse().find((e) => e.url.includes(urlPart) && e.finished && !e.failed &&
+      (since == null || (e.sequence != null && e.sequence > since)) && (!method || e.method?.toUpperCase() === method.toUpperCase()))
     if (!hit) return null
     let body: string | undefined
     try {
-      const r = await this.send<{ body?: string }>('Network.getResponseBody', { requestId: hit.requestId })
-      body = r?.body
+      const r = await this.send<{ body?: string; base64Encoded?: boolean }>('Network.getResponseBody', { requestId: hit.requestId })
+      body = r?.base64Encoded && r.body != null ? Buffer.from(r.body, 'base64').toString('utf-8') : r?.body
     } catch {
       /* 响应缓冲已被回收（加载了较多后续请求）——状态码断言仍可用 */
     }

@@ -1,5 +1,6 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, session, shell, Tray } from 'electron'
 import { join } from 'path'
+import { mkdirSync } from 'fs'
 import { TabManager, chromeLikeUA } from './tabs'
 import { Executor } from './executor'
 import { AgentRunner } from './agent/runner'
@@ -22,7 +23,11 @@ import { Asr } from './asr'
 import { Scheduler } from './scheduler'
 import { onCleanup, runCleanup, forceExitAfter } from './cleanup'
 import { convertRequirement } from './testcase/converter'
-import { parseTestCase, summarize } from './testcase/parser'
+import { summarize } from './testcase/parser'
+import { parseTestSuite, selectFailedCases } from './testcase/suite'
+import { runTestingSelftest } from './testcase/selftest'
+import { benchmarkModel } from './testcase/modelBenchmark'
+import { writeJsonAtomic } from './fsutil'
 import { stepPreview, updateStep, deleteStep, insertStep } from './testcase/edit'
 import { planFormFill } from './testcase/fields'
 import { reportsRoot, renderCaseMd } from './testcase/report'
@@ -45,7 +50,9 @@ if (!app.isPackaged) process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true'
 // 后台/最小化运行支持（默认关）：抑制 Chromium 后台节流（渲染/定时器/被遮挡窗口），
 // 保证测试或任务在窗口最小化时仍全速执行。commandLine 开关须在 app ready 前设置，故重启生效。
 // 默认关闭=与历史行为逐字节一致（开关只在设置里显式打开才追加）。
-if (getSettings().bgRun) {
+// 自动验收不依赖窗口是否处于前台；共享桌面焦点切换不应让 CDP 输入等待数分钟。
+const automationRuntime = process.argv.some((arg) => ['--selftest', '--testing-selftest', '--regression'].includes(arg))
+if (getSettings().bgRun || automationRuntime) {
   app.commandLine.appendSwitch('disable-renderer-backgrounding')
   app.commandLine.appendSwitch('disable-background-timer-throttling')
   app.commandLine.appendSwitch('disable-backgrounding-occluded-windows')
@@ -606,7 +613,7 @@ function registerIpc(): void {
   )
 
   // —————— 浏览器仿真测试 ——————
-  // 需求 MD → 用例 MD（一次 LLM 调用，不占页签）
+  // 需求 MD → 多用例 MD（全文分段转换，不占页签）
   ipcMain.handle('test:convert', async (_e, reqMd: string, mode: 'prd' | 'rough') => {
     const s = getSettings()
     if (!s.apiKey) throw new Error('请先在「设置」中配置 AI 接口')
@@ -614,17 +621,20 @@ function registerIpc(): void {
   })
   // 用例 MD 校验（UI 预览步骤/断言/变量/数据组 + 步骤节点明细，供面板行内编辑后重渲染）
   ipcMain.handle('test:parse', (_e, md: string) => {
-    const r = parseTestCase(String(md || ''))
-    if (!r.ok || !r.tc) return { ok: false, error: r.error }
-    const s = summarize(r.tc)
+    const r = parseTestSuite(String(md || ''))
+    if (!r.ok || !r.suite) return { ok: false, error: r.error }
+    const tc = { name: r.suite.name, vars: Object.assign({}, ...r.suite.cases.map((c) => c.vars)), steps: r.suite.cases.flatMap((c) => c.steps) }
+    const s = summarize(tc)
     return {
       ok: true,
-      name: r.tc.name,
+      name: r.suite.name,
+      cases: r.suite.cases.length,
+      unresolved: tc.steps.flatMap((s) => s.assertions).filter((a) => a.kind === 'ai').length,
       steps: s.steps,
       assertions: s.assertions,
       vars: s.vars,
-      groups: s.groups,
-      stepsDetail: stepPreview(r.tc)
+      groups: r.suite.cases.reduce((n, c) => n + (c.groups?.length || 1), 0),
+      stepsDetail: stepPreview(tc)
     }
   })
   // 行内编辑单步骤：改/删/插 → 返回新用例 MD（面板据此重新解析，其下方节点一并重建）
@@ -650,17 +660,31 @@ function registerIpc(): void {
   // loginReuse=启动先探测已保存登录态，命中则跳过登录步骤）
   ipcMain.handle(
     'test:start',
-    ok((md: string, opts: { envName?: string; failFast: boolean; fillPreview?: boolean; loginReuse?: boolean }) => {
+    ok((md: string, opts: { envName?: string; failFast: boolean; fillPreview?: boolean; loginReuse?: boolean; reusePlans?: boolean }) => {
       const env = findTestEnv(opts?.envName)
       return runner.startTestRun(String(md || ''), {
         failFast: opts?.failFast !== false,
         fillPreview: !!opts?.fillPreview,
-        loginReuse: opts?.loginReuse !== false,
+        loginReuse: opts?.loginReuse === true,
+        reusePlans: opts?.reusePlans !== false,
         env: env ? { name: env.name, baseUrl: env.baseUrl, protected: env.protected } : undefined
       })
     })
   )
   ipcMain.handle('test:stop', () => runner.stopTask())
+  let benchmarking = false
+  ipcMain.handle('test:model-benchmark', async () => {
+    if (benchmarking) throw new Error('模型测评正在运行')
+    const settings = getSettings()
+    if (!settings.apiKey) throw new Error('请先配置 AI 接口')
+    benchmarking = true
+    try {
+      const report = await benchmarkModel(createProvider(settings), settings)
+      mkdirSync(join(app.getPath('userData'), 'model-capabilities'), { recursive: true })
+      writeJsonAtomic(join(app.getPath('userData'), 'model-capabilities', `${report.profileId}-${report.testedAt}.json`), report)
+      return report
+    } finally { benchmarking = false }
+  })
   ipcMain.handle('test:status', () => runner.getTestRunStatus())
   // 强制重置卡在「执行中」的测试状态（UI 看门狗/用户手动兜底）
   ipcMain.handle('test:reset', () => runner.resetTestRun())
@@ -673,19 +697,15 @@ function registerIpc(): void {
     )
   )
   ipcMain.handle('cases:delete', ok((id: number) => deleteTestCase(Number(id))))
-  // 失败重跑：按步骤序号（1-based）生成只含失败步骤的子用例 MD（返回编辑器人工确认）
+  // 失败重跑：按步骤序号选择完整用例/数据组，保留其准备与清理（返回编辑器审核）
   ipcMain.handle('test:subcase', (_e, md: string, keepIdx: number[], suffix?: string) => {
-    const r = parseTestCase(String(md || ''))
-    if (!r.ok || !r.tc) return { ok: false, error: r.error }
-    const total = r.tc.steps.length
-    const keep = (Array.isArray(keepIdx) ? keepIdx : []).filter((n: any) => Number.isInteger(n) && n >= 1 && n <= total).sort((a: number, b: number) => a - b)
-    if (!keep.length) return { ok: false, error: '没有可保留的步骤序号' }
-    const sub: TestCase = {
-      name: `${r.tc.name}${suffix || '-失败重跑'}`,
-      vars: r.tc.vars,
-      steps: keep.map((n: number) => r.tc!.steps[n - 1])
-    }
-    return { ok: true, md: renderCaseMd(sub) }
+    const r = parseTestSuite(String(md || ''))
+    if (!r.ok || !r.suite) return { ok: false, error: r.error }
+    const indices = (Array.isArray(keepIdx) ? keepIdx : []).filter((n) => Number.isInteger(n) && n > 0)
+    const cases = selectFailedCases(r.suite, indices)
+    if (!cases.length) return { ok: false, error: '没有可重跑的失败用例' }
+    return { ok: true, md: `# TESTSUITE: ${r.suite.name}${suffix || '-失败重跑'}\n\n` + cases.map(renderCaseMd).join('\n\n') }
+
   })
   ipcMain.handle('test:reports', () => listReports())
   ipcMain.handle('test:report-read', ok((file: string) => readReport(file)))
@@ -722,7 +742,8 @@ function registerIpc(): void {
 
 // 自测模式：独立临时 userData + 绕过单实例锁，保证开发者开着正式应用也能随时跑自测
 // （共享真实 profile 会撞 Chromium 缓存锁，且定时任务/浏览历史会被自测污染）
-const isSelftest = process.argv.includes('--selftest')
+const isTestingSelftest = process.argv.includes('--testing-selftest')
+const isSelftest = process.argv.includes('--selftest') || isTestingSelftest
 if (isSelftest) {
   app.setPath('userData', join(app.getPath('temp'), `easybow-selftest-${Date.now()}`))
 }
@@ -755,6 +776,14 @@ if (!gotLock) {
       return
     }
     if (isSelftest) {
+      if (isTestingSelftest) {
+        createWindow()
+        const timeout = setTimeout(() => { console.error('Testing selftest timeout'); app.exit(1) }, 120000)
+        const code = await runTestingSelftest(tabManager, executor).catch((e) => { console.error(e); return 1 })
+        clearTimeout(timeout)
+        app.exit(code)
+        return
+      }
       await runSelftest({
         createWindow,
         getTabManager: () => tabManager,

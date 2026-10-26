@@ -71,6 +71,8 @@ extraResources:
   # 回归 fixtures（--regression 本地用例页；打包后回归也能跑）
   - from: resources/fixtures
     to: fixtures
+  - from: resources/testcases
+    to: testcases
 win:
   target:
     - nsis

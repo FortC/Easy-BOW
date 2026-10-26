@@ -15,6 +15,8 @@ import {
 import { mdToHtml, mdToPlain } from './markdown'
 import { decodeImageToPng } from './imgdec'
 import { EXPECT_TEXT_FN, EXPECT_SEL_FN, SOFT_ERR_FN } from './testcase/assertions'
+import { evaluateAssertion } from './testcase/evaluate'
+import { resolveTarget } from './testcase/plans'
 import { FORM_FIELDS_FN, FORM_SET_FN, type FormField } from './testcase/fields'
 import { scoreCandidate, verifyFieldMatch, extractKeywords } from './semantic'
 import { textMatch, TEXT_CAP } from './textmatch'
@@ -416,12 +418,16 @@ export class Executor {
    * 重排在 snapshots.set 之前完成，编号即最终编号（快照与提示词一致）。
    * opts.limit（S1 扩展提取）：提高快照上限重提取（默认按设置的上限）。
    */
-  async extract(tab?: Tab, opts?: { task?: string; limit?: number }): Promise<ExtractResult> {
+  async extract(tab?: Tab, opts?: { task?: string; limit?: number; query?: string }): Promise<ExtractResult> {
     const t = tab || this.tabManager.active()
     if (!t) throw new Error('没有可用页签')
+    if (!opts?.query && this.pendingObservations.has(t.id)) {
+      opts = { ...opts, query: this.pendingObservations.get(t.id), limit: 200 }
+      this.pendingObservations.delete(t.id)
+    }
     const cap = opts?.limit ? Math.max(20, Math.min(200, opts.limit)) : this.snapshotLimit()
     // W5 shadowDom 开关：false 时关闭 shadow DOM 穿透（独立回滚；缺省开启）
-    let res = await t.cdp.evaluate<ExtractResult>(EXTRACT_FN, [cap, getSettings().shadowDom !== false, TEXT_CAP])
+    let res = await t.cdp.evaluate<ExtractResult>(EXTRACT_FN, [cap, getSettings().shadowDom !== false, TEXT_CAP, opts?.query])
     if (!res || !Array.isArray(res.candidates)) {
       throw new Error('页面提取结果为空（页面可能还在加载或为特殊页面）')
     }
@@ -429,7 +435,7 @@ export class Executor {
     // 在各 frame 自身上下文提取后并入候选（frameKey 标识，坐标经偏移链合并；失败静默零影响）
     if (!process.env.EASYBOW_NO_SUPPLEMENT) {
       try {
-        const added = await supplementExtract(t.view.webContents, res, EXTRACT_FN, cap, res.viewportH, TEXT_CAP)
+        const added = await supplementExtract(t.view.webContents, res, EXTRACT_FN, cap, res.viewportH, TEXT_CAP, opts?.query)
         if (added > 0) res.totalFound += added
       } catch {}
     }
@@ -438,6 +444,8 @@ export class Executor {
         res = rerankByTask(res, opts.task)
       } catch {}
     }
+    if (opts?.query) res.candidates = res.candidates.filter((c) => `${c.text} ${c.fullText || ''} ${c.extra} ${c.anchor || ''}`.toLowerCase().includes(opts.query!.toLowerCase()))
+    res.snapshotId = `${t.id}-${++this.snapshotSequence}`
     this.snapshots.set(t.id, res)
     return res
   }
@@ -461,6 +469,8 @@ export class Executor {
   }
 
   private maxElementsProvider: () => number = () => 80
+  private snapshotSequence = 0
+  private pendingObservations = new Map<number, string>()
 
   setMaxElementsProvider(fn: () => number): void {
     this.maxElementsProvider = fn
@@ -478,6 +488,7 @@ export class Executor {
   /** 页签关闭时清理其提取快照（Map 只增不减会随页签开闭累积泄漏） */
   dropSnapshots(tabId: number): void {
     this.snapshots.delete(tabId)
+    this.pendingObservations.delete(tabId)
     this.extractCache.delete(tabId)
     this.pageTextCache.delete(tabId)
   }
@@ -1037,8 +1048,36 @@ export class Executor {
   }
 
   /** 返回 true 表示该动作改变了活动页签 */
+  async checkAssertion(a: AgentAction, ctx: ExecContext): Promise<AgentAction> {
+    const tab = this.tabManager.active()
+    if (!tab) throw new Error('没有可用页签')
+    const frame = a.frameKey ? await runByKey<{ url: string; title: string }>(tab.view.webContents, a.frameKey, 'function(){return {url:location.href,title:document.title}}', []) : null
+    await evaluateAssertion(a, {
+      url: () => { if (a.frameKey && !frame) throw new Error('目标框架不可达'); return frame?.url || tab.view.webContents.getURL() },
+      title: () => { if (a.frameKey && !frame) throw new Error('目标框架不可达'); return frame?.title ?? tab.view.webContents.getTitle() },
+      evaluate: async <T>(fn: string, args: unknown[]) => {
+        if (!a.frameKey) return tab.cdp.evaluate<T>(fn, args)
+        const result = await runByKey<T>(tab.view.webContents, a.frameKey, fn, args)
+        if (result == null) throw new Error('目标框架不可达或求值失败')
+        return result
+      },
+      response: (url, since, method) => tab.cdp.findResponseBody(url, since, method)
+    }, ctx.memory, ctx.signal, (ms) => this.sleep(ms, ctx.signal))
+    return a
+  }
+
   private async executeOne(a: AgentAction, ctx: ExecContext): Promise<boolean> {
     const tm = this.tabManager
+    if (a.snapshotId && a.snapshotId !== this.snapshots.get(tm.active()?.id ?? -1)?.snapshotId) throw new Error('页面快照已失效，请重新观察')
+    if (a.target && ['click', 'type', 'hover'].includes(a.name)) {
+      const fresh = await this.extract(undefined, { limit: 200, query: a.target.label })
+      if (fresh.totalFound > fresh.candidates.length) throw new Error('目标候选被截断，无法证明唯一性，请缩小目标作用域')
+      const index = resolveTarget(a.target, fresh.candidates)
+      if (index < 0) throw new Error('语义目标不存在或不唯一，已拒绝操作，请重新观察目标作用域')
+      a.index = index
+      a.fp = undefined
+      a.expect_text = a.target.tag === 'INPUT' || a.target.tag === 'TEXTAREA' ? undefined : [a.target.label, a.target.anchor].filter(Boolean).join(' ')
+    }
     switch (a.name) {
       case 'click': {
         const t = tm.active()
@@ -1643,7 +1682,10 @@ export class Executor {
       }
       case 'goto': {
         if (!a.url) throw new Error('goto 需要 url')
-        let url = a.url.trim()
+        let url = a.url.trim().replace(/\{\{([^}]+)\}\}/g, (_m, k) => {
+          if (ctx.memory[String(k).trim()] == null) throw new Error(`未定义导航变量: ${k}`)
+          return ctx.memory[String(k).trim()]
+        })
         if (!/^https?:|^file:/i.test(url)) url = 'https://' + url.replace(/^\/+/, '')
         await tm.navigate(url)
         a.result = `打开 ${url.slice(0, 80)}`
@@ -1765,6 +1807,13 @@ export class Executor {
           : `已重放 ${times} 轮（每轮 ${prev.length} 个动作）`
         if (rounds === 0 && stopErr) a.error = `repeat 首轮即失败：${stopErr.slice(0, 150)}`
         return false
+      }
+      case 'observe': {
+        const res = await this.extract(undefined, { query: a.query || a.text, task: a.query || a.text, limit: 200 })
+        const tab = tm.active()
+        if (tab && (a.query || a.text)) this.pendingObservations.set(tab.id, (a.query || a.text)!)
+        a.result = `快照 ${res.snapshotId}；命中 ${res.candidates.length} 个候选（跨域 frame 可能截断）；动作可携带 snapshotId。\n${formatCandidates(res, false, undefined, 'off', 'full')}`
+        return true // 观察改变了快照编号，剩余旧编号动作禁止继续
       }
       case 'read_content': {
         const t = tm.active()
@@ -1907,98 +1956,7 @@ export class Executor {
         return true
       }
       case 'expect': {
-        // 测试断言：失败不抛错（写入 a.error），同批后续动作照常执行；
-        // 3s 内每 500ms 轮询重试（SPA 异步渲染容错）
-        const t = tm.active()
-        if (!t) throw new Error('没有可用页签')
-        if (!a.kind) throw new Error('expect 需要 kind')
-        const expectVal = String(a.value ?? a.text ?? '').replace(
-          /\{\{([^}]+)\}\}/g,
-          (_m, k) => ctx.memory[String(k).trim()] ?? _m
-        )
-        const deadline = Date.now() + 3000
-        let passed = false
-        let actual = ''
-        while (true) {
-          try {
-            if (a.kind === 'url_contains') {
-              actual = t.view.webContents.getURL()
-              passed = actual.includes(expectVal)
-            } else if (a.kind === 'title_contains') {
-              actual = t.view.webContents.getTitle()
-              passed = actual.includes(expectVal)
-            } else if (a.kind === 'text_visible') {
-              const r = await t.cdp.evaluate<{ found: boolean; snippet: string }>(EXPECT_TEXT_FN, [expectVal])
-              passed = !!r?.found
-              actual = r?.snippet || (passed ? '已命中' : '页面文本中未找到')
-            } else if (a.kind === 'selector_exists') {
-              const r = await t.cdp.evaluate<{ ok: boolean; count?: number; err?: string }>(EXPECT_SEL_FN, [
-                a.selector || '',
-                'exists'
-              ])
-              if (!r?.ok) {
-                actual = r?.err || '选择器无效'
-                passed = false
-              } else {
-                actual = `匹配 ${r.count || 0} 个元素`
-                passed = (r.count || 0) > 0
-              }
-            } else if (a.kind === 'selector_value' || a.kind === 'selector_text') {
-              const r = await t.cdp.evaluate<{ ok: boolean; count?: number; v?: string; err?: string }>(EXPECT_SEL_FN, [
-                a.selector || '',
-                a.kind === 'selector_value' ? 'value' : 'text'
-              ])
-              if (!r?.ok) {
-                actual = r?.err || '选择器无效'
-                passed = false
-              } else if (!r.count) {
-                actual = '选择器未匹配到元素'
-                passed = false
-              } else {
-                actual = r.v || '(空)'
-                passed = actual.trim() === expectVal.trim()
-              }
-            } else if (a.kind === 'api_status' || a.kind === 'api_body') {
-              // 网络级断言：按 URL 片段匹配最近一次请求（外层 3s 轮询容错「请求还在飞」）
-              const urlPart = String(a.urlPart || '').replace(
-                /\{\{([^}]+)\}\}/g,
-                (_m, k) => ctx.memory[String(k).trim()] ?? _m
-              )
-              if (!urlPart) {
-                actual = '缺少 URL 片段'
-                passed = false
-              } else {
-                const r = await t.cdp.findResponseBody(urlPart)
-                if (!r) {
-                  passed = false
-                  actual = `未捕获到 URL 含 "${urlPart}" 的接口请求`
-                } else if (a.kind === 'api_status') {
-                  actual = `HTTP ${r.status} (${r.url.slice(0, 60)})`
-                  passed = String(r.status) === String(expectVal)
-                } else {
-                  const body = r.body || ''
-                  passed = body.includes(expectVal)
-                  actual = body ? body.slice(0, 100) : '(无响应体/缓冲已回收)'
-                }
-              }
-            } else {
-              throw new Error(`未知断言类型 ${a.kind}`)
-            }
-          } catch (e: any) {
-            actual = String(e?.message || e)
-            passed = false
-          }
-          if (a.negate) passed = !passed
-          if (passed || Date.now() >= deadline || ctx.signal.aborted) break
-          await this.sleep(500, ctx.signal)
-        }
-        const desc = `${a.negate ? '不' : ''}${expectVal || a.selector}`
-        if (passed) {
-          a.result = `断言通过: [${a.kind}] ${desc}`
-        } else {
-          a.error = `断言失败: [${a.kind}] 期望=${desc} 实际=${actual.slice(0, 120)}`
-          a.result = a.error
-        }
+        await this.checkAssertion(a, ctx)
         return false
       }
       case 'fill_form': {

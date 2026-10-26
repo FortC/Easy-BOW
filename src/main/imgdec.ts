@@ -26,11 +26,12 @@ const DECODE_TIMEOUT_MS = 15000
 /** 用 Chromium 画布把图片解码并转 PNG Buffer（失败抛错，调用方决定占位策略） */
 export async function decodeImageToPng(buf: Buffer): Promise<Buffer> {
   if (!buf.length) throw new Error('图片内容为空')
-  const win = new BrowserWindow({ show: false, webPreferences: { sandbox: true } })
+  const win = new BrowserWindow({ show: false, webPreferences: { sandbox: true, backgroundThrottling: false } })
+  let timer: ReturnType<typeof setTimeout> | undefined
   try {
     const decode = (async () => {
-      // data: 页面无 CSP 限制，data: 图片可直入画布
-      await win.loadURL('data:text/html,<meta charset="utf-8"><body></body>')
+      // 使用标准空白宿主页，避免将未转义 HTML 作为导航 URL；图片数据仍仅在本机解码。
+      await win.loadURL('about:blank')
       return win.webContents.executeJavaScript(
         `(function(b64, mime){ return new Promise(function(res, rej){
             var img = new Image();
@@ -52,14 +53,16 @@ export async function decodeImageToPng(buf: Buffer): Promise<Buffer> {
     })()
     const out = await Promise.race([
       decode,
-      new Promise((_r, rej) =>
-        setTimeout(() => rej(new Error(`图片解码超时(${DECODE_TIMEOUT_MS / 1000}s)`)), DECODE_TIMEOUT_MS).unref?.()
-      )
+      new Promise((_r, rej) => {
+        timer = setTimeout(() => rej(new Error(`图片解码超时(${DECODE_TIMEOUT_MS / 1000}s)`)), DECODE_TIMEOUT_MS)
+        timer.unref?.()
+      })
     ])
     const m = /^data:image\/png;base64,(.+)$/.exec(String(out || ''))
     if (!m) throw new Error('图片转 PNG 失败')
     return Buffer.from(m[1], 'base64')
   } finally {
+    if (timer) clearTimeout(timer)
     try {
       win.destroy()
     } catch {}

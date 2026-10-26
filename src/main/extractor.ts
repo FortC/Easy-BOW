@@ -37,6 +37,7 @@ export interface Candidate {
 }
 
 export interface ExtractResult {
+  snapshotId?: string
   title: string
   url: string
   scrollY: number
@@ -66,7 +67,7 @@ export interface SemanticHint {
 
 /** 在页面上下文中运行（自包含，序列化注入）；shadow=false 时关闭 shadow DOM 穿透（W5 开关回滚用）。
  *  cap=TEXT_CAP：文案长度上限，与 RESOLVE_FN 共用同一常量（消除历史上的 80/40 不对称） */
-export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: boolean, cap?: number) {
+export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: boolean, cap?: number, query?: string) {
   const SEL =
     'a[href], button, input, select, textarea, summary, [role], [contenteditable="true"], [onclick], img[onclick], label[for], [tabindex]:not([tabindex="-1"])'
   const INTERACTIVE_TAGS = new Set(['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'SUMMARY'])
@@ -562,7 +563,6 @@ export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: 
       // 视口下方太远的元素不进列表（可滚动后再提取），按顶层绝对坐标判断；
       // S1 放宽 4→8 屏：大表单页目标常在第 5-8 屏，太窄会导致"必须滚动"往返浪费步数
       if (v.rect.top + offY > window.innerHeight * 8) continue
-      total++
       const role = roleOf(el)
       const { text, fullText, truncatedBy, extra } = textOf(el, role)
       let score = 0
@@ -575,6 +575,8 @@ export const EXTRACT_FN = String(function extract(maxElements: number, shadow?: 
       if (v.occluded) score -= 60
       if (dis) score -= 20
       const anchor = anchorOf(el)
+      if (query && !(text + ' ' + (fullText || '') + ' ' + extra + ' ' + (anchor || '')).toLowerCase().includes(query.toLowerCase())) continue
+      total++
       const item: any = {
         framePaths,
         path: indexPath(el),

@@ -264,6 +264,7 @@ export type ActionName =
   // W1 智能等待：等业务信号出现/接口响应后再继续（比 wait 盲等更稳）
   | 'wait_for'
   | 'read_content'
+  | 'observe'
   | 'extract_images'
   | 'save'
   | 'recall'
@@ -305,6 +306,8 @@ export interface PlanNodeTarget {
 }
 
 export interface AgentAction {
+  target?: { role: string; tag: string; label: string; anchor?: string; frameKey?: string; framePaths: number[][] }
+  snapshotId?: string
   name: ActionName
   index?: number
   /** v4.5 元素指纹（4 位十六进制）：跨步骤稳定的元素身份。
@@ -331,6 +334,13 @@ export interface AgentAction {
   /** expect：断言取反（不包含/不存在） */
   negate?: boolean
   /** fill_form：显式字段映射（「字段描述→值」；缺省走 AI 智能填充） */
+  assertionId?: string
+  frameKey?: string
+  assertionStatus?: 'passed' | 'failed' | 'error'
+  /** 本步骤开始的网络请求序号（由引擎设置，模型不能覆盖） */
+  networkSince?: number
+  timeoutMs?: number
+  actual?: string
   data?: Record<string, string>
   /** fill_form：只填必填项 */
   onlyRequired?: boolean
@@ -420,6 +430,22 @@ export interface TestEnv {
   protected: boolean
 }
 
+export interface ModelCapabilityReport {
+  version: 1
+  profileId: string
+  model: string
+  endpoint: string
+  testedAt: number
+  passed: number
+  total: number
+  semanticQualified: boolean
+  p50Ms: number
+  p90Ms: number
+  inputTokens: number
+  outputTokens: number
+  results: Array<{ id: string; name: string; passed: boolean; ms: number; error?: string }>
+}
+
 /** 用例库条目（应用内保存的测试用例，可运行/定时回归/失败重跑） */
 export interface TestCaseEntry {
   id: number
@@ -434,18 +460,23 @@ export interface TestCaseEntry {
 
 /** 测试用例中的一条断言（由用例 MD 的「预期」行解析而来） */
 export interface TestAssertion {
+  id?: string
+  frameKey?: string
   /** MD 原文（报告回显） */
   raw: string
-  /** ai=未标类型的自然语言预期，由模型翻译成 expect 动作 */
+  /** ai=待确认的自然语言预期，必须结构化后才能运行 */
   kind: ExpectKind | 'ai'
   value?: string
   selector?: string
   /** api_* 类断言的 URL 片段 */
   urlPart?: string
   negate?: boolean
+  method?: string
+  timeoutMs?: number
 }
 
 export interface TestStep {
+  phase?: 'setup' | 'test' | 'cleanup'
   title: string
   /** 操作描述（自然语言，模型翻译成动作序列） */
   action: string
@@ -465,6 +496,9 @@ export interface TestGroup {
 
 /** 解析后的测试用例（parser 产物） */
 export interface TestCase {
+  id?: string
+  requirementIds?: string[]
+  acceptanceIds?: string[]
   name: string
   /** 数据表变量（注入任务记忆，{{变量}} 处替换） */
   vars: Record<string, string>
@@ -474,6 +508,8 @@ export interface TestCase {
 }
 
 export interface TestAssertionResult {
+  id?: string
+  status?: 'passed' | 'failed' | 'error'
   raw: string
   kind: string
   passed: boolean
@@ -484,6 +520,7 @@ export interface TestAssertionResult {
 export type TestStepStatus = 'pending' | 'running' | 'passed' | 'failed' | 'skipped'
 
 export interface TestStepResult {
+  phase?: 'setup' | 'test' | 'cleanup'
   /** 1-based 步骤序号 */
   index: number
   title: string
@@ -502,6 +539,8 @@ export type TestRunState = 'running' | 'passed' | 'failed' | 'error' | 'stopped'
 
 /** 一次测试运行的全量状态（经 test-run 事件推送到测试面板） */
 export interface TestRunStatus {
+  execution?: { replayedSteps: number; modelDecisions: number }
+  coverage?: Array<{ id: string; status: 'passed' | 'failed' | 'not_run' | 'uncovered'; cases: string[] }>
   /** 运行代号（主进程每次启动递增；旧循环的收尾不得污染新运行） */
   runId?: number
   state: TestRunState
@@ -732,10 +771,12 @@ export interface EasybowApi {
   testConvert(
     reqMd: string,
     mode: 'prd' | 'rough'
-  ): Promise<{ ok: boolean; md?: string; error?: string; steps?: number; assertions?: number; attempts?: number }>
+  ): Promise<{ ok: boolean; md?: string; error?: string; steps?: number; assertions?: number; attempts?: number; cases?: number; uncovered?: string[]; warnings?: string[] }>
   /** 校验测试用例 MD（解析给 UI 预览步骤数/断言数/变量 + 步骤节点明细，供行内编辑重渲染） */
   testParse(md: string): Promise<{
     ok: boolean
+    cases?: number
+    unresolved?: number
     error?: string
     name?: string
     steps?: number
@@ -762,8 +803,9 @@ export interface EasybowApi {
   /** 运行测试：解析 MD → 独立测试页签（独立登录分区）执行 → 报告 */
   testStart(
     md: string,
-    opts: { envName?: string; failFast: boolean; fillPreview?: boolean; loginReuse?: boolean }
+    opts: { envName?: string; failFast: boolean; fillPreview?: boolean; loginReuse?: boolean; reusePlans?: boolean }
   ): Promise<void>
+  testModelBenchmark(): Promise<ModelCapabilityReport>
   /** 强制重置「卡在执行中」的测试状态（UI 看门狗/用户手动兜底） */
   testReset(): Promise<TestRunStatus | null>
   /** 停止测试（与停止任务同一管线） */

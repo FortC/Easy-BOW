@@ -65,7 +65,8 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
       `\n========== 自测到达时间上限（${timeoutMin} 分钟），按当前结果收尾：${results.length - failed.length}/${results.length} 通过 ==========`
     )
     if (failed.length) console.log('失败项: ' + failed.map((f) => f.name).join(', '))
-    app.exit(failed.length ? 1 : 0)
+    // 超时意味着整套自测未完成，即使此前没有失败也不能返回成功。
+    app.exit(1)
   }, timeoutMin * 60 * 1000)
   ;(deadline as unknown as { unref?: () => void }).unref?.()
   const check = (name: string, ok: boolean, detail?: string) => {
@@ -989,9 +990,12 @@ export async function runSelftest(deps: SelftestDeps): Promise<void> {
               }
             }
             await ui.executeJavaScript(
-              `(() => { const x = document.querySelector('.modal h3 .close-x'); x && x.click(); })()`,
+              `(() => { const x = document.querySelector('button[aria-label="关闭定时任务"]'); if (!x) throw new Error('找不到关闭定时任务按钮'); x.click(); })()`,
               true
             )
+            await sleep(350)
+            const closed = await ui.executeJavaScript(`!document.querySelector('[role="dialog"][aria-label="定时任务"]')`, true)
+            check('定时任务UI自测收尾恢复', closed && !tm.isBrowserHidden(), `关闭=${closed} 浏览器隐藏=${tm.isBrowserHidden()}`)
           } catch (e: any) {
             check('定时任务弹窗UI统一', false, String(e?.message || e))
           }

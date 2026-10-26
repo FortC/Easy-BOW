@@ -23,7 +23,7 @@ node_done=true 表示「当前节点的预期已达成」。声明它时**必须
 - {"name":"goto","url":"https://..."}
 - {"name":"back"} / {"name":"forward"}
 - {"name":"wait","seconds":1-15}
-- {"name":"read_content"}   读取当前页正文与表格（Markdown），结果在下一步反馈给你
+- {"name":"observe","query":"订单号或目标字段关键字"}   按需查找局部元素（含行锚），返回新快照；下一轮用返回的编号操作。可给元素动作带 snapshotId，过期会拒绝。\n- {"name":"read_content"}   读取当前页正文与表格（Markdown），结果在下一步反馈给你
 - {"name":"extract_images"}   抓取当前页的图片资源链接（仿图片助手插件：DOM+网络嗅探合并，覆盖 img/srcset/懒加载/背景图/XHR 动态加载的图，按真实尺寸排序），结果在下一步反馈。需要商品主图、详情图、图片素材时必须用这个抓原始资源链接，禁止用截图代替。哪张是主图、哪些是详情图/规格图由你按尺寸、alt、URL 特征判断对应关系（列表头有判读提示）
 - {"name":"save","key":"记忆键","value":"要跨页签保存的数据"}   保存到任务记忆（不受历史压缩影响）
 - {"name":"recall","key":"记忆键"}   查看记忆内容
@@ -116,9 +116,9 @@ export const TEST_MODE_ADDON = `
 
 ## 测试模式（当前任务 = 浏览器自动化测试，本节规则优先级最高）
 1. 你正在执行测试脚本中的「当前步骤」：只做该步骤描述的操作，禁止即兴发挥、跳步、提前做后续步骤、做脚本外的多余操作
-2. 该步骤的每一条「预期」都必须输出对应的 expect 断言动作（脚本会给出每条预期应输出的确切 JSON，原样输出参数即可）；预期未全部断言前不得结束本步骤
-3. expect 断言失败不要尝试补救或重复操作——如实输出即可，由系统决定终止（fail-fast）还是继续
-4. 步骤的全部操作与断言完成后，最后输出 {"name":"test_step_done"} 收尾，系统会推进到下一步骤
+2. 预期由测试引擎按原脚本独立执行；禁止输出 expect，禁止修改预期或自行宣布通过。
+3. 即使预期可能失败，也只如实完成脚本操作；不要为了让断言通过而补救、重复提交或改写数据。
+4. 当前步骤操作完成后输出 {"name":"test_step_done"}；不要继续执行后续步骤，系统检查断言并推进。
 5. 一个测试步骤允许分多轮完成（例如先 scroll 找到元素、下拉展开后再选）；但每轮只服务于当前步骤
 6. 步骤要求「智能填充表单」时输出 {"name":"fill_form"}（可带 "onlyRequired":true），系统会自动识别字段并整表填充，你不要逐字段 type
 7. 页面弹出原生确认框（confirm/alert）时系统会按脚本自动应答，你无需处理
@@ -363,6 +363,7 @@ export function buildStepMessage(ctx: StepContext): string {
       ? `（页面可滚动: ${extract.scrollY}/${extract.scrollHeight}）`
       : ''
   parts.push(`# 当前页面\n标题: ${extract.title.slice(0, 60)}\nURL: ${(extract.url || '').slice(0, 100)} ${scrollInfo}`)
+  if (extract.snapshotId) parts.push(`当前快照: ${extract.snapshotId}。仅使用本次快照编号；历史 observe 结果中的编号不再有效。`)
 
   parts.push(
     ctx.vision

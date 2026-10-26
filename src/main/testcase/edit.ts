@@ -36,11 +36,12 @@ export function locateStepBlocksFromLines(lines: string[]): StepBlock[] {
   for (; i < lines.length; i++) {
     const l = lines[i]
     const t = l.trim()
+    if (/^#\s/.test(t)) { inSection = false; continue }
     // 注意：(?!#) 排除 ### —— 否则「### 步骤 1」会被当成二级标题吞掉，一个块都定位不到
     const h2 = t.match(/^##(?!#)\s*(.+)$/)
     if (h2) {
       const name = h2[1]
-      inSection = /步骤|清理/.test(name)
+      inSection = /步骤|清理|准备/.test(name)
       cleanup = /清理/.test(name)
       continue
     }
@@ -51,7 +52,7 @@ export function locateStepBlocksFromLines(lines: string[]): StepBlock[] {
     let j = i + 1
     for (; j < lines.length; j++) {
       const s = lines[j].trim()
-      if (/^###(?!#)\s/.test(s) || /^##(?!#)\s/.test(s)) break
+      if (/^#{1,3}(?!#)\s/.test(s)) break
     }
     // 尾部空行归给下一块（保持块间一个空行）
     let end = j

@@ -48,7 +48,9 @@ import {
 } from './llm'
 import { validateLocalActions, type FastLlm } from '../fastllm'
 import { ocrPageText } from '../ocr'
-import { parseTestCase } from '../testcase/parser'
+import { parseTestSuite, suiteCoverage, type TestSuite } from '../testcase/suite'
+import { candidateTarget, resolveTarget, planKey, reusableActions, type StepPlan } from '../testcase/plans'
+import { getStepPlan, saveStepPlan, invalidateStepPlan } from '../testcase/planStore'
 import { isLoginStep, pickWarmupUrl, probeLoginState } from './loginState'
 import { writeTestReport } from '../testcase/report'
 import { updateCaseRunStat } from '../testcase/store'
@@ -133,6 +135,15 @@ const RECOVER_PAGE_FN = String(function recoverPage(task: string) {
 
 /** 测试模式内部执行上下文（仅 startTestRun 期间存在；loop 的所有测试分支以它为门卫） */
 interface TestExecCtx {
+  pendingStepCompletion?: boolean
+  reusePlans: boolean
+  stepActions: AgentAction[]
+  planChecked?: boolean
+  replay?: { plan: StepPlan; cursor: number }
+  replayedDecision?: boolean
+  initializedStep?: number
+  networkCheckpoints: Map<number, number>
+  originalTabIds: Set<number>
   /** 所属运行代号（旧循环的收尾不得污染新运行） */
   epoch: number
   tc: TestCase
@@ -162,7 +173,11 @@ interface TestExecCtx {
 function assertionToAction(asrt: TestAssertion): AgentAction {
   return {
     name: 'expect',
-    kind: asrt.kind === 'ai' ? 'text_visible' : asrt.kind,
+    kind: asrt.kind === 'ai' ? undefined : asrt.kind,
+    assertionId: asrt.id,
+    frameKey: asrt.frameKey,
+    method: asrt.method,
+    timeoutMs: asrt.timeoutMs,
     value: asrt.value,
     selector: asrt.selector,
     urlPart: asrt.urlPart,
@@ -188,13 +203,14 @@ function missingActionParam(a: AgentAction): string | null {
   const has = (v: unknown) => v !== undefined && v !== null && v !== ''
   switch (a.name) {
     case 'click':
+      return has(a.index) || has(a.fp) || !!a.target ? null : 'index/fp/target'
     case 'drag':
     case 'upload':
     case 'switch_tab':
     case 'close_tab':
       return has(a.index) ? null : 'index'
     case 'type':
-      return has(a.index) ? (has(a.text) ? null : 'text') : 'index'
+      return has(a.index) || has(a.fp) || !!a.target ? (has(a.text) ? null : 'text') : 'index/fp/target'
     case 'goto':
       return has(a.url) ? null : 'url'
     case 'save':
@@ -312,7 +328,8 @@ export class AgentRunner {
   private testSoftErrors: string[] = []
   /** 数据驱动多组：收集模式（单组 run 不写报告，由合并器统一写） */
   private testCollectMode = false
-  private testGroupResults: Array<{ name: string; run: TestRunStatus; shots: Map<number, string> }> = []
+  private testSequenceRunning = false
+  private testGroupResults: Array<{ name: string; tc: TestCase; run: TestRunStatus; shots: Map<number, string> }> = []
   /** 单组 run 完成回调（execTestSequence 顺序执行用；带 epoch 防止旧循环提前兑现新运行的 Promise） */
   private testDoneResolve: { epoch: number; resolve: (run: TestRunStatus) => void } | null = null
   /**
@@ -404,7 +421,7 @@ export class AgentRunner {
   /** v4.3 日志/耗时：任务启动时刻（完成时算总耗时） */
   private taskStartedAt = 0
 
-  constructor(tabManager: TabManager, executor: Executor, broadcast: Broadcast) {
+  constructor(tabManager: TabManager, executor: Executor, broadcast: Broadcast, private testProviderFactory: (settings: Settings) => LlmProvider = createProvider) {
     this.tabManager = tabManager
     this.executor = executor
     this.broadcast = broadcast
@@ -533,7 +550,7 @@ export class AgentRunner {
   }
 
   async startTask(task: string): Promise<void> {
-    if (this.state.state === 'running' || this.state.state === 'paused') {
+    if (this.testSequenceRunning || this.state.state === 'running' || this.state.state === 'paused') {
       throw new Error('已有任务在运行，请先停止')
     }
     const settings = getSettings()
@@ -671,7 +688,7 @@ export class AgentRunner {
    * 仅空闲态可清（运行中拒绝）；不影响历史记录与经验库。
    */
   clearDisplay(): void {
-    if (this.state.state === 'running' || this.state.state === 'paused') {
+    if (this.testSequenceRunning || this.state.state === 'running' || this.state.state === 'paused') {
       throw new Error('任务进行中不能清空，请先停止任务')
     }
     this.steps = []
@@ -697,31 +714,24 @@ export class AgentRunner {
 
   /** 强制重置卡住的测试状态（UI 看门狗 / 用户手动兜底）：把 running 判死为 stopped */
   resetTestRun(reason = '状态已重置（上次运行未正常收尾）'): TestRunStatus | null {
+    const pending = this.testDoneResolve
+    if (this.testCtx || this.testSequenceRunning) this.stopTask()
+    // stopTask/finishTest 兑现单组 Promise，不能丢掉 resolver 让整个用例序列永久挂起。
+    if (pending && this.testDoneResolve === pending) {
+      this.testDoneResolve = null
+      pending.resolve(this.getTestRunStatus() || ({} as TestRunStatus))
+    }
+    this.testSequenceRunning = false
     const run = this.testRun
-    if (run && run.state === 'running') {
-      for (const s of run.steps) {
-        if (s.status === 'running' || s.status === 'pending') {
-          s.status = 'skipped'
-          if (!s.error) s.error = reason
-        }
+    if (run) {
+      for (const step of run.steps) if (step.status === 'pending' || step.status === 'running') {
+        step.status = 'skipped'; step.error = reason
       }
-      run.state = 'stopped'
-      run.endedAt = Date.now()
+      if (run.state === 'running') run.state = 'stopped'
+      run.endedAt ??= Date.now()
       run.failed = run.steps.filter((s) => s.status === 'failed' || s.status === 'skipped').length
       run.error = reason
     }
-    // 顺带把 Agent 状态机从「卡住的-running」拉回可启动状态
-    if (this.state.state === 'running' || this.state.state === 'paused' || this.state.state === 'captcha') {
-      this.pauseRequested = false
-      try {
-        this.abortCtrl?.abort(new Error(reason))
-      } catch {}
-      const ws = this.resumeWaiters
-      this.resumeWaiters = []
-      ws.forEach((w) => w())
-    }
-    this.testCtx = null
-    this.testDoneResolve = null
     this.broadcastTestRun()
     return this.getTestRunStatus()
   }
@@ -762,22 +772,25 @@ export class AgentRunner {
       failFast: boolean
       fillPreview?: boolean
       loginReuse?: boolean
+      reusePlans?: boolean
       caseId?: number
       env?: { name: string; baseUrl: string; protected: boolean }
     }
   ): Promise<void> {
-    if (this.state.state === 'running' || this.state.state === 'paused') {
+    if (this.testSequenceRunning || this.state.state === 'running' || this.state.state === 'paused') {
       throw new Error('已有任务在运行，请先停止')
     }
     const settings = getSettings()
     if (!settings.apiKey) throw new Error('请先在「设置」中配置 AI 接口（baseURL / API Key / 模型）')
-    const parsed = parseTestCase(md)
-    if (!parsed.ok || !parsed.tc) throw new Error(`测试用例解析失败: ${parsed.error}`)
-    const tc = parsed.tc
+    const parsed = parseTestSuite(md)
+    if (!parsed.ok || !parsed.suite) throw new Error(`测试用例解析失败: ${parsed.error}`)
+    const suite = parsed.suite
+    const unresolved = suite.cases.flatMap((c) => c.steps).flatMap((s) => s.assertions).filter((a) => a.kind === 'ai')
+    if (unresolved.length) throw new Error(`有 ${unresolved.length} 条预期待确认，请先改为 [文字]/[URL]/[选择器 X]/[接口 X] 等结构化断言，再运行`)
+    this.testSequenceRunning = true
     const epoch = await this.beginRun()
     // 数据驱动多组：数据区含 ### 组名 小节时逐组跑同一脚本；缺省单组（向后兼容）
-    const groups: TestGroup[] = tc.groups?.length ? tc.groups : [{ name: '', vars: tc.vars }]
-    void this.execTestSequence(tc, groups, settings, opts, epoch).catch((e) => {
+    void this.execTestSequence(suite, settings, opts, epoch).catch((e) => {
       if (epoch !== this.epoch) return
       this.setState({ state: 'error', statusText: `测试异常: ${e?.message || e}` })
       this.broadcast({ channel: 'toast', message: `测试异常: ${e?.message || e}`, kind: 'error' })
@@ -787,35 +800,39 @@ export class AgentRunner {
 
   /** 数据驱动：逐组顺序执行（上一组跑完再下一组；中途停止则跳出），最后合并报告 */
   private async execTestSequence(
-    tc: TestCase,
-    groups: TestGroup[],
+    suite: TestSuite,
     settings: Settings,
-    opts: { failFast: boolean; fillPreview?: boolean; loginReuse?: boolean; caseId?: number; env?: { name: string; baseUrl: string; protected: boolean } },
+    opts: { failFast: boolean; fillPreview?: boolean; loginReuse?: boolean; reusePlans?: boolean; caseId?: number; env?: { name: string; baseUrl: string; protected: boolean } },
     epoch: number
   ): Promise<void> {
-    const multi = groups.length > 1
-    if (multi) this.testGroupResults = []
-    this.testCollectMode = multi
+    const jobs = suite.cases.flatMap((tc) => (tc.groups?.length ? tc.groups.map((g) => ({ tc, group: { name: g.name, vars: { ...tc.vars, ...g.vars } } })) : [{ tc, group: { name: '', vars: tc.vars } }]))
+    this.testGroupResults = []
+    this.testCollectMode = true
     let stoppedEarly = false
     try {
-      for (let gi = 0; gi < groups.length; gi++) {
+      for (let gi = 0; gi < jobs.length; gi++) {
         if (epoch !== this.epoch) return // 已被新运行取代
         if (this.state.state === 'stopped') {
           stoppedEarly = true
           break
         }
         if (gi > 0) await new Promise((r) => setTimeout(r, 1200)) // 组间稍歇，界面/遮罩状态落地
-        await this.runTestOnce(tc, groups[gi], settings, opts, epoch)
+        if (epoch !== this.epoch || String(this.state.state) === 'stopped') { stoppedEarly = true; break }
+        await this.runTestOnce(jobs[gi].tc, jobs[gi].group, settings, opts, epoch)
+        if (opts.failFast && this.testGroupResults.at(-1)?.run.state !== 'passed') { stoppedEarly = String(this.state.state) === 'stopped'; break }
       }
     } finally {
+      if (epoch !== this.epoch) return
+      this.testSequenceRunning = false
       if (this.state.state === 'stopped') stoppedEarly = true
       this.testCollectMode = false
       const results = this.testGroupResults
       this.testGroupResults = []
       if (epoch !== this.epoch) return
-      if (multi && results.length) {
-        const merged = this.mergeGroupRuns(results, tc, opts.env?.name, stoppedEarly)
+      if (results.length) {
+        const merged = this.mergeGroupRuns(results, suite, opts.env?.name, stoppedEarly)
         this.testRun = merged
+        if (opts.caseId != null) updateCaseRunStat(opts.caseId, merged.state === 'passed' ? '✅ 全部通过' : `❌ ${merged.state} ${merged.failed}/${merged.totalSteps}`)
         this.broadcastTestRun()
         const verdict =
           merged.state === 'passed' ? '✅ 全部通过' : merged.state === 'stopped' ? '⏹️ 已停止' : `❌ 失败 ${merged.failed}/${merged.totalSteps} 步`
@@ -832,26 +849,41 @@ export class AgentRunner {
 
   /** 合并多组结果：步骤展平（组名前缀）+ 截图重定位 + 汇总判定 + 写合并报告 */
   private mergeGroupRuns(
-    results: Array<{ name: string; run: TestRunStatus; shots: Map<number, string> }>,
-    tc: TestCase,
+    results: Array<{ name: string; tc: TestCase; run: TestRunStatus; shots: Map<number, string> }>,
+    suite: TestSuite,
     envName: string | undefined,
     stoppedEarly: boolean
   ): TestRunStatus {
     const steps: TestStepResult[] = []
     const shotMap = new Map<number, string>()
+    const sourceSteps: TestCase['steps'] = []
     let si = 0
     for (const g of results) {
       for (const s of g.run.steps) {
         si++
-        steps.push({ ...s, index: si, title: `[${g.name}] ${s.title}` })
+        steps.push({ ...s, index: si, title: `[${g.tc.id}${g.name ? ` / ${g.name}` : ''}] ${s.title}` })
+        sourceSteps.push(g.tc.steps[s.index - 1])
         if (s.status === 'failed' && g.shots.has(s.index)) shotMap.set(si, g.shots.get(s.index)!)
+      }
+    }
+    for (const tc of suite.cases) {
+      const expectedGroups = tc.groups?.length ? tc.groups : [{ name: '', vars: tc.vars }]
+      for (const group of expectedGroups) {
+        if (results.some((g) => g.tc.id === tc.id && g.name === group.name)) continue
+        for (const step of tc.steps) {
+          steps.push({ index: ++si, title: `[${tc.id}${group.name ? ` / ${group.name}` : ''}] ${step.title}`, phase: step.phase,
+            status: 'skipped', assertions: [], modelSteps: 0, error: '用例未执行（停止或 fail-fast）' })
+          sourceSteps.push(step)
+        }
       }
     }
     const passed = steps.filter((s) => s.status === 'passed').length
     const failed = steps.length - passed
     const merged: TestRunStatus = {
       state: stoppedEarly ? 'stopped' : failed === 0 ? 'passed' : 'failed',
-      caseName: tc.name,
+      caseName: suite.name,
+      execution: { replayedSteps: results.reduce((n, r) => n + (r.run.execution?.replayedSteps || 0), 0), modelDecisions: results.reduce((n, r) => n + (r.run.execution?.modelDecisions || 0), 0) },
+      coverage: suiteCoverage(suite, results.map((g) => ({ caseId: g.tc.id!, state: g.run.state }))),
       envName,
       totalSteps: steps.length,
       currentStep: steps.length,
@@ -863,7 +895,7 @@ export class AgentRunner {
       tokens: results.reduce((acc, r) => ({ input: acc.input + (r.run.tokens?.input || 0), output: acc.output + (r.run.tokens?.output || 0) }), { input: 0, output: 0 })
     }
     try {
-      merged.reportPath = writeTestReport(merged, tc, shotMap)
+      merged.reportPath = writeTestReport(merged, { name: suite.name, vars: {}, steps: sourceSteps }, shotMap)
     } catch (e) {
       console.error('[easybow] 多组测试报告写入失败:', e)
     }
@@ -879,21 +911,27 @@ export class AgentRunner {
       failFast: boolean
       fillPreview?: boolean
       loginReuse?: boolean
+      reusePlans?: boolean
       caseId?: number
       env?: { name: string; baseUrl: string; protected: boolean }
     },
     epoch: number
   ): Promise<TestRunStatus> {
     return new Promise<TestRunStatus>((resolve) => {
-      const provider = createProvider(settings)
+      const provider = this.testProviderFactory(settings)
       // 独立测试页签（登录态与日常浏览互不污染）；页签满时让用户先关页签
-      const tab = this.tabManager.ensureTestTab()
+      const originalTabIds = new Set(this.tabManager.all().filter((t) => !t.partition?.includes('easybow-test')).map((t) => t.id))
+      const tab = this.tabManager.prepareTestTab(opts.loginReuse === true)
       tab.cdp.setDialogPolicy('accept') // JS 原生弹窗自动应答（仅测试期间启用，结束即关闭）
       tab.cdp.setNetworkCapture(true) // 网络级断言（api_status/api_body）捕获，结束即关闭
       Cdp.defaultDialogPolicy = 'accept' // 测试中新开的页签（如 window.open）同样接管弹窗
 
       this.testSoftErrors = []
       this.testCtx = {
+        reusePlans: opts.reusePlans !== false,
+        stepActions: [],
+        networkCheckpoints: new Map(),
+        originalTabIds,
         epoch,
         tc,
         stepIdx: 0,
@@ -903,7 +941,7 @@ export class AgentRunner {
         envName: opts.env?.name,
         caseId: opts.caseId,
         perStepModelSteps: 0,
-        loginReuse: opts.loginReuse !== false,
+        loginReuse: opts.loginReuse === true,
         loggedIn: null,
         loginWarned: false
       }
@@ -918,6 +956,7 @@ export class AgentRunner {
         steps: tc.steps.map((s, i) => ({
           index: i + 1,
           title: s.title,
+          phase: s.phase,
           status: 'pending',
           assertions: [],
           modelSteps: 0
@@ -925,7 +964,8 @@ export class AgentRunner {
         passed: 0,
         failed: 0,
         startedAt: Date.now(),
-        tokens: { input: 0, output: 0 }
+        tokens: { input: 0, output: 0 },
+        execution: { replayedSteps: 0, modelDecisions: 0 }
       }
       this.broadcastTestRun()
 
@@ -993,7 +1033,16 @@ export class AgentRunner {
             this.setState({ state: 'error', statusText: `测试异常: ${e?.message || e}` })
             this.broadcast({ channel: 'toast', message: `测试异常: ${e?.message || e}`, kind: 'error' })
           })
-          .finally(() => {
+          .finally(async () => {
+            if (epoch !== this.epoch) return
+            if (epoch === this.epoch && this.testCtx && this.state.state !== 'stopped' && this.testCtx.tc.steps[this.testCtx.stepIdx]?.phase !== 'cleanup') {
+              const cur = this.testRun?.steps[this.testCtx.stepIdx]
+              if (cur && (cur.status === 'running' || cur.status === 'pending')) { cur.status = 'failed'; cur.error = '执行异常或提前退出' }
+              if (this.enterTestCleanup('执行提前退出，转入清理')) {
+                this.setState({ state: 'running', statusText: '执行清理…' })
+                await this.loop(task, provider, settings, epoch).catch((e) => { if (epoch === this.epoch) this.setState({ state: 'error', statusText: `清理异常: ${e?.message || e}` }) })
+              }
+            }
             if (this.loopActive === p) this.loopActive = null
             this.telemetry.end({ state: this.state.state, steps: this.steps.length, tokens: this.state.usage })
             if (this.testCtx && this.testCtx.epoch === epoch) this.finishTest(epoch)
@@ -1061,7 +1110,7 @@ export class AgentRunner {
    * 登录态复用判定：当前步骤是登录类且已确认登录 → 直接判过并推进到下一步。
    * 返回 'skip' = 已跳过并推进（调用方 continue）、'end' = 已无后续步骤（应结束）、'no' = 不跳过。
    */
-  private consumeLoginSkip(): 'no' | 'skip' | 'end' {
+  private async consumeLoginSkip(): Promise<'no' | 'skip' | 'end'> {
     const tctx = this.testCtx
     const run = this.testRun
     if (!tctx || !run || !tctx.loginReuse || tctx.loggedIn !== true) return 'no'
@@ -1069,10 +1118,8 @@ export class AgentRunner {
     if (!isLoginStep(step)) return 'no'
     const cur = run.steps[tctx.stepIdx]
     if (!cur || cur.status === 'passed' || cur.status === 'failed') return 'no'
-    cur.status = 'passed'
     cur.note = '已复用保存的登录态，跳过登录操作'
-    cur.assertions.push({ raw: '[自动] 复用已保存登录态（跳过登录操作）', kind: 'soft', passed: true })
-    if (!this.advanceTestStep()) return 'end'
+    if (!(await this.handleTestPostBatch([], true))) return 'end'
     this.broadcastTestRun()
     return 'skip'
   }
@@ -1083,6 +1130,11 @@ export class AgentRunner {
     const run = this.testRun
     if (!tctx || !run) return false
     tctx.stepIdx++
+    tctx.initializedStep = undefined
+    tctx.pendingStepCompletion = false
+    tctx.stepActions = []
+    tctx.planChecked = false
+    tctx.replay = undefined
     tctx.perStepModelSteps = 0
     this.testSoftErrors = []
     run.passed = run.steps.filter((s) => s.status === 'passed').length
@@ -1095,6 +1147,21 @@ export class AgentRunner {
     return true
   }
 
+  /** 失败后跳过剩余业务步骤，进入独立清理阶段；清理失败不能阻止其他清理。 */
+  private enterTestCleanup(reason: string): boolean {
+    const ctx = this.testCtx
+    const run = this.testRun
+    if (!ctx || !run) return false
+    const next = ctx.tc.steps.findIndex((s, i) => i > ctx.stepIdx && s.phase === 'cleanup')
+    if (next < 0) return false
+    for (let i = ctx.stepIdx + 1; i < next; i++) {
+      run.steps[i].status = 'skipped'
+      run.steps[i].error = reason
+    }
+    ctx.stepIdx = next - 1
+    return this.advanceTestStep()
+  }
+
   /**
    * 测试收尾（幂等）：未执行步骤标 skipped、算通过率、失败步骤截图落盘、写报告、
    * 关闭弹窗自动应答、清 testCtx。由 loop 结束路径（done/异常/停止/fail-fast）统一触发。
@@ -1105,15 +1172,18 @@ export class AgentRunner {
     if (!tctx || !run || run.state !== 'running') return
     // 旧循环收尾不得污染新运行（旧 bug：点停止后立刻再运行，旧循环把新 run 提前判死）
     if (epoch != null && (epoch !== this.epoch || tctx.epoch !== epoch)) return
+    this.tabManager.endTestSession()
     try {
       this.tabManager.getTestTab()?.cdp.setDialogPolicy(null)
-      this.tabManager.getTestTab()?.cdp.setNetworkCapture(false)
+      for (const tab of this.tabManager.all()) if (!tctx.originalTabIds.has(tab.id)) {
+        tab.cdp.setNetworkCapture(false); tab.cdp.setDialogPolicy(null)
+      }
       Cdp.defaultDialogPolicy = null
     } catch {}
     for (const s of run.steps) {
       if (s.status === 'pending' || s.status === 'running') {
         s.status = 'skipped'
-        if (!s.error) s.error = '未执行（测试提前结束）'
+        if (!s.error) s.error = s.phase === 'cleanup' ? '清理未执行（测试提前结束；停止后不会继续写操作）' : '未执行（测试提前结束）'
       }
     }
     run.passed = run.steps.filter((s) => s.status === 'passed').length
@@ -1142,7 +1212,7 @@ export class AgentRunner {
     }
     if (this.testCollectMode) {
       // 多组收集模式：本组结果与截图暂存，报告由 mergeGroupRuns 统一写
-      this.testGroupResults.push({ name: run.groupName || '', run: this.getTestRunStatus()!, shots })
+      this.testGroupResults.push({ name: run.groupName || '', tc: tctx.tc, run: this.getTestRunStatus()!, shots })
     } else {
       try {
         run.reportPath = writeTestReport(run, tctx.tc, shots)
@@ -1201,11 +1271,7 @@ export class AgentRunner {
     lines.push(`### ${scriptStep.title}`)
     lines.push(`- 操作: ${scriptStep.action}`)
     for (const asrt of scriptStep.assertions) {
-      if (asrt.kind === 'ai') {
-        lines.push(`- 预期: ${asrt.raw} → 把这条自然语言预期翻译成合适的 expect 动作输出`)
-      } else {
-        lines.push(`- 预期: ${asrt.raw} → 输出 ${JSON.stringify(assertionToAction(asrt))}`)
-      }
+      lines.push(`- 引擎断言 ${asrt.id}: ${asrt.raw}（操作完成后引擎自动检查，不要输出 expect 或更改预期）`)
     }
     if (scriptStep.dialog) lines.push(`- 弹窗: ${scriptStep.dialog === 'accept' ? '确认' : '取消'}（系统自动应答）`)
     // 登录态复用：已登录时登录类步骤由系统直接判过；会话失效（踩到登录页）时提醒模型先登录
@@ -1232,24 +1298,37 @@ export class AgentRunner {
     if (!tctx || !run) return false
     const cur = run.steps[tctx.stepIdx]
     if (!cur) return false
-    tctx.perStepModelSteps++
-    cur.modelSteps = tctx.perStepModelSteps
-
-    // 收集本批 expect 断言结果
-    for (const e of executed) {
-      if (e.name !== 'expect') continue
-      cur.assertions.push({
-        raw: `[${e.kind}${e.negate ? '/不' : ''}] ${e.value || e.selector || ''}`,
-        kind: String(e.kind),
-        passed: !e.error,
-        actual: e.error ? e.error.replace(/^断言失败:.*实际=/, '').slice(0, 150) : undefined
-      })
+    if (!tctx.replayedDecision && !tctx.pendingStepCompletion) {
+      tctx.perStepModelSteps++
+      cur.modelSteps++
     }
-    // 软断言（提交后校验错误提示，executor 在 click 时推入）：并入断言展示与判定
-    for (const msg of this.testSoftErrors) {
-      const raw = `[自动] ${msg}`
-      if (!cur.assertions.some((x) => x.raw === raw)) {
-        cur.assertions.push({ raw, kind: 'soft', passed: false, actual: msg })
+
+    const scriptStep = tctx.tc.steps[tctx.stepIdx]
+    const hardActionFailure = executed.some((a) => a.error && a.name !== 'expect')
+    if (stepDoneSignal && !hardActionFailure) {
+      tctx.pendingStepCompletion = true
+      for (const asrt of scriptStep.assertions) {
+        if (this.testCtx !== tctx) return false
+        if (this.abortCtrl!.signal.aborted) return this.pauseRequested
+        if (cur.assertions.some((a) => a.id === asrt.id)) continue
+        const action = assertionToAction(asrt)
+        const tab = this.tabManager.active()
+        action.networkSince = tab ? (tctx.networkCheckpoints.get(tab.id) ?? 0) : 0
+        try { await this.executor.checkAssertion(action, {
+          memory: this.state.memory, signal: this.abortCtrl!.signal, settings: getSettings()
+        }) } catch (error) {
+          if (this.abortCtrl!.signal.aborted) return this.testCtx === tctx && this.pauseRequested
+          throw error
+        }
+        if (this.testCtx !== tctx) return false
+        if (this.abortCtrl!.signal.aborted) return this.pauseRequested
+        cur.assertions.push({ id: asrt.id, raw: asrt.raw, kind: asrt.kind,
+          passed: action.assertionStatus === 'passed', status: action.assertionStatus, actual: action.actual })
+        this.telemetry.log('verify', this.steps.length, { assertionId: asrt.id, status: action.assertionStatus })
+      }
+      // 明确的断言决定负向测试结果；无显式断言时仍保留提交错误兜底。
+      if (!scriptStep.assertions.length) for (const msg of this.testSoftErrors) {
+        cur.assertions.push({ raw: `[自动] ${msg}`, kind: 'soft', passed: false, status: 'failed', actual: msg })
       }
     }
 
@@ -1258,33 +1337,35 @@ export class AgentRunner {
 
     if (stepDoneSignal && !hardFail) {
       const scriptStep = tctx.tc.steps[tctx.stepIdx]
-      const missing = Math.max(0, (scriptStep?.assertions.length || 0) - cur.assertions.filter((x) => x.kind !== 'soft').length)
+      const verified = new Set(cur.assertions.map((x) => x.id))
+      const missing = scriptStep.assertions.filter((a) => !verified.has(a.id)).length
       if (assertFail || missing > 0) {
         cur.status = 'failed'
         if (!cur.error) cur.error = assertFail ? '断言失败' : `有 ${missing} 条预期未输出断言`
       } else {
         cur.status = 'passed'
       }
+      if (tctx.reusePlans && scriptStep.assertions.length && scriptStep.phase !== 'cleanup') {
+        const key = planKey(scriptStep, this.state.memory.base_url || '', tctx.tc.name)
+        try {
+          if (cur.status === 'passed') {
+            const actions = reusableActions(tctx.stepActions, this.state.memory)
+            if (actions) saveStepPlan({ version: 1, key, actions, createdAt: Date.now() })
+            if (tctx.replay && this.testRun?.execution) this.testRun.execution.replayedSteps++
+          } else invalidateStepPlan(key)
+        } catch { /* 缓存写入不影响测试结论 */ }
+      }
       // 登录步骤真正跑通后刷新登录态标记（其后的步骤不再重复登录；失效时由每步探针重新判 false）
       if (cur.status === 'passed' && isLoginStep(scriptStep)) {
         tctx.loggedIn = true
         tctx.loginWarned = false
       }
-      if (cur.status === 'failed' && tctx.failFast) {
+      if (cur.status === 'failed' && tctx.failFast && scriptStep.phase !== 'cleanup') {
+        if (this.enterTestCleanup('业务步骤失败，已跳过并进入清理')) { this.broadcastTestRun(); return true }
         this.broadcastTestRun()
         return false // fail-fast：直接结束循环，finishTest 收尾
       }
-      // 推进到下一步骤（软断言随步骤消费清空）
-      tctx.stepIdx++
-      tctx.perStepModelSteps = 0
-      this.testSoftErrors = []
-      run.passed = run.steps.filter((s) => s.status === 'passed').length
-      run.failed = run.steps.filter((s) => s.status === 'failed' || s.status === 'skipped').length
-      if (tctx.stepIdx >= tctx.tc.steps.length) {
-        this.broadcastTestRun()
-        return false // 全部步骤走完，收尾交给 finishTest（→ passed）
-      }
-      run.currentStep = tctx.stepIdx + 1
+      if (!this.advanceTestStep()) { this.broadcastTestRun(); return false }
       this.broadcastTestRun()
       return true
     }
@@ -1293,13 +1374,11 @@ export class AgentRunner {
     if (tctx.perStepModelSteps >= 8) {
       cur.status = 'failed'
       cur.error = `步骤卡住：超出单步骤 8 次决策预算`
-      if (tctx.failFast) {
-        this.broadcastTestRun()
-        return false
+      if (tctx.failFast && scriptStep.phase !== 'cleanup') {
+        if (this.enterTestCleanup('步骤超出决策预算，进入清理')) { this.broadcastTestRun(); return true }
+        this.broadcastTestRun(); return false
       }
-      tctx.stepIdx++
-      tctx.perStepModelSteps = 0
-      run.currentStep = Math.min(tctx.stepIdx + 1, run.totalSteps)
+      if (!this.advanceTestStep()) { this.broadcastTestRun(); return false }
       this.broadcastTestRun()
     }
     return true
@@ -2047,6 +2126,10 @@ export class AgentRunner {
     while (true) {
       // 暂停等待 / 停止判定（返回 false 则任务结束；epoch 失配=已被新运行取代）
       if (!(await this.checkpoint(epoch))) return
+      if (this.testCtx?.pendingStepCompletion) {
+        if (!(await this.handleTestPostBatch([], true))) return
+        continue
+      }
       // abort signal 一律在使用点实时读 this.abortCtrl!.signal——
       // 暂停恢复会中途重建 controller，迭代开头的局部快照会变陈旧（已 abort），
       // 导致后续模型调用/动作批被误中止白跑一轮（复核 P1-7）
@@ -2054,7 +2137,7 @@ export class AgentRunner {
       // 0. 模型步数（人工指导不算步数预算）；测试模式放宽（一个测试步骤可能消耗多个模型步）
       const stepN = this.steps.filter((s) => !s.userGuidance).length + 1
       const maxSteps = this.testCtx
-        ? Math.max(settings.maxSteps, this.testCtx.tc.steps.length * 8 + 6)
+        ? Math.max(settings.maxSteps, this.testCtx.tc.steps.length * 48 + 6)
         : settings.maxSteps
       if (stepN > maxSteps) {
         // S2 步数耗尽诊断化：不再一句"已达最大步数"，给出卡点与失败归因
@@ -2074,9 +2157,14 @@ export class AgentRunner {
         return
       }
 
+      if (this.testCtx && this.testCtx.initializedStep !== this.testCtx.stepIdx) {
+        this.testCtx.initializedStep = this.testCtx.stepIdx
+        this.testCtx.networkCheckpoints = new Map(this.tabManager.all().map((t) => [t.id, t.cdp.networkCheckpoint()]))
+      }
+
       // 0. 登录态复用：已登录时跳过「登录类」步骤（跳过即推进，可能直接跑完整个用例）
       if (this.testCtx) {
-        const r = this.consumeLoginSkip()
+        const r = await this.consumeLoginSkip()
         if (r === 'end') return // 收尾统一走 finishTest
         if (r === 'skip') continue
       }
@@ -2410,6 +2498,32 @@ export class AgentRunner {
         }
       }
 
+      // 经断言验证的参数化计划：每轮仅执行一个动作，重新解析目标后再操作。
+      let planReplay = false
+      const test = this.testCtx
+      if (test) {
+        const script = test.tc.steps[test.stepIdx]
+        test.replayedDecision = false
+        if (test.reusePlans && !test.planChecked && script.phase !== 'cleanup' && script.assertions.length) {
+          test.planChecked = true
+          const plan = getStepPlan(planKey(script, this.state.memory.base_url || '', test.tc.name))
+          if (plan) test.replay = { plan, cursor: 0 }
+        }
+        if (test.replay && !guidance.length) {
+          const next = test.replay.plan.actions[test.replay.cursor]
+          const index = next?.target ? resolveTarget(next.target, extract.candidates) : undefined
+          if (index === -1) {
+            try { invalidateStepPlan(test.replay.plan.key) } catch {}
+            test.replay = undefined
+            this.lastResults.push('复用计划的目标不存在或有歧义，已停用旧计划；请基于当前页面继续本步骤，禁止重复已成功操作。')
+          } else {
+            planReplay = true
+            test.replayedDecision = true
+            localParsed = { thought: '复用已验证流程（目标重新解析，断言由引擎执行）', actions: next ? [{ ...next, index }] : [{ name: 'test_step_done' }] }
+          }
+        } else if (test.replay && guidance.length) { test.replay = undefined }
+      }
+
       let llmOut: {
         text: string
         usage: { inputTokens: number; outputTokens: number; cachedInputTokens?: number }
@@ -2426,7 +2540,7 @@ export class AgentRunner {
 
       if (localParsed) {
         // ⚡ 本地直出：跳过云端调用，直接进入动作执行（token 0）
-        localUsed = true
+        localUsed = !planReplay
         // 上一步结果已在 buildLocalPrompt 消费，这里同样清空——
         // 否则混合模式连续命中时旧页面文本（read_content 最长 6200 字/步）无限累积，
         // 既污染本地小模型上下文，恢复云端后第一步还会把陈旧数据整包灌进提示词
@@ -2435,7 +2549,7 @@ export class AgentRunner {
           text: JSON.stringify({ thought: localParsed.thought, actions: localParsed.actions }),
           usage: { inputTokens: 0, outputTokens: 0 }
         }
-        this.setState({ statusText: `第 ${stepN} 步：⚡本地快速决策（${Math.round(this.fastllm!.genMs)}ms，未走云端）` })
+        this.setState({ statusText: planReplay ? `第 ${stepN} 步：复用已验证流程` : `第 ${stepN} 步：⚡本地快速决策（${Math.round(this.fastllm!.genMs)}ms，未走云端）` })
       } else {
         // 视觉截图已在元素提取时并行取得；截失败则本步静默走纯文本
         useVision = (visionActive || visionForced) && !!visionShot
@@ -2833,8 +2947,9 @@ export class AgentRunner {
 
       // 5. 执行动作批（测试模式：test_step_done 是控制信号，进执行器前剥离；protectedSubmit 透传生产保护）
       this.setState({ statusText: `第 ${stepN} 步：执行 ${parsed.actions.length} 个动作…`, usage })
-      const stepDoneSignal = !!this.testCtx && parsed.actions.some((x) => x.name === 'test_step_done')
-      let toRun = this.testCtx ? parsed.actions.filter((x) => x.name !== 'test_step_done') : parsed.actions
+      const controlAt = this.testCtx ? parsed.actions.findIndex((x) => x.name === 'test_step_done' || x.name === 'done') : -1
+      const stepDoneSignal = !!this.testCtx && controlAt >= 0
+      let toRun = this.testCtx ? parsed.actions.slice(0, controlAt < 0 ? undefined : controlAt).filter((x) => x.name !== 'expect') : parsed.actions
       const blocked: AgentAction[] = []
       // 参数契约前置拦截（WPS 任务根因 4）：缺必填参数的动作不进执行批，直接标错误反馈模型——
       // 省一次「执行器报错→下一步」的模型往返；错误文案指明补参方式
@@ -2876,6 +2991,13 @@ export class AgentRunner {
           return true
         })
       }
+      if (this.testCtx) {
+        if (!planReplay && this.testRun?.execution) this.testRun.execution.modelDecisions++
+        for (const a of toRun) {
+          const candidate = a.index != null ? extract.candidates[a.index] : a.fp ? extract.candidates.find((c) => c.fp === a.fp) : undefined
+          if (candidate) a.target = candidateTarget(candidate)
+        }
+      }
       const tAct0 = Date.now()
       const stepHits: Array<{ x: number; y: number; w: number; h: number; label?: string }> = []
       const batchOut = await this.executor.executeBatch(toRun, {
@@ -2895,6 +3017,15 @@ export class AgentRunner {
       })
       timings.actMs = Math.max(0, Date.now() - tAct0 - (timings.settleMs || 0))
       const executed = [...blocked, ...batchOut]
+      if (this.testCtx) {
+        this.testCtx.stepActions.push(...executed.filter((a) => !['expect', 'test_step_done', 'done'].includes(a.name)))
+        if (planReplay && this.testCtx.replay) {
+          if (executed.some((a) => a.error)) {
+            try { invalidateStepPlan(this.testCtx.replay.plan.key) } catch {}
+            this.testCtx.replay = undefined
+          } else this.testCtx.replay.cursor += toRun.length
+        }
+      }
       // 只认实际执行成功的 done（暂停/出错打断批次时不应误判完成）
       const doneAction = executed.find((a) => a.name === 'done' && !a.error)
       // T8 失败尝试记账：方式失败进「禁止重复」清单（每目标最近 3 条、全局 20 条）
@@ -3162,7 +3293,7 @@ export class AgentRunner {
       this.broadcast({ channel: 'step', step })
 
       // 测试模式：断言收集 / 步骤推进 / fail-fast（返回 false 结束循环，收尾统一走 finishTest）
-      if (this.testCtx && !(await this.handleTestPostBatch(executed, stepDoneSignal))) return
+      if (this.testCtx && !(await this.handleTestPostBatch(executed, stepDoneSignal && !blocked.length && batchOut.length === toRun.length && !batchOut.some((a) => a.result?.includes('本批剩余动作已取消'))))) return
 
       // 6.5 节点链复核（普通任务）：模型声明 node_done 或输出 done 时，用节点「预期」复核本节点；
       //     未通过 → 视觉优先自愈重试（不推进、不收尾），连续失败/同错复发升级人工介入

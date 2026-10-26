@@ -27,7 +27,7 @@
  *
  * 预期行类型标记：[文字]→text_visible、[URL]→url_contains、[标题]→title_contains、
  * [选择器 X] 存在/不存在→selector_exists、[选择器 X] 值=Y→selector_value、
- * [选择器 X] 文本=Y→selector_text；无标记的自然语言预期 → kind:'ai'（由模型翻译成 expect）。
+ * [选择器 X] 文本=Y→selector_text；未结构化的预期 → kind:'ai'（待人工确认，运行前拦截）。
  */
 import type { TestCase, TestStep, TestAssertion, ExpectKind } from '@shared/types'
 
@@ -45,20 +45,24 @@ function stripQuotes(s: string): string {
 /** 解析「预期」行为结构化断言 */
 export function parseAssertionLine(raw: string): TestAssertion {
   const line = raw.trim()
+  const frame = line.match(/^\[框架\s+([\d.]+)\]\s*(.+)$/)
+  if (frame) return { ...parseAssertionLine(frame[2]), raw: line, frameKey: frame[1] }
   // [接口 X] 状态 = 200 / 响应包含 Y（网络级断言：按 URL 片段匹配最近一次请求）
   const apiM = line.match(/^\[接口\s+([^\]]+)\]\s*(.*)$/)
   if (apiM) {
     const urlPart = apiM[1].trim()
+    const http = urlPart.match(/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(.+)$/i)
+    const api = { urlPart: http ? http[2] : urlPart, ...(http ? { method: http[1].toUpperCase() } : {}) }
     const rest = apiM[2].trim()
     const stM = rest.match(/^状态\s*(?:=|为)\s*(\d{3})$/)
-    if (stM) return { raw: line, kind: 'api_status', urlPart, value: stM[1] }
+    if (stM) return { raw: line, kind: 'api_status', ...api, value: stM[1] }
     const bodyM = rest.match(/^响应包含\s*(.+)$/)
-    if (bodyM) return { raw: line, kind: 'api_body', urlPart, value: stripQuotes(bodyM[1]) }
-    // 只给了接口没给判断 → 默认 200
-    return { raw: line, kind: 'api_status', urlPart, value: '200' }
+    if (bodyM) return { raw: line, kind: 'api_body', ...api, value: stripQuotes(bodyM[1]) }
+    // 不完整的接口预期必须人工确认，不能擅自补成 HTTP 200。
+    return { raw: line, kind: 'ai' }
   }
   // [选择器 X] 存在 / 不存在 / 值 = Y / 文本 = Y
-  const selM = line.match(/^\[选择器\s+([^\]]+)\]\s*(.*)$/)
+  const selM = line.match(/^\[选择器\s+(.+)\]\s*(.*)$/)
   if (selM) {
     const selector = selM[1].trim()
     const rest = selM[2].trim()
@@ -68,17 +72,17 @@ export function parseAssertionLine(raw: string): TestAssertion {
     if (valM) return { raw: line, kind: 'selector_value', selector, value: valM[1].trim() }
     const txtM = rest.match(/^文本\s*=\s*(.*)$/)
     if (txtM) return { raw: line, kind: 'selector_text', selector, value: txtM[1].trim() }
-    // 只给了选择器没给判断 → 默认存在性
-    return { raw: line, kind: 'selector_exists', selector }
+    // 不完整的选择器预期不能擅自补成存在性。
+    return { raw: line, kind: 'ai' }
   }
   // [文字] / [URL] / [标题]（支持「不包含/不出现」取反）
   const tagM = line.match(/^\[(文字|URL|标题|url|url包含|标题包含)\]\s*(.*)$/)
   if (tagM) {
     const tag = tagM[1]
     const rest = tagM[2].trim()
-    const neg = /^(不包含|不出现|不含)/.test(rest)
-    const value = stripQuotes(rest.replace(/^(不包含|不出现|不含|包含|出现|含有)/, '').trim())
-    const kind: ExpectKind = tag === 'URL' || tag.toLowerCase() === 'url包含' ? 'url_contains' : tag === '标题' || tag === '标题包含' ? 'title_contains' : 'text_visible'
+    const neg = /^(?:页面)?(不包含|不出现|不含)/.test(rest)
+    const value = stripQuotes(rest.replace(/^(?:页面)?(不包含|不出现|不含|包含|出现|含有)/, '').trim())
+    const kind: ExpectKind = tag.toLowerCase().startsWith('url') ? 'url_contains' : tag.startsWith('标题') ? 'title_contains' : 'text_visible'
     return { raw: line, kind, value, negate: neg || undefined }
   }
   // 无类型标记 → 交给模型翻译
@@ -180,7 +184,7 @@ function parseSteps(lines: string[], startIdx: number, cleanup: boolean): { step
     if (m) {
       if (cur) steps.push(finalizeStep(cur, curLogin))
       curLogin = undefined
-      cur = { title: (cleanup ? '清理: ' : '') + m[1].trim(), action: '', assertions: [] }
+      cur = { title: (cleanup ? '清理: ' : '') + m[1].trim(), phase: cleanup ? 'cleanup' : 'test', action: '', assertions: [] }
       continue
     }
     // 显式登录标记（- 登录: 是/否），写在步骤小节内任意位置
@@ -239,8 +243,9 @@ export function parseTestCase(md: string): ParseResult {
       vars = r.vars
       groups = r.groups
       i = r.end - 1
-    } else if (/^##\s*步骤/.test(l)) {
+    } else if (/^##\s*(步骤|准备)/.test(l)) {
       const r = parseSteps(lines, i + 1, false)
+      if (/准备/.test(l)) r.steps.forEach((s) => { s.phase = 'setup' })
       steps.push(...r.steps)
       i = r.end - 1
     } else if (/^##\s*清理/.test(l)) {
@@ -255,7 +260,12 @@ export function parseTestCase(md: string): ParseResult {
   for (let k = 0; k < steps.length; k++) {
     if (!steps[k].action) return { ok: false, error: `步骤「${steps[k].title}」缺少「- 操作: …」描述` }
   }
-  return { ok: true, tc: groups ? { name, vars, steps, groups } : { name, vars, steps } }
+  const metadata = (label: string) => {
+    const line = lines.find((l) => new RegExp(`^[-*]\\s*${label}\\s*[:：]`).test(l.trim()))
+    return line ? line.replace(/^[-*]\s*[^:：]+[:：]\s*/, '').split(/[,，\s]+/).filter(Boolean) : []
+  }
+  steps.forEach((step, si) => step.assertions.forEach((a, ai) => { a.id = `s${si + 1}-a${ai + 1}` }))
+  return { ok: true, tc: { name, vars, steps, ...(groups ? { groups } : {}), requirementIds: metadata('需求'), acceptanceIds: metadata('验收点') } }
 }
 
 /** 概要（UI 校验预览用） */

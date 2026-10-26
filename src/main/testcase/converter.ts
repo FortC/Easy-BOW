@@ -1,10 +1,11 @@
 /**
- * 需求 MD → 测试用例 MD 转换器（一次 LLM 调用，无浏览器依赖）。
+ * 需求 MD → 多用例 MD：全文分段转换，无浏览器依赖。
  * 双模式：prd=完整 PRD 提炼拆用例 / rough=粗略手写步骤补全断言与数据。
- * 产出必须通过 parser 校验；失败自动带错误回喂重试一次（转换失败不外吐不可执行的 MD）。
+ * 每段产出经 suite parser 校验并可重试一次；缺少业务预期会保留待确认标记并阻止运行。
  */
 import type { LlmProvider } from '../agent/llm'
-import { parseTestCase, summarize } from './parser'
+import { parseTestSuite } from './suite'
+import { compileRequirements, requirementChunks } from './requirements'
 
 export type ConvertMode = 'prd' | 'rough'
 
@@ -42,10 +43,10 @@ const SPEC = `输出必须是如下规范的测试用例 Markdown（直接输出
 
 const PRD_ADDON = `你面对的是一份完整的产品需求文档（PRD）。任务：
 1. 通读全文，提取「可测功能点」（有明确输入/操作/可见结果的功能）
-2. 为本 PRD 生成一个冒烟级测试用例集（先输出最核心主流程的用例，一个 TESTCASE 只覆盖一条主流程；PRD 里如有多个独立功能，选择最重要的 1 个主流程 + 若干关键异常场景合并进同一用例的步骤序列）
+2. 为本 PRD 生成多个独立 TESTCASE，主流程、异常和边界场景分别建用例，不能把互斥场景串成一条流程
 3. 边界与异常：主流程用例的关键异常（必填校验、错误提示）以独立步骤体现，断言错误提示文案/错误元素
 4. 测试数据按业务语义造合理值（手机号/邮箱/身份证等给格式合法的假值）
-只输出一个 TESTCASE（不要输出多个，用户可分次转换）。`
+输出本段需求的所有可测用例，每个以 # TESTCASE: 开始。在标题下增加「- 需求: 原需求编号」和「- 验收点: AC-xxx, AC-yyy」，仅引用输入存在的编号。`
 
 const ROUGH_ADDON = `你面对的是工程师手写的粗略测试步骤（可能口语化、缺断言、缺数据）。任务：
 1. 严格保留用户的步骤语义与顺序，不擅自增加/删减/合并业务步骤
@@ -93,6 +94,9 @@ export interface ConvertResult {
   error?: string
   steps?: number
   assertions?: number
+  cases?: number
+  uncovered?: string[]
+  warnings?: string[]
   attempts?: number
 }
 
@@ -113,25 +117,39 @@ export async function convertRequirement(
   reqMd: string,
   mode: ConvertMode
 ): Promise<ConvertResult> {
-  const input = (reqMd || '').trim().slice(0, 30000)
+  const input = (reqMd || '').trim()
   if (!input) return { ok: false, error: '需求内容为空' }
-  const system = `你是测试用例生成器。${mode === 'prd' ? PRD_ADDON : ROUGH_ADDON}\n\n${SPEC}\n\n${FEWSHOT}`
-
-  let lastError = ''
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const user =
-      attempt === 1
-        ? `# 需求（${mode === 'prd' ? 'PRD 全文' : '粗略手写步骤'}）\n${input}\n\n输出测试用例 MD：`
-        : `# 需求（${mode === 'prd' ? 'PRD 全文' : '粗略手写步骤'}）\n${input}\n\n你上一次的输出解析失败：${lastError}\n请严格按规范修正后重新输出完整用例 MD：`
-    const out = await provider.chat(system, [{ role: 'user', content: user }])
-    const md = extractMd(out.text)
-    const parsed = parseTestCase(md)
-    if (parsed.ok && parsed.tc) {
-      const s = summarize(parsed.tc)
-      return { ok: true, md, steps: s.steps, assertions: s.assertions, attempts: attempt }
+  // 明确拒绝超出资源上限，绝不以截断伪装成全文转换。
+  if (input.length > 1000000) return { ok: false, error: '需求超过 100 万字符，请拆分文档后导入；未发送任何内容' }
+  const compiled = compileRequirements(input)
+  const chunks = requirementChunks(compiled.annotated)
+  const system = `你是测试用例生成器。${mode === 'prd' ? PRD_ADDON : ROUGH_ADDON}\n\n${SPEC}\n\n${FEWSHOT}
+补充约束：示例只说明格式，不是被测产品事实。不得沿用示例的账号密码、路由、成功文案或 CSS。
+仅使用需求明确给出的页面、文案、路由和选择器；无法确定的预期写「- 预期: [待确认] 说明缺少什么」，留给用户补充，不能编造。
+每个可执行业务步骤都应有预期；准备/导航/清理步骤可省略。每个用例必须独立准备数据和恢复数据。
+需求有 AC 编号时必须在用例标题下用「- 验收点: AC-xxx」关联对应验收点。`
+  const documents: string[] = []
+  let attempts = 0
+  for (const [index, chunk] of chunks.entries()) {
+    let lastError = ''
+    let accepted = false
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      attempts++
+      const user = `# 需求片段 ${index + 1}/${chunks.length}\n${chunk}\n${lastError ? `上次格式错误：${lastError}。请修正。` : ''}\n输出本片段测试用例 MD；缺少上下文请标待确认，不能自行假设：`
+      const out = await provider.chat(system, [{ role: 'user', content: user }], undefined, { plain: true, maxTokens: 8192 })
+      const md = extractMd(out.text)
+      const parsed = parseTestSuite(md)
+      if (parsed.ok && parsed.suite) { documents.push(md); accepted = true; break }
+      lastError = parsed.error || '解析失败'
     }
-    lastError = parsed.error || '解析失败'
-    if (attempt === 2) return { ok: false, md, error: `生成结果不符合用例规范: ${lastError}`, attempts: attempt }
+    if (!accepted) return { ok: false, error: `需求片段 ${index + 1}/${chunks.length} 转换失败: ${lastError}；未交付不完整用例集`, attempts }
   }
-  return { ok: false, error: 'unreachable' }
+  const manifest = compiled.acceptance.map((a) => a.id)
+  const md = `# TESTSUITE: 需求验证\n${manifest.length ? `- 验收点: ${manifest.join(', ')}\n` : ''}\n${documents.join('\n\n')}`
+  const suite = parseTestSuite(md).suite!
+  const covered = new Set(suite.cases.flatMap((c) => c.acceptanceIds || []))
+  return { ok: true, md, cases: suite.cases.length,
+    steps: suite.cases.reduce((n, c) => n + c.steps.length, 0),
+    assertions: suite.cases.reduce((n, c) => n + c.steps.reduce((a, step) => a + step.assertions.length, 0), 0),
+    uncovered: manifest.filter((id) => !covered.has(id)), warnings: !manifest.length ? ['原需求没有 AC 编号或验收复选清单，无法计算完整验收覆盖率；建议补充验收点后重新生成。'] : [], attempts }
 }

@@ -70,10 +70,12 @@ export async function fetchAxTree(cdp: Cdp, maxNodes = 150, candKnownTexts?: str
     if (!nm || nm.length > 30) continue
     // W4 state 采集：disabled/checked/expanded（浏览器引擎判定，含 aria 与自定义控件语义）
     const states: string[] = []
-    if (n.disabled === true) states.push('disabled')
-    if (n.checked === true || n.checked === 'mixed') states.push(n.checked === 'mixed' ? '半选' : '已勾选')
-    if (n.expanded === true) states.push('已展开')
-    if (n.expanded === false) states.push('已收起')
+    const property = (key: string) => n.properties?.find((p: any) => p.name === key)?.value?.value ?? n[key]
+    if (property('disabled') === true) states.push('disabled')
+    const checked = property('checked')
+    if (checked === true || checked === 'true' || checked === 'mixed') states.push(checked === 'mixed' ? '半选' : '已勾选')
+    if (property('expanded') === true) states.push('已展开')
+    if (property('expanded') === false) states.push('已收起')
     // 名字能对上候选文本的不需要盒子（名字桥配对）；对不上的才要几何（图标候选）
     picked.push({ bid, role, name: nm, state: states.length ? states.join('/') : undefined, needBox: !known.has(nm) })
     if (picked.length >= maxNodes) break

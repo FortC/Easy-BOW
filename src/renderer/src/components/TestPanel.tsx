@@ -1,7 +1,7 @@
 import { Check, CircleCheck, CircleX, FlaskConical, Hourglass, LoaderCircle, Play, Square, X } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { useEffect, useRef, useState } from 'react'
-import type { MainEvent, TestCaseEntry, TestEnv, TestRunStatus } from '@shared/types'
+import type { MainEvent, ModelCapabilityReport, TestCaseEntry, TestEnv, TestRunStatus } from '@shared/types'
 import { useModalFocus } from '../hooks/useDelayedUnmount'
 
 type PanelTab = 'convert' | 'run' | 'reports' | 'lib'
@@ -67,6 +67,8 @@ export default function TestPanel(props: {
   const [parsed, setParsed] = useState<
     | {
         ok: boolean
+        cases?: number
+        unresolved?: number
         error?: string
         name?: string
         steps?: number
@@ -93,7 +95,10 @@ export default function TestPanel(props: {
   const [failFast, setFailFast] = useState(true)
   const [fillPreview, setFillPreview] = useState(false)
   /** 登录态复用：启动先探测已保存登录态，命中跳过登录步骤（默认开） */
-  const [loginReuse, setLoginReuse] = useState(true)
+  const [loginReuse, setLoginReuse] = useState(false)
+  const [reusePlans, setReusePlans] = useState(true)
+  const [benchmarking, setBenchmarking] = useState(false)
+  const [modelReport, setModelReport] = useState<ModelCapabilityReport | null>(null)
   const [envDraft, setEnvDraft] = useState<TestEnv | null>(null)
   const [run, setRun] = useState<TestRunStatus | null>(null)
   /** 主 Agent 是否在跑（看门狗据此判断「显示执行中」是否属实） */
@@ -232,8 +237,8 @@ export default function TestPanel(props: {
       const r = await window.easybow.testConvert(reqMd, mode)
       if (r.ok && r.md) {
         setCaseMd(r.md)
-        setParsed({ ok: true, steps: r.steps, assertions: r.assertions })
-        props.onToast(`用例已生成（${r.steps} 步骤 / ${r.assertions} 断言${r.attempts && r.attempts > 1 ? '，重试后成功' : ''}），可编辑后运行`, 'success')
+        setParsed(await window.easybow.testParse(r.md))
+        props.onToast(`已生成 ${r.cases || 1} 个用例 / ${r.steps} 步骤 / ${r.assertions} 断言${r.uncovered?.length ? `，${r.uncovered.length} 个验收点未覆盖` : ''}${r.warnings?.length ? `。${r.warnings[0]}` : ''}`, r.uncovered?.length || r.warnings?.length ? 'info' : 'success')
         setTab('run')
       } else {
         if (r.md) setCaseMd(r.md)
@@ -271,7 +276,7 @@ export default function TestPanel(props: {
         props.onToast(`用例校验未通过: ${v.error}`, 'error')
         return
       }
-      await window.easybow.testStart(caseMd, { envName: envName || undefined, failFast, fillPreview, loginReuse })
+      await window.easybow.testStart(caseMd, { envName: envName || undefined, failFast, fillPreview, loginReuse, reusePlans })
       lastRunMd.current = caseMd
       props.onToast(`测试已启动（独立测试页签${envName ? ` · ${envName}` : ''}）`, 'success')
       setReportContent(null)
@@ -387,7 +392,7 @@ export default function TestPanel(props: {
     setStepsDetail(null)
     setTab('run')
     try {
-      await window.easybow.testStart(entry.md, { envName: envName || undefined, failFast, loginReuse })
+      await window.easybow.testStart(entry.md, { envName: envName || undefined, failFast, loginReuse, reusePlans })
       lastRunMd.current = entry.md
       props.onToast(`已从用例库运行「${entry.name}」`, 'success')
     } catch (e: any) {
@@ -482,6 +487,17 @@ export default function TestPanel(props: {
           <>
             <div className="form-row">
               <label>需求内容（粘贴 PRD 全文或手写粗略步骤）</label>
+              <input type="file" accept=".md,.markdown,.txt,text/markdown,text/plain" onChange={async (e) => {
+                const file = e.target.files?.[0]
+                e.target.value = ''
+                if (!file) return
+                try {
+                  if (file.size > 4000000) throw new Error('文档过大，请拆分为小于 4MB 的 Markdown')
+                  setReqMd(await file.text())
+                  setMode('prd')
+                  props.onToast(`已导入 ${file.name}`, 'success')
+                } catch (error: any) { props.onToast(error?.message || '读取失败', 'error') }
+              }} />
               <textarea
                 className="test-md-input"
                 value={reqMd}
@@ -502,7 +518,7 @@ export default function TestPanel(props: {
             </div>
             <div className="test-actions">
               <button className="btn primary" onClick={doConvert} disabled={converting}>
-                {converting ? '生成中…（一次模型调用）' : '生成测试用例'}
+                {converting ? '生成中…（按段处理全文）' : '生成测试用例集'}
               </button>
             </div>
             <div className="field-hint">
@@ -652,7 +668,14 @@ export default function TestPanel(props: {
                 <label>登录态</label>
                 <select value={loginReuse ? '1' : '0'} onChange={(e) => setLoginReuse(e.target.value === '1')}>
                   <option value="1">复用已保存登录态（已登录则跳过登录步骤）</option>
-                  <option value="0">每次重新登录</option>
+                  <option value="0">干净会话（每用例、每组数据隔离）</option>
+                </select>
+              </div>
+              <div className="form-row">
+                <label>流程复用</label>
+                <select value={reusePlans ? '1' : '0'} onChange={(e) => setReusePlans(e.target.value === '1')}>
+                  <option value="1">复用已验证流程（失效时交回 AI）</option>
+                  <option value="0">每次由 AI 执行</option>
                 </select>
               </div>
             </div>
@@ -686,7 +709,7 @@ export default function TestPanel(props: {
             {parsed && (
               <div className={`field-hint ${parsed.ok ? '' : 'test-parse-err'}`}>
                 {parsed.ok
-                  ? `✅ ${parsed.name}：${parsed.steps} 步骤 / ${parsed.assertions} 断言${parsed.groups ? ` · ${parsed.groups} 组数据驱动` : ''}${parsed.vars?.length ? ` · 变量: ${parsed.vars.join(', ')}` : ''}`
+                  ? `✅ ${parsed.name}：${parsed.cases || 1} 用例 / ${parsed.steps} 步骤 / ${parsed.assertions} 断言${parsed.unresolved ? ` · ⚠ ${parsed.unresolved} 条预期待确认（需补充后才能运行）` : ''}${parsed.groups ? ` · ${parsed.groups} 组数据` : ''}${parsed.vars?.length ? ` · 变量: ${parsed.vars.join(', ')}` : ''}`
                   : `❌ ${parsed.error}`}
               </div>
             )}
@@ -695,7 +718,7 @@ export default function TestPanel(props: {
             )}
             {loginReuse && (
               <div className="field-hint">
-                🔑 登录态复用：启动先访问目标站点探测——测试页签分区已保存有效登录时，「登录」类步骤自动判过并跳过；会话失效被踢回登录页时自动重新登录。
+                🔑 复用专用测试分区的登录态；已登录时仅跳过登录操作，脚本断言仍由引擎逐条执行。
               </div>
             )}
 
@@ -747,6 +770,19 @@ export default function TestPanel(props: {
             </div>
 
             {/* 运行进度与结果 */}
+            <div className="field-hint">
+              <button className="btn mini" disabled={benchmarking || running} onClick={async () => {
+                setBenchmarking(true)
+                try { setModelReport(await window.easybow.testModelBenchmark()) }
+                catch (e: any) { props.onToast(e?.message || '测评失败', 'error') }
+                finally { setBenchmarking(false) }
+              }}>{benchmarking ? '测评中…' : '测评当前模型（6 次调用）'}</button>
+              <span>固定语义场景，会消耗少量 Token；真实站点能力仍需回归验证。</span>
+              {modelReport && <div>
+                {modelReport.model}：{modelReport.passed}/{modelReport.total} 通过 · P50 {modelReport.p50Ms}ms · P90 {modelReport.p90Ms}ms · Token {modelReport.inputTokens + modelReport.outputTokens}
+                {modelReport.results.map((r) => <div key={r.id}>{r.passed ? '✓' : '✗'} {r.name} · {r.ms}ms {r.error || ''}</div>)}
+              </div>}
+            </div>
             {run && (
               <div className="test-run">
                 <div className={`test-run-banner ${RUN_VERDICT[run.state]?.cls || ''}`}>
@@ -759,8 +795,8 @@ export default function TestPanel(props: {
                   {run.state !== 'running' && (
                     <span className="test-run-ops">
                       {run.failed > 0 && (
-                        <button className="btn mini warn" onClick={rerunFailed} title="把失败/跳过步骤抽成子用例，人工确认后重跑">
-                          ↻ 重跑失败步骤
+                        <button className="btn mini warn" onClick={rerunFailed} title="重跑失败步骤所属的完整用例及数据组，保留准备与清理">
+                          ↻ 重跑失败用例
                         </button>
                       )}
                       <button className="btn mini" onClick={() => window.easybow.testOpenReports().catch(() => {})}>
@@ -769,6 +805,8 @@ export default function TestPanel(props: {
                     </span>
                   )}
                 </div>
+                {run.execution && <div className="field-hint">复用 {run.execution.replayedSteps} 步 · 模型决策 {run.execution.modelDecisions} 次</div>}
+                {run.coverage?.length ? <div className="field-hint">{run.coverage.map((c) => <div key={c.id}>{c.id} · {{ passed: '通过', failed: '失败', not_run: '未执行或验证未完成', uncovered: '未覆盖' }[c.status]} · {c.cases.join(', ')}</div>)}</div> : null}
                 <div className="test-steps">
                   {run.steps.map((s) => (
                     <div key={s.index} className={`test-step ${s.status}`}>
@@ -788,7 +826,7 @@ export default function TestPanel(props: {
                           {s.assertions.map((a, i) => (
                             <div key={i} className={`test-assert ${a.passed ? 'ok' : 'bad'}`}>
                               <span>{a.passed ? <Check size={11} strokeWidth={3} /> : <X size={11} strokeWidth={3} />}</span>
-                              <code>{a.raw}</code>
+                              <code>{a.raw}</code>{a.status === 'error' && <em>求值错误</em>}
                               {!a.passed && a.actual && <em>实际: {a.actual}</em>}
                             </div>
                           ))}

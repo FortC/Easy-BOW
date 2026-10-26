@@ -37,6 +37,7 @@ const api: EasybowApi = {
   testConvert: (reqMd, mode) => ipcRenderer.invoke('test:convert', reqMd, mode),
   testParse: (md) => ipcRenderer.invoke('test:parse', md),
   testStart: (md, opts) => ipcRenderer.invoke('test:start', md, opts),
+  testModelBenchmark: () => ipcRenderer.invoke('test:model-benchmark'),
   testStop: () => ipcRenderer.invoke('test:stop'),
   testRunStatus: () => ipcRenderer.invoke('test:status'),
   testReset: () => ipcRenderer.invoke('test:reset'),

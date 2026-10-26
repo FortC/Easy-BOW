@@ -49,7 +49,14 @@ export function writeTestReport(run: TestRunStatus, tc: TestCase, shots: Map<num
   lines.push(`- **开始**: ${new Date(run.startedAt || Date.now()).toLocaleString('zh-CN', { hour12: false })}`)
   if (dur != null) lines.push(`- **耗时**: ${dur}s`)
   lines.push(`- **Token**: 输入 ${run.tokens.input} / 输出 ${run.tokens.output}`)
+  if (run.execution) lines.push(`- **执行方式**: 复用 ${run.execution.replayedSteps} 个步骤 / 模型决策 ${run.execution.modelDecisions} 次`)
   lines.push('')
+  if (run.coverage?.length) {
+    lines.push('## 验收点覆盖', '', '| 验收点 | 结果 | 用例 |', '|---|---|---|')
+    const labels = { passed: '通过', failed: '失败', not_run: '未执行或未完成验证', uncovered: '未覆盖' }
+    for (const c of run.coverage) lines.push(`| ${c.id.replace(/\|/g, '/')} | ${labels[c.status]} | ${c.cases.join(', ')} |`)
+    lines.push('')
+  }
   lines.push(`## 步骤结果`)
   lines.push('')
   lines.push(`| # | 步骤 | 状态 | 模型步数 | 断言 | 失败原因 |`)
@@ -69,7 +76,7 @@ export function writeTestReport(run: TestRunStatus, tc: TestCase, shots: Map<num
       lines.push('')
       lines.push(`### ${s.index}. ${s.title} — ${s.error || '未执行'}`)
       for (const a of s.assertions) {
-        lines.push(`- ${a.passed ? '✅' : '❌'} \`${a.raw}\`${a.passed ? '' : ` — 实际: ${a.actual || '(未取得)'}`}`)
+        lines.push(`- ${a.passed ? '✅' : '❌'} ${a.id || ''} \`${a.raw}\`（${a.status === 'error' ? '求值错误' : a.passed ? '通过' : '失败'}）${a.passed ? '' : ` — 实际: ${a.actual || '(未取得)'}`}`)
       }
       if (s.shotFile) lines.push(`- 失败截图: ![${s.title}](${s.shotFile})`)
       const script = tc.steps[s.index - 1]
@@ -177,21 +184,34 @@ img{max-width:100%;border:1px solid #e5e6eb;border-radius:6px;margin-top:8px}
 开始: ${esc(new Date(run.startedAt || Date.now()).toLocaleString('zh-CN', { hour12: false }))}
 </div>
 ${rows}
+${run.coverage?.length ? `<h2>验收点覆盖</h2>${run.coverage.map((c) => `<p>${esc(c.id)} · ${esc(({ passed: '通过', failed: '失败', not_run: '未执行或未完成验证', uncovered: '未覆盖' })[c.status])} · ${esc(c.cases.join(', '))}</p>`).join('')}` : ''}
 </body></html>`
 }
 
 /** 用例回显（与 parser 输入规范一致的 MD） */
 export function renderCaseMd(tc: TestCase): string {
   const out: string[] = [`# TESTCASE: ${tc.name}`, '']
+  if (tc.requirementIds?.length) out.push(`- 需求: ${tc.requirementIds.join(', ')}`)
+  if (tc.acceptanceIds?.length) out.push(`- 验收点: ${tc.acceptanceIds.join(', ')}`)
   const varKeys = Object.keys(tc.vars)
   if (varKeys.length) {
     out.push('## 测试数据', '', '| 变量 | 值 |', '|---|---|')
     for (const k of varKeys) out.push(`| ${k} | ${tc.vars[k]} |`)
     out.push('')
   }
-  out.push('## 步骤', '')
+  if (tc.groups?.length) {
+    if (!varKeys.length) out.push('## 测试数据', '')
+    for (const g of tc.groups) {
+      out.push(`### ${g.name}`, '| 变量 | 值 |', '|---|---|')
+      for (const [key, value] of Object.entries(g.vars)) out.push(`| ${key} | ${value} |`)
+      out.push('')
+    }
+  }
+  let phase = ''
   for (const s of tc.steps) {
-    out.push(`### ${s.title.replace(/^清理: /, (m) => m)}`)
+    const nextPhase = s.phase || (s.title.startsWith('清理:') ? 'cleanup' : 'test')
+    if (nextPhase !== phase) { phase = nextPhase; out.push(phase === 'cleanup' ? '## 清理' : phase === 'setup' ? '## 准备' : '## 步骤', '') }
+    out.push(`### ${s.title.replace(/^清理: /, '')}`)
     out.push(`- 操作: ${s.action}`)
     for (const a of s.assertions) out.push(`- 预期: ${a.raw}`)
     if (s.dialog) out.push(`- 弹窗: ${s.dialog === 'accept' ? '确认' : '取消'}`)

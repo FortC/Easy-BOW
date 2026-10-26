@@ -1,6 +1,6 @@
 {
   "name": "easybow",
-  "version": "4.6.0",
+  "version": "4.7.0",
   "description": "EasyBow — AI 浏览器：内置大模型自动操作 + 跨页签数据搬运 + 本地免费 OCR",
   "main": "out/main/index.js",
   "author": "clb <lamthebest@foxmail.com>",
@@ -22,7 +22,8 @@
     "fastllm:test": "node scripts/run-app.mjs out/main/index.js --fastllm-test",
     "regression": "electron-vite build && node scripts/run-app.mjs out/main/index.js --regression",
     "benchmark": "electron-vite build && node scripts/run-app.mjs out/main/index.js --regression --benchmark",
-    "analyze-traces": "node scripts/analyze-traces.mjs"
+    "analyze-traces": "node scripts/analyze-traces.mjs",
+    "test:testing": "electron-vite build && node scripts/run-app.mjs out/main/index.js --testing-selftest"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0",

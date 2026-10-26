@@ -2,6 +2,8 @@
 
 一个 Windows 桌面应用（Electron），本身就是一台 **AI 浏览器**：你描述任务，AI 大模型直接驱动浏览器替你点、输、读、填、搬运数据，全过程实时可见，token 消耗可控；本地免费 OCR 与本地快速决策模型加持。
 
+**v4.7.0**：支持需求 MD 文件导入、多用例生成、引擎独立断言、验收点覆盖报告和参数化流程复用。可在工具栏「测试」中使用，详见 [发布说明](docs/release-notes-v4.7.0.md)。
+
 ## 界面一览
 
 | 主界面（多页签 + AI 任务面板） | AI 操作过程时间线 |
@@ -40,8 +42,9 @@ npm run fetch:model  # （可选）预拉取本地快速决策模型到 resource
 npm run dist         # 自动拉取模型 + 构建 + 打包：安装包 + 便携版到 dist/
 ```
 
-- `dist/EasyBow-Setup-4.3.0.exe` — NSIS 安装包（约 477MB，**已内置本地快速决策模型**，装完即用）
-- `dist/EasyBow-Portable-4.3.0.exe` — 免安装便携版（约 477MB，同内置）
+- `dist/EasyBow-Setup-4.7.0.exe` — NSIS 安装包（**已内置本地快速决策、语音识别与 OCR 资源**）
+- `dist/EasyBow-Portable-4.7.0.exe` — 免安装便携版（同内置）
+- `dist/SHA256SUMS-4.7.0.txt` — 下载文件的 SHA-256 校验清单
 
 ### 使用步骤
 
