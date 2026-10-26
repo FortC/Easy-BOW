@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process'
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
+import { request } from 'node:https'
 
 const argv = process.argv.slice(2)
 const arg = (key, fallback = '') => { const i = argv.indexOf(`--${key}`); return i < 0 ? fallback : argv[i + 1] }
@@ -18,11 +19,13 @@ if (!notes || !existsSync(notes)) throw new Error('缺少发布说明文件')
 const tag = `v${version}`
 const base = `https://api.github.com/repos/${repo}`
 const git = (args, extra = {}) => spawnSync('git', args, { encoding: 'utf8', windowsHide: true, ...extra })
-const head = git(['rev-parse', 'HEAD']).stdout.trim()
 if (JSON.parse(readFileSync('package.json', 'utf8')).version !== version) throw new Error('package.json 版本与发布版本不一致')
 if (git(['diff', '--quiet']).status !== 0 || git(['diff', '--cached', '--quiet']).status !== 0) throw new Error('存在尚未提交的修改，禁止发布来源不明确的安装包')
 const tagged = git(['rev-parse', `${tag}^{commit}`])
-if (tagged.status !== 0 || tagged.stdout.trim() !== head) throw new Error('发布标签必须存在且指向当前 HEAD')
+if (tagged.status !== 0) throw new Error('发布标签必须存在，请先提交并推送对应标签')
+const head = tagged.stdout.trim()
+// 发布工具本身可在标签之后修复；应用和构建输入必须仍与标签完全相同。
+if (git(['diff', '--quiet', tag, 'HEAD', '--', 'src', 'resources', 'package.json', 'package-lock.json', 'electron-builder.yml', 'electron.vite.config.ts', 'tsconfig*', 'scripts/fetch-*', 'scripts/sync-ocr-web.mjs']).status !== 0) throw new Error('当前应用源码与发布标签不同，请从标签对应源码构建')
 const names = [`EasyBow-Setup-${version}.exe`, `EasyBow-Portable-${version}.exe`, `EasyBow-Setup-${version}.exe.blockmap`, 'latest.yml', `SHA256SUMS-${version}.txt`]
 for (const name of names) if (!existsSync(join(dir, name)) || !statSync(join(dir, name)).size) throw new Error(`缺少产物: ${name}`)
 
@@ -44,6 +47,34 @@ async function hash(file) {
   return h.digest('hex')
 }
 
+// 大包允许持续上传，只对无数据的连接超时；避免 fetch 的响应头等待上限中断慢速上传。
+function uploadArtifact(url, headers, artifact) {
+  return new Promise((resolve, reject) => {
+    const source = createReadStream(artifact.file)
+    const req = request(url, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/octet-stream', 'Content-Length': String(artifact.size) } }, (res) => {
+      let body = ''
+      res.setEncoding('utf8')
+      res.on('data', (chunk) => { body += chunk })
+      res.on('error', reject)
+      res.on('aborted', () => reject(new Error(`上传响应中断: ${artifact.name}`)))
+      res.on('end', () => {
+        if (res.statusCode !== 201) return reject(new Error(`附件上传失败: ${artifact.name} (HTTP ${res.statusCode})`))
+        try { resolve(JSON.parse(body)) } catch { reject(new Error('GitHub 上传响应无效')) }
+      })
+    })
+    req.setTimeout(180000, () => req.destroy(new Error('上传连接连续 180 秒无数据')))
+    req.on('error', (error) => { source.destroy(); reject(new Error(`${artifact.name}: ${error.code || error.message}`)) })
+    source.on('error', (error) => req.destroy(error))
+    source.pipe(req)
+    let sent = 0
+    let last = 0
+    source.on('data', (chunk) => {
+      sent += chunk.length
+      if (sent - last >= 25 * 1048576) { last = sent; console.log(`  ${artifact.name}: ${(sent / 1048576).toFixed(0)} MiB 已发送`) }
+    })
+  })
+}
+
 async function main() {
   const token = await getToken()
   const headers = { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'easybow-publish' }
@@ -57,9 +88,12 @@ async function main() {
   if (remoteTag?.object?.type !== 'commit' || remoteTag.object.sha !== head) throw new Error('远端标签没有指向当前提交，禁止发布错误版本')
   const local = await Promise.all(names.map(async (name) => ({ name, file: join(dir, name), size: statSync(join(dir, name)).size, sha256: await hash(join(dir, name)) })))
   let release = await api('GET', `/releases/tags/${tag}`)
+  // 未公开草稿可能不出现在按 tag 查询接口中，必须从认证后的列表恢复同一草稿。
+  if (!release) release = (await api('GET', '/releases?per_page=100')).find((r) => r.tag_name === tag)
   if (!release) release = await api('POST', '/releases', { tag_name: tag, target_commitish: head, name: `EasyBow ${tag}`, body: readFileSync(notes, 'utf8'), draft: true, prerelease: version.includes('-') })
   console.log(`Release 草稿就绪: ${tag} (${head.slice(0, 12)})`)
   for (const artifact of local) {
+    release = await api('GET', `/releases/${release.id}`)
     const present = release.assets?.find((a) => a.name === artifact.name)
     if (present) {
       if (present.size !== artifact.size || (present.digest && present.digest !== `sha256:${artifact.sha256}`)) throw new Error(`远端已有不同内容附件: ${artifact.name}`)
@@ -67,20 +101,7 @@ async function main() {
       continue
     }
     console.log(`上传 ${artifact.name} (${(artifact.size / 1048576).toFixed(1)} MiB)…`)
-    const stream = (async function* () {
-      let sent = 0
-      let last = 0
-      for await (const chunk of createReadStream(artifact.file)) {
-        sent += chunk.length
-        if (sent - last >= 100 * 1048576) { last = sent; console.log(`  ${artifact.name}: ${(sent / 1048576).toFixed(0)} MiB 已发送`) }
-        yield chunk
-      }
-    })()
-    const response = await fetch(`https://uploads.github.com/repos/${repo}/releases/${release.id}/assets?name=${encodeURIComponent(artifact.name)}`, {
-      method: 'POST', headers: { ...headers, 'Content-Type': 'application/octet-stream', 'Content-Length': String(artifact.size) }, body: stream, duplex: 'half'
-    })
-    if (!response.ok) throw new Error(`附件上传失败: ${artifact.name} (HTTP ${response.status})；草稿保留，可重新运行`)
-    const asset = await response.json()
+    const asset = await uploadArtifact(`https://uploads.github.com/repos/${repo}/releases/${release.id}/assets?name=${encodeURIComponent(artifact.name)}`, headers, artifact)
     if (asset.size !== artifact.size || (asset.digest && asset.digest !== `sha256:${artifact.sha256}`)) throw new Error(`上传后校验失败: ${artifact.name}`)
     console.log(`上传并校验完成: ${artifact.name}`)
   }
