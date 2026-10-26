@@ -1,0 +1,83 @@
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing validated release tag
+        required: true
+        default: v4.7.0
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      EASYBOW_HF_MIRROR: https://huggingface.co
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate source tag and completed CI
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') { throw 'Invalid release tag' }
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($env:RELEASE_TAG -ne "v$version") { throw 'Package version differs from tag' }
+          $sha = (git rev-parse HEAD).Trim()
+          $remote = gh api "repos/$env:GH_REPO/git/ref/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          if ($remote.object.sha -ne $sha) { throw 'Remote tag differs from checkout' }
+          $runs = gh api "repos/$env:GH_REPO/actions/runs?head_sha=$sha&per_page=30" | ConvertFrom-Json
+          if (!($runs.workflow_runs | Where-Object { $_.name -eq 'ci' -and $_.conclusion -eq 'success' })) { throw 'Validated CI run required for this exact commit' }
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Build Windows installer and portable package
+        run: npm run dist
+      - name: Run packaged application acceptance tests
+        run: |
+          $exe = Join-Path $PWD 'dist/win-unpacked/EasyBow.exe'
+          $p = Start-Process -FilePath $exe -ArgumentList '--testing-selftest' -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput "$PWD/packaged-test.log" -RedirectStandardError "$PWD/packaged-test-errors.log"
+          Get-Content packaged-test.log
+          if ($p.ExitCode -ne 0) { Get-Content packaged-test-errors.log; throw "Packaged tests failed: $($p.ExitCode)" }
+          if (!(Select-String -Path packaged-test.log -Pattern 'Testing selftest: 25 passed, 0 failed' -Quiet)) { throw 'Incomplete packaged test run' }
+      - name: Upload verified assets and publish existing draft
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $release = gh release view $env:RELEASE_TAG --json id,isDraft | ConvertFrom-Json
+          if (!$release.isDraft) { throw 'Refusing to replace assets of an already public release' }
+          $names = @("EasyBow-Setup-$version.exe", "EasyBow-Portable-$version.exe", "EasyBow-Setup-$version.exe.blockmap", 'latest.yml')
+          $checksums = foreach ($name in $names) { $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist/$name").Hash.ToLowerInvariant(); "$hash  $name" }
+          $checksumName = "SHA256SUMS-$version.txt"
+          $checksums | Set-Content "dist/$checksumName" -Encoding ascii
+          $all = @($names) + @($checksumName)
+          foreach ($name in $all) { gh release upload $env:RELEASE_TAG "dist/$name" --clobber; if ($LASTEXITCODE -ne 0) { throw "Upload failed: $name" } }
+          $metadata = gh api "repos/$env:GH_REPO/releases/$($release.id)" | ConvertFrom-Json
+          foreach ($name in $all) {
+            $asset = $metadata.assets | Where-Object { $_.name -eq $name }
+            $file = Get-Item "dist/$name"
+            $digest = 'sha256:' + (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash.ToLowerInvariant()
+            if (!$asset -or $asset.state -ne 'uploaded' -or $asset.size -ne $file.Length -or ($asset.digest -and $asset.digest -ne $digest)) { throw "Remote verification failed: $name" }
+          }
+          gh release edit $env:RELEASE_TAG --draft=false --latest --notes-file "docs/release-notes-v$version.md"
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-test-logs
+          path: |
+            packaged-test.log
+            packaged-test-errors.log
+          if-no-files-found: ignore
